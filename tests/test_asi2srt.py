@@ -258,3 +258,12 @@ def test_linhas_reais_do_bitrate_monitor():
     m = a.RE_BITRATE.search(real)
     assert m and int(m.group(1).replace(",", "")) == 8123456
     assert a.RE_ALARME.search(alarme) and not a.RE_ALARME.search(real)
+
+
+@pytest.mark.parametrize("end,modo", [("187.60.226.82?6001", "caller"), ("187.60.226.82", "caller"),
+                                      ("9000x", "listener")])
+def test_endereco_srt_invalido(end, modo):
+    canal = {"entrada": {"tipo": "srt", "modo": modo, "endereco": end},
+             "saidas": [{"tipo": "udp", "endereco": "127.0.0.1:5000"}]}
+    with pytest.raises(ValueError, match="inválido"):
+        a.montar_comando(canal)

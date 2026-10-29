@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -239,8 +239,13 @@ def _args_srt(s: dict, entrada: bool) -> list:
     modo = s.get("modo", "listener" if entrada else "caller")
     if modo not in ("caller", "listener"):
         raise ValueError(f"modo SRT inválido: {modo}")
-    if not str(s.get("endereco", "")).strip():
+    end = str(s.get("endereco", "")).strip()
+    if not end:
         raise ValueError("SRT sem endereço")
+    if modo == "caller" and not re.match(r"^[A-Za-z0-9.\-]+:\d{1,5}$", end):
+        raise ValueError(f"endereço SRT caller inválido: {end!r} (use IP:porta, ex.: 187.60.226.82:6001)")
+    if modo == "listener" and not re.match(r"^([A-Za-z0-9.\-]+:)?\d{1,5}$", end):
+        raise ValueError(f"endereço SRT listener inválido: {end!r} (use a porta, ex.: 9000)")
     a = ["--" + modo, str(s["endereco"]).strip(), "--transtype", "live",
          "--latency", str(int(s.get("latencia_ms") or 200))]
     if not entrada:
