@@ -362,3 +362,44 @@ def test_relatorio_salvo_ao_parar_e_persistente():
     finally:
         p.terminate()
         p.wait(10)
+
+
+# ---------------- escolha do pacote do TSDuck (Raspberry Pi e outros) ----------------
+PACOTES = [
+    "tsduck_3.45-4798.ubuntu24_amd64.deb", "tsduck_3.45-4798.ubuntu24_arm64.deb",
+    "tsduck-dev_3.45-4798.ubuntu24_arm64.deb", "tsduck_3.45-4798.ubuntu25_amd64.deb",
+    "tsduck_3.45-4798.debian12_amd64.deb", "tsduck_3.45-4798.debian12_arm64.deb",
+    "tsduck_3.45-4798.debian13_arm64.deb", "tsduck-dev_3.45-4798.debian13_arm64.deb",
+    "tsduck_3.45-4798.raspbian12_armhf.deb", "tsduck-dev_3.45-4798.raspbian12_armhf.deb",
+    "tsduck-3.45-4798.el9.x86_64.rpm", "tsduck-3.45-4798.el9.aarch64.rpm",
+    "tsduck-3.45-4798.fc42.aarch64.rpm", "tsduck-devel-3.45-4798.fc42.aarch64.rpm",
+]
+
+
+@pytest.mark.parametrize("info,arq,deb,esperado", [
+    # Raspberry Pi OS 64 bits (bookworm)
+    ({"ID": "debian", "VERSION_ID": "12"}, "arm64", True, "tsduck_3.45-4798.debian12_arm64.deb"),
+    # Raspberry Pi OS 64 bits (trixie)
+    ({"ID": "debian", "VERSION_ID": "13"}, "arm64", True, "tsduck_3.45-4798.debian13_arm64.deb"),
+    # Raspberry Pi OS 32 bits
+    ({"ID": "raspbian", "VERSION_ID": "12", "ID_LIKE": "debian"}, "armhf", True,
+     "tsduck_3.45-4798.raspbian12_armhf.deb"),
+    # Raspberry Pi OS 32 bits mais novo que o pacote: usa o raspbian mais recente
+    ({"ID": "raspbian", "VERSION_ID": "13", "ID_LIKE": "debian"}, "armhf", True,
+     "tsduck_3.45-4798.raspbian12_armhf.deb"),
+    # Ubuntu no Raspberry
+    ({"ID": "ubuntu", "VERSION_ID": "24.04", "ID_LIKE": "debian"}, "arm64", True,
+     "tsduck_3.45-4798.ubuntu24_arm64.deb"),
+    # Ubuntu de PC (a VM)
+    ({"ID": "ubuntu", "VERSION_ID": "24.04", "ID_LIKE": "debian"}, "amd64", True,
+     "tsduck_3.45-4798.ubuntu24_amd64.deb"),
+    # derivado de Debian sem pacote próprio: cai no Debian
+    ({"ID": "linuxmint", "VERSION_ID": "22", "ID_LIKE": "ubuntu debian"}, "arm64", True,
+     "tsduck_3.45-4798.ubuntu24_arm64.deb"),
+    ({"ID": "fedora", "VERSION_ID": "42"}, "aarch64", False, "tsduck-3.45-4798.fc42.aarch64.rpm"),
+    ({"ID": "rocky", "VERSION_ID": "9.4"}, "x86_64", False, "tsduck-3.45-4798.el9.x86_64.rpm"),
+    # 32 bits sem pacote raspbian: não instala pacote errado
+    ({"ID": "debian", "VERSION_ID": "12"}, "armhf", True, None),
+])
+def test_escolher_pacote_tsduck(info, arq, deb, esperado):
+    assert a.escolher_pacote_tsduck(PACOTES, info, arq, deb) == esperado

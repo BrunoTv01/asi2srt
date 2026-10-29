@@ -15,6 +15,39 @@ os canais, supervisão com reinício automático e monitoração.
  Arquivo .ts ┘        painel web :8088 · reinício automático     └─► ...
 ```
 
+## Instalação rápida (um comando)
+
+Em um Raspberry Pi, Ubuntu ou Debian recém-instalado:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh | sudo bash
+```
+
+Instala as dependências, o asi2srt, o TSDuck e o serviço (inicia no boot), e mostra o endereço do
+painel (login `admin` / `admin`). Para atualizar, rode o mesmo comando de novo.
+
+## Raspberry Pi
+
+| | |
+|---|---|
+| **Modelos** | Raspberry Pi 4 ou 5 (recomendado). Pi 3 funciona para poucos canais de baixa taxa. |
+| **Sistema** | Raspberry Pi OS **64 bits** (recomendado) ou 32 bits; Ubuntu Server para Raspberry também serve. |
+| **Entradas** | **SRT** e **UDP/multicast**. Placas ASI (DekTec, DVEO) **não funcionam em ARM** — os drivers só existem para PC Intel/AMD. Para analisar ASI no Raspberry, use um conversor ASI→IP na frente. |
+| **Rede** | Prefira cabo. Para multicast, informe o IP da interface no canal. |
+| **TSDuck** | Instalado automaticamente do pacote oficial (`debian12_arm64` / `raspbian12_armhf`). Se não houver pacote para o seu sistema, `COMPILAR=1` compila do código-fonte (1 a 3 horas). |
+
+Desempenho: a análise TR 101 290 roda em Python puro e processa mais de 1 Gb/s em um PC;
+num Raspberry Pi 4 a expectativa é algo na casa de 100–200 Mb/s no total, folgado para vários
+canais SRT/UDP típicos (5–40 Mb/s cada). Acompanhe a CPU com `htop`.
+
+Compilar o TSDuck manualmente (quando não há pacote pronto):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh | sudo COMPILAR=1 bash
+# ou, com o asi2srt já instalado:
+sudo asi2srt instalar-tsduck --compilar
+```
+
 ## Instalação
 
 **Binário pronto (não precisa de Python):** baixe em [Releases](../../releases).
@@ -215,7 +248,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.2.0 && git push origin v2.2.0
+git tag v2.5.0 && git push origin v2.5.0
 ```
 
 ## Licença

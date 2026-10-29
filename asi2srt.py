@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -56,6 +56,8 @@ except ImportError:
 log = logging.getLogger("asi2srt")
 
 TIPOS_ENTRADA = ("dektec", "linuxasi", "udp", "srt", "arquivo")
+# O DTAPI da DekTec só existe para Linux em processadores Intel/AMD (não há para ARM/Raspberry Pi)
+DEKTEC_DISPONIVEL = platform.machine().lower() in ("x86_64", "amd64", "i686", "i386")
 TIPOS_SAIDA = ("srt", "udp")
 
 # ======================================================================
@@ -114,6 +116,21 @@ supervisor:
   status_http: "0.0.0.0:8088" # painel web. Vazio desativa
   usuario: admin              # login do painel
   senha_painel: admin         # troque se o painel ficar acessível fora da rede local
+  log_arquivo: ""
+"""
+
+
+CONFIG_INICIAL = """\
+# asi2srt - configuração. Crie e edite os canais pelo painel web (http://IP:8088).
+# Exemplo comentado de todas as opções: asi2srt init exemplo.yaml
+canais: []
+supervisor:
+  reinicio_min_s: 2
+  reinicio_max_s: 60
+  tsp: tsp
+  status_http: "0.0.0.0:8088"
+  usuario: admin
+  senha_painel: admin
   log_arquivo: ""
 """
 
@@ -1425,7 +1442,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                             for c in ger.listar()])
                 if metodo == "GET" and caminho == "/api/info":
                     return self._resp(200, {"versao": __version__, "config": ger.caminho,
-                                            "persistente": bool(ger.caminho), "tr101290": TR_ITENS})
+                                            "persistente": bool(ger.caminho), "tr101290": TR_ITENS,
+                                            "plataforma": platform.machine(), "dektec": DEKTEC_DISPONIVEL})
                 if partes[:2] == ["api", "canais"]:
                     if len(partes) == 2:
                         if metodo == "GET":
@@ -1590,6 +1608,8 @@ def cmd_init(args):
 
 def cmd_verificar(args):
     ok = True
+    print(f"Plataforma: {platform.machine()} · {_os_release().get('PRETTY_NAME', platform.system())}"
+          + ("" if DEKTEC_DISPONIVEL else "  (placas DekTec não são suportadas nesta arquitetura)"))
     tsp = shutil.which(args.tsp) or (args.tsp if os.path.exists(args.tsp) else None)
     if not tsp:
         print("✗ TSDuck (tsp) não encontrado  ->  sudo asi2srt instalar-tsduck")
@@ -1603,6 +1623,8 @@ def cmd_verificar(args):
         tem = re.search(rf"\b{nome}\b", texto) is not None
         print(f"{'✓' if tem else ('✗' if obrig else '·')} plugin {nome}"
               f"{'' if tem or obrig else ' (só necessário para placas DekTec)'}")
+        if nome == "dektec" and not DEKTEC_DISPONIVEL:
+            continue
         ok &= tem or not obrig
     if shutil.which("tsdektec"):
         r = subprocess.run(["tsdektec", "-a"], capture_output=True, text=True)
@@ -1613,45 +1635,118 @@ def cmd_verificar(args):
     return 0 if ok else 1
 
 
+def _os_release():
+    info = {}
+    try:
+        with open("/etc/os-release") as f:
+            for linha in f:
+                k, _, v = linha.strip().partition("=")
+                info[k] = v.strip('"')
+    except OSError:
+        pass
+    return info
+
+
+def _arquitetura_pacote(deb: bool) -> str:
+    """Arquitetura do sistema de pacotes (no Raspberry, kernel 64 bits pode ter userland armhf)."""
+    if deb and shutil.which("dpkg"):
+        r = subprocess.run(["dpkg", "--print-architecture"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    m = platform.machine()
+    if deb:
+        return {"x86_64": "amd64", "aarch64": "arm64", "armv7l": "armhf", "armv6l": "armhf"}.get(m, m)
+    return {"amd64": "x86_64", "arm64": "aarch64"}.get(m, m)
+
+
+def escolher_pacote_tsduck(nomes, info, arq, deb):
+    """Escolhe o pacote do TSDuck de uma release: mesma distro e versão > mesma distro >
+    distro "pai" (ID_LIKE) > nenhum. Ignora pacotes de desenvolvimento."""
+    distro = info.get("ID", "").lower()
+    major = info.get("VERSION_ID", "").split(".")[0]
+    familia = [distro] + info.get("ID_LIKE", "").lower().split()
+    if deb:
+        rx = re.compile(r"^tsduck_[\d.\-]+\.([a-z]+)(\d+)_" + re.escape(arq) + r"\.deb$")
+    else:
+        rx = re.compile(r"^tsduck-[\d.\-]+\.(el|fc)(\d+)\." + re.escape(arq) + r"\.rpm$")
+        familia = ["fc" if distro == "fedora" else "el"]
+        distro = familia[0]
+    cands = []
+    for n in nomes:
+        m = rx.match(n)
+        if not m:
+            continue
+        d, v = m.group(1), m.group(2)
+        if d == distro and v == major:
+            nota = 3
+        elif d == distro:
+            nota = 2
+        elif d in familia:
+            nota = 1
+        else:
+            continue
+        cands.append((nota, int(v), n))
+    return max(cands)[2] if cands else None
+
+
+def _compilar_tsduck():
+    """Compila o TSDuck a partir do código-fonte (sem DekTec, Java e smartcard)."""
+    opcoes = ["NOTEST=1", "NODEKTEC=1", "NOJAVA=1", "NOPCSC=1", "NOVATEK=1", "NOHIDES=1"]
+    src = "/usr/local/src/tsduck"
+    print("compilando o TSDuck a partir do código-fonte.\n"
+          "ATENÇÃO: no Raspberry Pi isso leva de 1 a 3 horas; em modelos com 1-2 GB de RAM,\n"
+          "aumente a swap antes (sudo dphys-swapfile setup com CONF_SWAPSIZE=2048).")
+    if not shutil.which("git"):
+        subprocess.run(["apt-get", "install", "-y", "git"], check=True)
+    if not os.path.isdir(src):
+        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/tsduck/tsduck", src], check=True)
+    subprocess.run(["bash", "scripts/install-prerequisites.sh", "NODOXYGEN=1"] + opcoes, cwd=src, check=True)
+    nucleos = str(max(1, min(os.cpu_count() or 1, 4)))
+    subprocess.run(["make", "-j" + nucleos] + opcoes, cwd=src, check=True)
+    subprocess.run(["make", "install"] + opcoes, cwd=src, check=True)
+    subprocess.run(["ldconfig"], check=False)
+
+
 def cmd_instalar_tsduck(args):
     if os.geteuid() != 0:
         raise SystemExit("rode como root: sudo asi2srt instalar-tsduck")
     if shutil.which("tsp") and not args.forcar:
         print("TSDuck já instalado (use --forcar para reinstalar)")
         return
-    info = {}
-    with open("/etc/os-release") as f:
-        for linha in f:
-            k, _, v = linha.strip().partition("=")
-            info[k] = v.strip('"')
+    if args.compilar:
+        _compilar_tsduck()
+        print("TSDuck instalado. Confira com: asi2srt verificar")
+        return
+    info = _os_release()
     distro, versao = info.get("ID", ""), info.get("VERSION_ID", "")
-    arq = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
-    deb = distro in ("ubuntu", "debian") or "debian" in info.get("ID_LIKE", "")
-    print(f"sistema: {distro} {versao} ({arq}) - buscando a versão mais recente do TSDuck...")
-    req = urllib.request.Request("https://api.github.com/repos/tsduck/tsduck/releases/latest",
-                                 headers={"User-Agent": "asi2srt"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        rel = json.load(r)
-    nomes = [a for a in rel["assets"] if "-dev" not in a["name"] and "devel" not in a["name"]]
-    if deb:
-        cand = [a for a in nomes if a["name"].endswith(f"_{arq}.deb")]
-        pref = [a for a in cand if f"{distro}{versao}".replace(".", "") in a["name"].replace(".", "")]
+    deb = bool(shutil.which("dpkg")) or distro in ("ubuntu", "debian", "raspbian")
+    arq = _arquitetura_pacote(deb)
+    print(f"sistema: {info.get('PRETTY_NAME', distro + ' ' + versao)} ({arq}) - procurando o TSDuck...")
+    escolha = None
+    try:
+        req = urllib.request.Request("https://api.github.com/repos/tsduck/tsduck/releases/latest",
+                                     headers={"User-Agent": "asi2srt"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            rel = json.load(r)
+        assets = {a["name"]: a["browser_download_url"] for a in rel["assets"]}
+        escolha = escolher_pacote_tsduck(list(assets), info, arq, deb)
+    except OSError as e:
+        print(f"não foi possível consultar o GitHub: {e}")
+    if escolha:
+        destino = os.path.join(tempfile.gettempdir(), escolha)
+        print(f"baixando {escolha}...")
+        urllib.request.urlretrieve(assets[escolha], destino)
+        if deb:
+            subprocess.run(["apt-get", "update"], check=False)
+            subprocess.run(["apt-get", "install", "-y", destino], check=True)
+        else:
+            subprocess.run(["dnf" if shutil.which("dnf") else "yum", "install", "-y", destino], check=True)
+    elif deb and subprocess.run(["bash", "-c", "apt-cache policy tsduck | grep -q 'Candidate: [0-9]'"]).returncode == 0:
+        print("sem pacote na release do GitHub; instalando o TSDuck do repositório da distribuição...")
+        subprocess.run(["apt-get", "install", "-y", "tsduck"], check=True)
     else:
-        arq_rpm = {"amd64": "x86_64", "arm64": "aarch64"}.get(arq, arq)
-        cand = [a for a in nomes if a["name"].endswith(f".{arq_rpm}.rpm")]
-        pref = [a for a in cand if f"el{versao.split('.')[0]}" in a["name"]
-                or f"fc{versao}" in a["name"]]
-    escolha = (pref or cand or [None])[0]
-    if not escolha:
-        raise SystemExit("não achei pacote para este sistema; baixe em https://tsduck.io/download/")
-    destino = os.path.join(tempfile.gettempdir(), escolha["name"])
-    print(f"baixando {escolha['name']}...")
-    urllib.request.urlretrieve(escolha["browser_download_url"], destino)
-    if deb:
-        subprocess.run(["apt-get", "update"], check=False)
-        subprocess.run(["apt-get", "install", "-y", destino], check=True)
-    else:
-        subprocess.run(["dnf" if shutil.which("dnf") else "yum", "install", "-y", destino], check=True)
+        raise SystemExit(f"não há pacote pronto do TSDuck para {distro} {versao} ({arq}).\n"
+                         "Compile a partir do código-fonte com:  sudo asi2srt instalar-tsduck --compilar")
     print("TSDuck instalado. Confira com: asi2srt verificar")
 
 
@@ -1688,9 +1783,9 @@ def cmd_instalar_servico(args):
     os.makedirs(os.path.dirname(args.config), exist_ok=True)
     if not os.path.exists(args.config):
         with open(args.config, "w", encoding="utf-8") as f:
-            f.write(CONFIG_EXEMPLO)
+            f.write(CONFIG_INICIAL)
         os.chmod(args.config, 0o600)
-        print(f"configuração de exemplo criada em {args.config}")
+        print(f"configuração criada em {args.config} (sem canais: crie pelo painel)")
     with open("/etc/systemd/system/asi2srt.service", "w") as f:
         f.write(UNIDADE_SYSTEMD.format(exe=exe, config=args.config))
     subprocess.run(["systemctl", "daemon-reload"], check=False)
@@ -1898,7 +1993,7 @@ function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=M
  const p=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(2)},${(hh-v/mx*hh).toFixed(2)}`).join(' ');
  return`<svg class="spark" viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none"><polygon class="area" points="0,${hh} ${p} ${w},${hh}"/><polyline points="${p}"/></svg>`}
 
-let dados=[],editando=null,logId=null,TRI=[],anaId=null,ordem={k:'pid',d:1},ana=null;
+let INFO={},dados=[],editando=null,logId=null,TRI=[],anaId=null,ordem={k:'pid',d:1},ana=null;
 const TR=[['sync_loss','TS sync loss','1.1 Perda de sincronismo: 2+ sync bytes errados seguidos ou perda do sinal de entrada'],
  ['sync_byte','Sync byte','1.2 Pacote com sync byte diferente de 0x47'],
  ['pat','PAT','1.3 PAT ausente por mais de 0,5 s, table_id errado ou embaralhada'],
@@ -1958,7 +2053,8 @@ function desenhar(){const c=editando,e=c.entrada,p=c.processamento||{};
  <fieldset><legend>Canal</legend><div class="campos"><label style="grid-column:span 2">Nome<input name="nome" value="${esc(c.nome)}" required></label>
  <label class="chk"><input type="checkbox" name="ativo" ${c.ativo!==false?'checked':''}> Ativo (inicia automaticamente)</label></div></fieldset>
  <fieldset><legend>Entrada</legend><div class="campos"><label>Tipo<select name="e_tipo" id="etipo">
- ${Object.entries(NOMES_E).map(([k,n])=>`<option value="${k}" ${e.tipo===k?'selected':''}>${n}</option>`).join('')}</select></label>
+ ${Object.entries(NOMES_E).map(([k,n])=>{const off=(k==='dektec'&&INFO.dektec===false)||(k==='linuxasi'&&INFO.plataforma&&!/x86|amd64|i.86/.test(INFO.plataforma));
+  return`<option value="${k}" ${e.tipo===k?'selected':''} ${off&&e.tipo!==k?'disabled':''}>${n}${off?' — indisponível neste hardware':''}</option>`}).join('')}</select></label>
  ${CE[e.tipo].map(f=>campo('e.',f,e)).join('')}</div></fieldset>
  <fieldset><legend>Processamento</legend><div class="campos">
  <label class="chk"><input type="checkbox" name="p.analise_tr101290" ${p.analise_tr101290!==false?'checked':''}> Análise TR 101 290</label>
@@ -2075,7 +2171,7 @@ document.addEventListener('click',async ev=>{const b=ev.target.closest('button')
 $('#dlglog').addEventListener('close',()=>logId=null);
 $('#novo').onclick=()=>abrir();
 
-api('GET','/api/info').then(i=>{TRI=i.tr101290||[];render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
+api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
 atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(()=>{if(!(ana&&ana.salvo&&sessSel!=null))carregarAna()},1000);setInterval(carregarSess,10000);rota();
 </script></body></html>
 """
@@ -2126,6 +2222,7 @@ def main(argv=None):
 
     p = sub.add_parser("instalar-tsduck", help="instala o TSDuck (root)")
     p.add_argument("--forcar", action="store_true")
+    p.add_argument("--compilar", action="store_true", help="compila do código-fonte (sem pacote pronto)")
     p.set_defaults(func=cmd_instalar_tsduck)
 
     p = sub.add_parser("instalar-servico", help="instala serviço systemd (root)")
