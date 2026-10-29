@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.ts
+asi2srt.yaml
+config.teste.yaml

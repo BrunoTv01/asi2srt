@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml pytest
+      - run: pytest -v tests/
+      - run: python asi2srt.py comando -e dektec:0:0 -s "srt://example.com:9000?latency=200"
+
+  binario:
+    needs: testes
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            nome: asi2srt-linux-amd64
+          - os: ubuntu-22.04-arm
+            nome: asi2srt-linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml pyinstaller
+      - run: pyinstaller --onefile --name ${{ matrix.nome }} asi2srt.py
+      - run: ./dist/${{ matrix.nome }} --versao
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.nome }}
+          path: dist/${{ matrix.nome }}
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.nome }}
