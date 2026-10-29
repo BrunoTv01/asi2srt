@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -281,8 +281,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
     ent = canal["entrada"]
     proc = canal.get("processamento") or {}
     saidas = canal.get("saidas") or []
-    if not saidas:
-        raise ValueError("o canal precisa de pelo menos uma saída")
+    so_analise = not saidas  # sem saídas: o canal só recebe e analisa
 
     cmd = [tsp_bin, "--realtime", "--buffer-size-mb", "8", "--max-flushed-packets", "7"]
 
@@ -319,7 +318,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
                 " ".join(shlex.quote(a) for a in filho)]
 
     pids =[_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
-    if proc.get("remover_nulos", True):
+    if proc.get("remover_nulos", True) and not so_analise:
         pids.append(0x1FFF)
     if pids:
         cmd += ["-P", "filter", "--negate"]
@@ -338,7 +337,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
         filho = [tsp_bin, "--realtime", "-O"] + _args_saida(s)
         cmd += ["-P", "fork", "--nowait", " ".join(shlex.quote(a) for a in filho)]
 
-    cmd += ["-O"] + _args_saida(saidas[0])
+    cmd += ["-O", "drop"] if so_analise else ["-O"] + _args_saida(saidas[0])
     return cmd
 
 
@@ -1387,10 +1386,10 @@ def _achar_config():
 def _carregar(args):
     """Devolve (cfg, caminho). caminho None = modo linha de comando (não persiste)."""
     if args.entrada or args.saida:
-        if not (args.entrada and args.saida):
-            raise SystemExit("use --entrada e --saida juntos (ou -c arquivo)")
+        if not args.entrada:
+            raise SystemExit("--saida precisa de --entrada (sem --saida o canal só analisa)")
         canal = {"nome": args.nome, "entrada": entrada_de_texto(args.entrada),
-                 "saidas": [saida_de_url(s) for s in args.saida],
+                 "saidas": [saida_de_url(s) for s in (args.saida or [])],
                  "processamento": {"remover_nulos": not args.manter_nulos,
                                    "bitrate_min": args.bitrate_min,
                                    "intervalo_relatorio_s": 5}}
@@ -1750,7 +1749,7 @@ const CE={
  dektec:[['dispositivo','Placa','number',0],['canal','Porta','number',0],['timeout_ms','Timeout sem sinal (ms)','number',5000]],
  linuxasi:[['dispositivo','Dispositivo','text','/dev/asirx0']],
  udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface_local','IP da interface (multicast)','text','']],
- srt:[['modo','Modo','sel:listener,caller','listener'],['endereco','Endereço (porta ou host:porta)','text','9000'],
+ srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Endereço (caller: IP:porta · listener: porta)','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text','']],
  arquivo:[['caminho','Arquivo .ts','text',''],['loop','Repetir em loop','chk',true]]};
 const CS={
@@ -1758,7 +1757,7 @@ const CS={
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
       ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25]],
  udp:[['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']]};
-const NOMES_E={dektec:'DekTec ASI',linuxasi:'Linux ASI (DVEO)',udp:'UDP / Multicast',srt:'SRT',arquivo:'Arquivo .ts'};
+const NOMES_E={srt:'SRT',udp:'UDP / Multicast',dektec:'ASI — placa DekTec',linuxasi:'ASI — driver Linux (DVEO)',arquivo:'Arquivo .ts'};
 
 function resE(e){switch(e.tipo){case'dektec':return`DekTec ${e.dispositivo??0}:${e.canal??0}`;case'linuxasi':return`ASI ${e.dispositivo}`;
  case'udp':return`UDP ${e.endereco}`;case'srt':return`SRT ${e.modo} ${e.endereco}${e.senha?' 🔒':''}`;case'arquivo':return`Arquivo ${(e.caminho||'').split('/').pop()}`}return e.tipo}
@@ -1787,7 +1786,7 @@ function tr(s){const t=s.tr101290;if(!t)return'';
 function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
- <div><span class="l">Saídas</span>${c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join('')}</div></div>
+ <div><span class="l">Saídas</span>${c.saidas.length?c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join(''):'<span class="tag" style="color:var(--mut)">somente análise</span>'}</div></div>
  ${spark(s.historico)}
  <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>
@@ -1820,11 +1819,12 @@ function desenhar(){const c=editando,e=c.entrada,p=c.processamento||{};
  ${CE[e.tipo].map(f=>campo('e.',f,e)).join('')}</div></fieldset>
  <fieldset><legend>Processamento</legend><div class="campos">
  <label class="chk"><input type="checkbox" name="p.analise_tr101290" ${p.analise_tr101290!==false?'checked':''}> Análise TR 101 290</label>
- <label class="chk"><input type="checkbox" name="p.remover_nulos" ${p.remover_nulos!==false?'checked':''}> Remover pacotes nulos</label>
+ <label class="chk" title="Só vale para as saídas"><input type="checkbox" name="p.remover_nulos" ${p.remover_nulos!==false?'checked':''}> Remover nulos nas saídas</label>
  <label>PIDs a remover (ex.: 0x12, 0x14)<input name="p.remover_pids" value="${esc((p.remover_pids||[]).join(', '))}"></label>
  <label>Alarme bitrate mín. (Mb/s)<input type="number" step="0.1" name="p.bitrate_min" value="${(p.bitrate_min||0)/1e6}"></label>
  <label>Alarme bitrate máx. (Mb/s)<input type="number" step="0.1" name="p.bitrate_max" value="${(p.bitrate_max||0)/1e6}"></label></div></fieldset>
- <fieldset><legend>Saídas</legend>
+ <fieldset><legend>Saídas (opcional)</legend>
+ ${c.saidas.length?'':'<p class="msg" style="white-space:normal;margin:0 0 10px">Sem saídas: o canal só recebe e analisa o sinal. Adicione uma saída apenas se quiser retransmitir.</p>'}
  ${c.saidas.map((s,i)=>`<div class="saida"><div class="sh"><span>${i===0?'Principal':'Cópia '+i} — ${s.tipo.toUpperCase()}</span>
   <button type="button" class="mini perigo" data-rm="${i}">Remover</button></div>
   <input type="hidden" name="s.${i}.tipo" value="${s.tipo}"><div class="campos">${CS[s.tipo].map(f=>campo(`s.${i}.`,f,s)).join('')}</div></div>`).join('')}
@@ -1845,8 +1845,8 @@ function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
   if(v!==undefined)o[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});return o})}
 
 function abrir(id){const c=id?dados.find(x=>x.id===id):null;
- editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'dektec'},
-  processamento:{remover_nulos:true,analise_tr101290:true,intervalo_relatorio_s:5},saidas:[{tipo:'srt'}]};
+ editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'srt',modo:'caller'},
+  processamento:{remover_nulos:true,analise_tr101290:true,intervalo_relatorio_s:5},saidas:[]};
  delete editando.status;$('#dtit').textContent=c?'Editar canal':'Novo canal';desenhar();$('#dlg').showModal()}
 
 $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();

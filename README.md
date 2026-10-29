@@ -38,6 +38,17 @@ sudo asi2srt instalar-tsduck
 asi2srt verificar
 ```
 
+## Só análise (sem saída)
+
+As saídas são opcionais. Um canal sem saída apenas recebe o sinal (SRT, UDP ou ASI) e mostra a
+análise completa — é o padrão ao criar um canal pelo painel. Pela linha de comando, basta omitir `-s`:
+
+```bash
+asi2srt rodar -e "srt://187.60.226.82:6001?latency=2000"     # analisa um SRT
+asi2srt rodar -e "udp://239.1.1.1:1234?local=10.0.0.5"       # analisa um multicast
+asi2srt rodar -e dektec:0:0                                  # analisa uma entrada ASI
+```
+
 ## Painel web
 
 ```bash

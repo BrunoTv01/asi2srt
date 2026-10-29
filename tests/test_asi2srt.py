@@ -94,7 +94,6 @@ def test_formato_antigo_compativel():
 
 
 @pytest.mark.parametrize("canal,erro", [
-    ({"entrada": {"tipo": "arquivo", "caminho": "x.ts"}, "saidas": []}, "pelo menos uma saída"),
     ({"entrada": {"tipo": "arquivo", "caminho": "x.ts"},
       "saidas": [{"tipo": "srt", "endereco": "h:1", "senha": "curta"}]}, "10 e 79"),
     ({"entrada": {"tipo": "arquivo", "caminho": "x.ts"},
@@ -217,6 +216,7 @@ OPCOES_TSDUCK = {
     "dektec": {"--device", "--channel", "--receive-timeout"},
     "file": {"--infinite"},
     "fork": {"--nowait", "--buffered-packets"},
+    "drop": set(),
     "filter": {"--negate", "--pid"},
     "bitrate_monitor": {"--periodic-bitrate", "--time-interval", "--min", "--max"},
 }
@@ -267,3 +267,12 @@ def test_endereco_srt_invalido(end, modo):
              "saidas": [{"tipo": "udp", "endereco": "127.0.0.1:5000"}]}
     with pytest.raises(ValueError, match="inválido"):
         a.montar_comando(canal)
+
+
+def test_canal_so_analise():
+    for ent in ("srt://h:6001?latency=2000", "udp://239.1.1.1:1234", "dektec:0:0", "linuxasi:/dev/asirx0"):
+        cmd = a.montar_comando({"entrada": a.entrada_de_texto(ent), "saidas": []}, porta_analise=40000)
+        assert cmd[-2:] == ["-O", "drop"]
+        assert "filter" not in cmd           # sem saída, mantém o TS completo (com nulos)
+        assert "fork" in cmd and "bitrate_monitor" in cmd
+        _verificar_opcoes(cmd)
