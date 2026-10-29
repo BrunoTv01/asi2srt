@@ -116,6 +116,17 @@ Zerar: botão **Zerar** ou `POST /api/canais/{id}/zerar`. A análise pode ser de
 Observação: placas e drivers ASI normalmente descartam pacotes sem sync antes de entregá-los
 ao software, então na prática o "TS sync loss" aparece sobretudo como perda do sinal de entrada.
 
+### Relatórios salvos
+
+Ao parar um canal (ou desligar o serviço), a análise da sessão é **salva**: o card do canal parado
+mostra o resumo (período, duração, bitrate médio/mín/máx, erros TR 101 290, serviços) e
+**Ver relatório** abre a análise completa como estava no fim da sessão. A tela de análise tem um
+seletor com as **últimas 20 sessões** de cada canal e o botão **Baixar relatório** (JSON).
+
+Os relatórios ficam em `<arquivo-de-config>-relatorios.json` (ex.: `/etc/asi2srt/config-relatorios.json`)
+e a sessão em andamento é salva a cada 60 s, então nada se perde se o programa cair.
+API: `GET /api/canais/{id}/relatorios` e `GET /api/canais/{id}/analise?sessao=N[&baixar=1]`.
+
 ## Linha de comando (sem painel nem arquivo)
 
 ```bash

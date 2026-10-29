@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -451,6 +451,7 @@ class AnalisadorTS:
 
     # --- estado -------------------------------------------------------
     def zerar(self):
+        self.est_taxa = [0, 0.0, None, None]   # n, soma, mín, máx (bitrate total por segundo)
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
         self.cc_pid = {}
@@ -806,6 +807,12 @@ class AnalisadorTS:
             self.taxa = {p: (n - self.n_ant.get(p, 0)) * 1504 / dt for p, n in self.n_pid.items()}
             self.taxa_total = sum(self.taxa.values())
             self.hist_total.append(int(self.taxa_total))
+            if self.taxa_total > 0 and self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL:
+                e = self.est_taxa
+                e[0] += 1
+                e[1] += self.taxa_total
+                e[2] = self.taxa_total if e[2] is None else min(e[2], self.taxa_total)
+                e[3] = self.taxa_total if e[3] is None else max(e[3], self.taxa_total)
             self.pcr_info = {p: {"intervalo_ms": round(j[0] / 27000, 2), "jitter_ns": int(j[1])}
                              for p, j in self.pcr_janela.items()}
             self.pcr_janela = {}
@@ -892,6 +899,22 @@ class AnalisadorTS:
         if pid < 0x20:
             return "SI reservado", "psi"
         return "Não referenciado", "desconhecido"
+
+    def relatorio(self, agora_mono=None, agora_wall=None):
+        """Análise congelada para guardar: horários absolutos no lugar de 'há N s'."""
+        agora_mono = time.monotonic() if agora_mono is None else agora_mono
+        agora_wall = time.time() if agora_wall is None else agora_wall
+        a = self.analise(agora_mono)
+        tr = a["tr101290"]
+        with self.lock:
+            tr["ultimo_em"] = {k: agora_wall - (agora_mono - v) for k, v in self.ultimo_erro.items()}
+            n, soma, mn, mx = self.est_taxa
+        tr.pop("ha_s", None)
+        tr["recentes"] = []
+        a["resumo"]["sinal"] = False
+        a["taxa_sessao"] = {"media": int(soma / n) if n else 0, "min": int(mn or 0), "max": int(mx or 0),
+                            "segundos_com_sinal": n}
+        return a
 
     def analise(self, agora=None):
         agora = time.monotonic() if agora is None else agora
@@ -1027,6 +1050,7 @@ class Canal(threading.Thread):
         self.sup = sup
         montar_comando(cfg, sup.get("tsp", "tsp"))  # valida antes de abrir recursos
         self.analisador = AnalisadorTS()
+        self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
         self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta)
         self.proc = None
@@ -1059,6 +1083,16 @@ class Canal(threading.Thread):
         s["tr101290"] = self.analisador.status()
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         return s
+
+    def relatorio(self, motivo):
+        agora_w = time.time()
+        a = self.analisador.relatorio(time.monotonic(), agora_w)
+        prio = {i[0]: i[1] for i in TR_ITENS}
+        cont = a["tr101290"]["contadores"]
+        totais = {f"p{p}": sum(v for k, v in cont.items() if prio[k] == p) for p in (1, 2, 3)}
+        return {"inicio": self.inicio_sessao, "fim": agora_w, "duracao_s": int(agora_w - self.inicio_sessao),
+                "motivo": motivo, "reinicios": self.st.get("reinicios", 0),
+                "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a}
 
     def zerar_contadores(self):
         with self.analisador.lock:
@@ -1147,6 +1181,69 @@ class Gerenciador:
         for c in cfg.get("canais") or []:
             c = normalizar_canal(c)
             self.defs[c["id"]] = c
+        self.rel_caminho = (os.path.splitext(caminho)[0] + "-relatorios.json") if caminho else None
+        self.relatorios = {}
+        if self.rel_caminho and os.path.exists(self.rel_caminho):
+            try:
+                with open(self.rel_caminho, encoding="utf-8") as f:
+                    self.relatorios = json.load(f)
+            except (OSError, ValueError) as e:
+                log.error("não foi possível ler %s: %s", self.rel_caminho, e)
+        self._parar_autosave = threading.Event()
+        threading.Thread(target=self._autosave, daemon=True, name="autosave").start()
+
+    # --- relatórios de análise ---------------------------------------
+    MAX_RELATORIOS = 20
+
+    def _gravar_relatorios(self):
+        if not self.rel_caminho:
+            return
+        tmp = self.rel_caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.relatorios, f, ensure_ascii=False)
+        os.replace(tmp, self.rel_caminho)
+
+    def _guardar(self, cid, t, motivo):
+        if t.analisador.pacotes == 0:
+            return  # nada foi recebido nesta sessão
+        rel = t.relatorio(motivo)
+        rel["canal"] = self.defs.get(cid, {}).get("nome", cid)
+        with self.lock:
+            lista = self.relatorios.setdefault(cid, [])
+            if lista and lista[0].get("inicio") == rel["inicio"]:
+                lista[0] = rel           # mesma sessão (autosave anterior): substitui
+            else:
+                lista.insert(0, rel)
+            del lista[self.MAX_RELATORIOS:]
+            try:
+                self._gravar_relatorios()
+            except OSError as e:
+                log.error("não foi possível salvar relatórios: %s", e)
+
+    def _autosave(self):
+        """Salva a sessão em andamento a cada 60 s (preserva os dados se o processo cair)."""
+        while not self._parar_autosave.wait(60):
+            for cid, t in list(self.exec.items()):
+                try:
+                    self._guardar(cid, t, "em andamento")
+                except Exception:  # noqa: BLE001
+                    log.exception("autosave")
+
+    def resumo_relatorio(self, rel):
+        a = rel["analise"]
+        return {"inicio": rel["inicio"], "fim": rel["fim"], "duracao_s": rel["duracao_s"],
+                "motivo": rel["motivo"], "taxa": rel["taxa"], "totais": rel["totais"],
+                "contadores": a["tr101290"]["contadores"], "n_pids": a["resumo"]["n_pids"],
+                "n_servicos": a["resumo"]["n_servicos"], "servicos": [s["nome"] for s in a["servicos"]]}
+
+    def relatorio_salvo(self, cid, idx=0):
+        lista = self.relatorios.get(cid) or []
+        if not 0 <= idx < len(lista):
+            return None
+        rel = lista[idx]
+        return {**rel["analise"], "estado": "parado", "salvo": True, "sessao": idx,
+                "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
+                "taxa_sessao": rel["taxa"], "totais": rel["totais"]}
 
     # --- persistência ------------------------------------------------
     def persistir(self):
@@ -1195,6 +1292,10 @@ class Gerenciador:
                 self.persistir()
         if t:
             t.encerrar()
+            try:
+                self._guardar(cid, t, "parado" if marcar else "encerrado")
+            except Exception:  # noqa: BLE001
+                log.exception("erro ao salvar relatório")
 
     def reiniciar(self, cid):
         self.parar(cid, marcar=False)
@@ -1229,6 +1330,8 @@ class Gerenciador:
         with self.lock:
             self.defs.pop(cid, None)
             self.persistir()
+            if self.relatorios.pop(cid, None) is not None:
+                self._gravar_relatorios()
 
     def encerrar_tudo(self):
         for cid in list(self.exec):
@@ -1244,7 +1347,11 @@ class Gerenciador:
             st = t.status() if t else {"estado": "parado", "bitrate_bps": 0, "erros_cc": 0,
                                        "alarmes_bitrate": 0, "reinicios": 0, "historico": [],
                                        "tr101290": None}
-            out.append({**c, "status": st})
+            rels = self.relatorios.get(cid) or []
+            ult = self.resumo_relatorio(rels[0]) if rels else None
+            if ult and t is None and ult["motivo"] == "em andamento":
+                ult["motivo"] = "interrompido"
+            out.append({**c, "status": st, "ultimo_relatorio": ult})
         return out
 
     def log_canal(self, cid):
@@ -1276,11 +1383,13 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     hmac.compare_digest(s, str(ger.sup.get("senha_painel", "")))
             return False
 
-        def _resp(self, codigo, corpo, tipo="application/json"):
+        def _resp(self, codigo, corpo, tipo="application/json", baixar=None):
             if not isinstance(corpo, bytes):
-                corpo = json.dumps(corpo, ensure_ascii=False).encode()
+                corpo = json.dumps(corpo, ensure_ascii=False, indent=2 if baixar else None).encode()
             self.send_response(codigo)
             self.send_header("Content-Type", tipo)
+            if baixar:
+                self.send_header("Content-Disposition", f'attachment; filename="{baixar}"')
             self.send_header("Content-Length", str(len(corpo)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -1302,7 +1411,9 @@ def servidor_web(ger: Gerenciador, endereco: str):
             # proteção contra CSRF: ações exigem cabeçalho próprio
             if metodo != "GET" and self.headers.get("X-Asi2srt") != "1":
                 return self._resp(403, {"erro": "cabeçalho X-Asi2srt ausente"})
-            caminho = urlparse(self.path).path.rstrip("/") or "/"
+            url = urlparse(self.path)
+            caminho = url.path.rstrip("/") or "/"
+            q = {k: v[-1] for k, v in parse_qs(url.query).items()}
             partes = caminho.strip("/").split("/")
             try:
                 if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
@@ -1336,11 +1447,25 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         acao = partes[3]
                         if metodo == "GET" and acao == "log":
                             return self._resp(200, ger.log_canal(cid))
+                        if metodo == "GET" and acao == "relatorios":
+                            return self._resp(200, [{"sessao": i, **ger.resumo_relatorio(r)}
+                                                    for i, r in enumerate(ger.relatorios.get(cid) or [])])
                         if metodo == "GET" and acao == "analise":
                             t = ger.exec.get(cid)
-                            if not t:
-                                return self._resp(409, {"erro": "canal parado"})
-                            return self._resp(200, {**t.analisador.analise(), "estado": t.status()["estado"]})
+                            if "sessao" in q or not t:
+                                dados = ger.relatorio_salvo(cid, int(q.get("sessao", 0)))
+                                if dados is None:
+                                    return self._resp(409, {"erro": "canal parado e sem análise salva"})
+                            else:
+                                agora_w = time.time()
+                                dados = {**t.analisador.analise(), "estado": t.status()["estado"],
+                                         "salvo": False, "periodo": {"inicio": t.inicio_sessao,
+                                                                     "duracao_s": int(agora_w - t.inicio_sessao)}}
+                            if q.get("baixar"):
+                                nome = re.sub(r"[^\w.-]+", "_", ger.defs[cid]["nome"])
+                                data = time.strftime("%Y%m%d-%H%M", time.localtime(dados["periodo"]["inicio"]))
+                                return self._resp(200, dados, baixar=f"asi2srt-{nome}-{data}.json")
+                            return self._resp(200, dados)
                         if metodo == "GET" and acao == "comando":
                             return self._resp(200, {"comando": comando_para_log(
                                 montar_comando(ger.defs[cid], ger.sup.get("tsp", "tsp")))})
@@ -1647,6 +1772,10 @@ main{padding:20px;max-width:1400px;margin:auto}
 .lamp small{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lamp b{font-variant-numeric:tabular-nums;font-size:12.5px}.lamp.e b{color:var(--err)}
 .aus{font-size:11.5px;color:var(--err);margin-top:6px;font-family:ui-monospace,monospace}
+.tr.rel{border-style:dashed}.tr.rel .met{margin-top:2px}
+.aban{background:#10233d;border:1px solid #1f4b85;color:#cfe3ff;padding:9px 12px;border-radius:9px;margin-bottom:12px;font-size:13px}
+#asess{width:auto;max-width:330px}a.btn{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:13px;text-decoration:none}
+a.btn:hover{border-color:#8b949e}
 .trp{display:flex;gap:10px;align-items:center;margin-top:7px;font-size:11.5px;color:var(--mut)}
 .trp .e{color:var(--err)}.trp .w{color:var(--warn)}.trp a{margin-left:auto;color:var(--acc);cursor:pointer;text-decoration:none}
 #vana{padding:16px 20px;max-width:1500px;margin:auto}
@@ -1717,7 +1846,9 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
-  <span class="sp" style="flex:1"></span><button id="azerar">Zerar contadores</button></div>
+  <span class="sp" style="flex:1"></span><select id="asess" title="Sessões de análise salvas"></select>
+  <a class="btn" id="abaixar" href="#">Baixar relatório</a><button id="azerar">Zerar contadores</button></div>
+ <div class="aban" id="aban" hidden></div>
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
   <div class="acol"><div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
@@ -1783,18 +1914,30 @@ function tr(s){const t=s.tr101290;if(!t)return'';
  ${TRI.length?(()=>{const soma=p=>TRI.filter(x=>x[1]===p).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),
   rec=p=>TRI.some(x=>x[1]===p&&t.recentes.includes(x[0])),cl=p=>rec(p)?'e':soma(p)?'w':'';
   return`<div class="trp"><span class="${cl(2)}">P2 · ${soma(2)}</span><span class="${cl(3)}">P3 · ${soma(3)}</span><a data-ana="${s._id}">Análise completa →</a></div>`})():''}</div>`}
+const fmtDH=s=>new Date(s*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+const fmtH=s=>new Date(s*1000).toLocaleTimeString('pt-BR');
+const MOTIVO={parado:'parada',encerrado:'serviço desligado',interrompido:'interrompida','em andamento':'em andamento'};
+const MOTIVO_L={parado:'encerrada pelo usuário',encerrado:'encerrada (serviço desligado)',interrompido:'interrompida (o programa foi fechado inesperadamente)','em andamento':'em andamento'};
+function relCard(c){const r=c.ultimo_relatorio,n=r.contadores;
+ return`<div class="tr rel"><div class="trh"><span>Última análise · ${esc(MOTIVO[r.motivo]||r.motivo)}</span><span>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</span></div>
+ <div class="met"><div><small>Bitrate médio</small><b class="big">${mb(r.taxa.media)}<small> Mb/s</small></b></div>
+ <div><small>Mín / máx</small><b>${mb(r.taxa.min)} / ${mb(r.taxa.max)}</b></div><div><small>Duração</small><b>${dur(r.duracao_s)}</b></div></div>
+ <div class="lamps" style="margin-top:8px">${TR.map(([k,nm,d])=>{const v=n[k]||0;return`<div class="lamp ${v?'w':''}" title="${esc(d)}"><i></i><small>${nm}</small><b>${v}</b></div>`}).join('')}</div>
+ <div class="trp"><span class="${r.totais.p2?'w':''}">P2 · ${r.totais.p2}</span><span class="${r.totais.p3?'w':''}">P3 · ${r.totais.p3}</span>
+ <span>${r.n_servicos} serv · ${r.n_pids} PIDs</span><a data-ana="${c.id}">Ver relatório →</a></div>
+ ${r.servicos.length?`<div class="msg" style="margin-top:4px" title="${esc(r.servicos.join(', '))}">${esc(r.servicos.join(' · '))}</div>`:''}</div>`}
 function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
  <div><span class="l">Saídas</span>${c.saidas.length?c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join(''):'<span class="tag" style="color:var(--mut)">somente análise</span>'}</div></div>
- ${spark(s.historico)}
+ ${!ativo&&c.ultimo_relatorio?relCard(c):`${spark(s.historico)}
  <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
- <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>
+ <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>`}
  ${tr(s)}
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
  <div class="acoes">${ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻ Reiniciar</button><button data-a="zerar" data-id="${c.id}" title="Zerar contadores">Zerar</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>`}
- ${ativo?`<button data-a="analise" data-id="${c.id}">Análise</button>`:''}<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
+ ${ativo?`<button data-a="analise" data-id="${c.id}">Análise</button>`:c.ultimo_relatorio?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
 
 function render(){if(anaId)return;$('#grid').innerHTML=dados.length?dados.map(card).join(''):
@@ -1856,24 +1999,35 @@ $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();
 // ---------- análise ----------
 const fmtR=b=>b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(1)+' kb/s';
 const fmtHa=s=>s<60?Math.round(s)+'s':s<3600?Math.round(s/60)+'min':(s/3600).toFixed(1)+'h';
-function rota(){const m=location.hash.match(/^#\/analise\/(\w+)/);anaId=m?m[1]:null;ana=null;
+let sessSel=null;
+async function carregarSess(){if(!anaId)return;try{const l=await api('GET',`/api/canais/${anaId}/relatorios`),
+ c=dados.find(x=>x.id===anaId),vivo=c&&c.status.estado!=='parado';
+ const ops=(vivo?['<option value="">Ao vivo</option>']:[]).concat(l.map(r=>`<option value="${r.sessao}">${fmtDH(r.inicio)} → ${fmtH(r.fim)} (${dur(r.duracao_s)})${r.motivo==='em andamento'?' · em andamento':''}</option>`));
+ const s=$('#asess');s.innerHTML=ops.join('')||'<option>sem sessões salvas</option>';s.value=sessSel==null?(vivo?'':'0'):String(sessSel)}catch(e){}}
+$('#asess').onchange=e=>{const v=e.target.value;sessSel=v===''?null:+v;carregarAna()};
+function rota(){const m=location.hash.match(/^#\/analise\/(\w+)/);anaId=m?m[1]:null;ana=null;sessSel=null;if(anaId)carregarSess();
  $('#vana').hidden=!anaId;$('#vlista').hidden=!!anaId;window.scrollTo(0,0);
  if(anaId){$('#akpi').innerHTML=$('#atr').innerHTML=$('#aserv').innerHTML=$('#apids').innerHTML='';carregarAna()}else render()}
 async function carregarAna(){if(!anaId)return;const c=dados.find(x=>x.id===anaId);$('#anome').textContent=c?c.nome:'';
- try{ana=await api('GET',`/api/canais/${anaId}/analise`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
+ const qs=sessSel==null?'':`?sessao=${sessSel}`;$('#abaixar').href=`/api/canais/${anaId}/analise?baixar=1`+(sessSel==null?'':`&sessao=${sessSel}`);
+ try{ana=await api('GET',`/api/canais/${anaId}/analise${qs}`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
 function kpi(r,v,t){return`<div class="kpi" title="${esc(t||'')}"><small>${r}</small><b>${v}</b></div>`}
-function rAna(){const a=ana,r=a.resumo,t=a.tr101290;
- $('#aest').className='pill '+a.estado;$('#aest').textContent=(r.sinal?a.estado:'sem sinal').replace('_',' ');
- $('#akpi').innerHTML=kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')
+function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts=a.taxa_sessao;
+ $('#aest').className='pill '+(S?'parado':a.estado);$('#aest').textContent=S?'relatório salvo':(r.sinal?a.estado:'sem sinal').replace('_',' ');
+ $('#azerar').hidden=!!S;$('#aban').hidden=!S;
+ if(S)$('#aban').innerHTML=`Análise ${esc(MOTIVO_L[p.motivo]||p.motivo)} — resumo salvo de <b>${fmtDH(p.inicio)}</b> até <b>${fmtDH(p.fim)}</b> (${dur(p.duracao_s)}).`
+  +(p.motivo==='em andamento'?' Sessão ainda em andamento: este é o último salvamento automático.':'');
+ $('#akpi').innerHTML=(S?kpi('Duração',dur(p.duracao_s))+kpi('Bitrate médio',fmtR(ts.media))+kpi('Bitrate mínimo',fmtR(ts.min))+kpi('Bitrate máximo',fmtR(ts.max))
+  :kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')+kpi('Sessão',dur(p.duracao_s)))
   +kpi('Taxa',r.cbr?'CBR':'VBR','CBR = TS com pacotes nulos (taxa constante)')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'))
   +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
   +kpi('Pacotes',r.pacotes.toLocaleString('pt-BR'));
  $('#adesde').textContent='desde '+new Date(r.desde*1000).toLocaleTimeString('pt-BR');
  $('#atr').innerHTML=[1,2,3].map(p=>`<div class="trg"><h4>Prioridade ${p}</h4>${TRI.filter(x=>x[1]===p).map(([k,,cod,nome,desc])=>{
-  const v=t.contadores[k]||0,rec=t.recentes.includes(k),na=t.nao_aplicavel.includes(k),ha=t.ha_s[k];
+  const v=t.contadores[k]||0,rec=t.recentes.includes(k),na=t.nao_aplicavel.includes(k),ha=S?null:(t.ha_s||{})[k],em=S?(t.ultimo_em||{})[k]:null;
   const c=rec?'e':(na&&!v)?'x':v?'w':'';
   return`<div class="trl ${c}" title="${esc(desc)}${na?' — não aplicável a este TS':''}"><i></i><span class="cod">${cod}</span><span>${nome}</span>
-  <span class="ha">${na&&!v?'n/a':ha!=null?'há '+fmtHa(ha):''}</span><b>${v}</b></div>`}).join('')}</div>`).join('');
+  <span class="ha">${na&&!v?'n/a':ha!=null?'há '+fmtHa(ha):em!=null?'às '+fmtH(em):''}</span><b>${v}</b></div>`}).join('')}</div>`).join('');
  // gráfico
  const h=a.historico,W=600,H=150;if(h.length>1){const mx=Math.max(...h)*1.15||1,
   pts=h.map((v,i)=>`${(i/(h.length-1)*W).toFixed(1)},${(H-v/mx*(H-14)).toFixed(1)}`).join(' ');
@@ -1922,7 +2076,7 @@ $('#dlglog').addEventListener('close',()=>logId=null);
 $('#novo').onclick=()=>abrir();
 
 api('GET','/api/info').then(i=>{TRI=i.tr101290||[];render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
-atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(carregarAna,1000);rota();
+atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(()=>{if(!(ana&&ana.salvo&&sessSel!=null))carregarAna()},1000);setInterval(carregarSess,10000);rota();
 </script></body></html>
 """
 

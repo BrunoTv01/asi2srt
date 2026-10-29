@@ -276,3 +276,89 @@ def test_canal_so_analise():
         assert "filter" not in cmd           # sem saída, mantém o TS completo (com nulos)
         assert "fork" in cmd and "bitrate_monitor" in cmd
         _verificar_opcoes(cmd)
+
+
+# ---------------- relatório salvo ao parar ----------------
+TSP_COM_TS = r'''#!/usr/bin/env python3
+import sys, re, socket, time, struct, zlib
+porta = int(re.search(r"127\.0\.0\.1:(\d+)", " ".join(sys.argv)).group(1))
+INV = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
+def crc(d):
+    c = zlib.crc32(d.translate(INV)) ^ 0xFFFFFFFF
+    return int(f"{c:032b}"[::-1], 2)
+def sec(tid, ext, corpo):
+    d = struct.pack(">H", ext) + b"\xc1\x00\x00" + corpo
+    s = bytes([tid, 0xB0 | ((len(d) + 4) >> 8), (len(d) + 4) & 0xFF]) + d
+    return s + struct.pack(">I", crc(s))
+pat = sec(0, 7, struct.pack(">HH", 1, 0xE100))
+pmt = sec(2, 1, struct.pack(">HH", 0xE101, 0xF000) + struct.pack(">BHH", 0x1B, 0xE101, 0xF000))
+cc = {}
+def pkt(pid, carga=b"", pusi=False):
+    cc[pid] = (cc.get(pid, -1) + 1) & 15
+    return (bytes([0x47, (0x40 if pusi else 0) | (pid >> 8), pid & 0xFF, 0x10 | cc[pid]]) + carga).ljust(188, b"\xff")
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+n = 0
+while True:
+    d = pkt(0, b"\x00" + pat, True) + pkt(0x100, b"\x00" + pmt, True) + b"".join(pkt(0x101) for _ in range(5))
+    s.sendto(d, ("127.0.0.1", porta)); n += 1
+    if n % 20 == 0: print("* bitrate_monitor: TS bitrate: 1,000,000 bits/s", flush=True)
+    time.sleep(0.05)
+'''
+
+
+def _subir(cfg_path, porta):
+    p = subprocess.Popen([sys.executable, PROG, "rodar", "-c", cfg_path],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    for _ in range(50):
+        try:
+            socket.create_connection(("127.0.0.1", porta), timeout=0.2).close()
+            return p
+        except OSError:
+            time.sleep(0.1)
+    return p
+
+
+def test_relatorio_salvo_ao_parar_e_persistente():
+    d = tempfile.mkdtemp()
+    tsp = os.path.join(d, "tsp")
+    with open(tsp, "w") as f:
+        f.write(TSP_COM_TS)
+    os.chmod(tsp, 0o755)
+    porta = _porta_livre()
+    cfg = os.path.join(d, "cfg.json")
+    with open(cfg, "w") as f:
+        json.dump({"canais": [{"id": "c1", "nome": "Sinal", "entrada": {"tipo": "udp", "endereco": "1234"},
+                               "saidas": []}],
+                   "supervisor": {"tsp": tsp, "status_http": f"127.0.0.1:{porta}",
+                                  "usuario": "admin", "senha_painel": "segredo"}}, f)
+    base = f"http://127.0.0.1:{porta}"
+    p = _subir(cfg, porta)
+    try:
+        time.sleep(3.5)
+        assert _req(base, "GET", "/api/canais/c1/analise")[1]["salvo"] is False
+        assert _req(base, "POST", "/api/canais/c1/parar")[0] == 200
+        _, lista = _req(base, "GET", "/api/canais")
+        r = lista[0]["ultimo_relatorio"]
+        assert r and r["motivo"] == "parado" and r["n_servicos"] == 1 and r["duracao_s"] >= 3
+        assert r["taxa"]["media"] > 0 and set(r["totais"]) == {"p1", "p2", "p3"}
+        cod, a = _req(base, "GET", "/api/canais/c1/analise")
+        assert cod == 200 and a["salvo"] is True and a["resumo"]["tsid"] == 7
+        assert a["servicos"][0]["componentes"][0]["desc"] == "H.264/AVC vídeo"
+    finally:
+        p.terminate()
+        p.wait(10)
+    assert os.path.exists(os.path.join(d, "cfg-relatorios.json"))
+    # depois de reiniciar o programa, o resumo continua lá
+    p = _subir(cfg, porta)
+    try:
+        _, lista = _req(base, "GET", "/api/canais")
+        assert lista[0]["ultimo_relatorio"]["n_servicos"] == 1
+        assert len(_req(base, "GET", "/api/canais/c1/relatorios")[1]) == 1
+        r = urllib.request.Request(base + "/api/canais/c1/analise?sessao=0&baixar=1", headers={
+            "Authorization": "Basic " + base64.b64encode(b"admin:segredo").decode()})
+        with urllib.request.urlopen(r) as resp:
+            assert "attachment" in resp.headers["Content-Disposition"]
+            assert json.loads(resp.read())["salvo"] is True
+    finally:
+        p.terminate()
+        p.wait(10)
