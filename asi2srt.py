@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -244,7 +244,7 @@ def _args_srt(s: dict, entrada: bool) -> list:
     a = ["--" + modo, str(s["endereco"]).strip(), "--transtype", "live",
          "--latency", str(int(s.get("latencia_ms") or 200))]
     if not entrada:
-        a += ["--ohead-bandwidth", str(int(s.get("overhead_pct") or 25))]
+        a += ["--ohead-bw", str(int(s.get("overhead_pct") or 25))]
     if s.get("senha"):
         if not 10 <= len(s["senha"]) <= 79:
             raise ValueError("a senha SRT deve ter entre 10 e 79 caracteres")
@@ -659,7 +659,7 @@ class Canal(threading.Thread):
             linha = linha.rstrip()
             if not linha:
                 continue
-            m = RE_BITRATE.search(linha)
+            m = None if RE_ALARME.search(linha) else RE_BITRATE.search(linha)
             if m:
                 bps = int(float(m.group(1).replace(",", "")))
                 with self.lock:

@@ -204,3 +204,57 @@ def test_painel_html(gateway):
     with urllib.request.urlopen(r) as resp:
         html = resp.read().decode()
     assert "Novo canal" in html and a.__version__ in html
+
+
+# Opções reais do TSDuck (extraídas do código-fonte: tsSRTArgs.cpp, tsTSDatagramOutput.cpp,
+# tsUDPReceiverArgs.cpp, tsForkPacketPlugin.cpp, tsBitrateMonitorPlugin.cpp, tsTSProcessorArgs.cpp,
+# tsDektecInputPlugin.cpp, tsTSFileInputArgs.cpp). Garante que nenhuma opção inventada chegue ao tsp.
+OPCOES_TSDUCK = {
+    "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets"},
+    "srt": {"--caller", "--listener", "--transtype", "--latency", "--ohead-bw", "--passphrase",
+            "--pbkeylen", "--streamid"},
+    "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout"},
+    "dektec": {"--device", "--channel", "--receive-timeout"},
+    "file": {"--infinite"},
+    "fork": {"--nowait", "--buffered-packets"},
+    "filter": {"--negate", "--pid"},
+    "bitrate_monitor": {"--periodic-bitrate", "--time-interval", "--min", "--max"},
+}
+
+
+def _verificar_opcoes(cmd):
+    plugin = "tsp"
+    for arg in cmd[1:]:
+        if arg in ("-I", "-P", "-O"):
+            plugin = None
+            continue
+        if plugin is None:
+            plugin = arg
+            continue
+        if arg.startswith("--"):
+            assert arg in OPCOES_TSDUCK[plugin], f"opção {arg} não existe no plugin {plugin}"
+        if plugin == "fork" and arg.startswith(("/", "tsp")) or " -O " in arg:
+            _verificar_opcoes(shlex.split(arg))
+
+
+import shlex  # noqa: E402
+
+
+@pytest.mark.parametrize("entrada", ["dektec:0:1", "linuxasi:/dev/asirx0", "udp://239.1.1.1:1234?local=10.0.0.1",
+                                     "srt://:9000?mode=listener&passphrase=1234567890&streamid=x",
+                                     "srt://h:9000?latency=500", "arquivo:x.ts"])
+def test_opcoes_existem_no_tsduck(entrada):
+    canal = {"entrada": a.entrada_de_texto(entrada),
+             "saidas": [a.saida_de_url("srt://h:1?passphrase=1234567890&streamid=s&oheadbw=30"),
+                        a.saida_de_url("udp://239.1.1.1:1?ttl=4&local=10.0.0.2"),
+                        a.saida_de_url("srt://:9001?mode=listener")],
+             "processamento": {"remover_pids": ["0x20"], "bitrate_min": 1, "bitrate_max": 9}}
+    _verificar_opcoes(a.montar_comando(canal, porta_analise=40000))
+
+
+def test_linhas_reais_do_bitrate_monitor():
+    real = "* bitrate_monitor: 2026/10/29 12:00:00, TS bitrate: 8,123,456 bits/s, net bitrate: 7,900,000 bits/s"
+    alarme = "* bitrate_monitor: TS bitrate (512,000 bits/s) is lower than allowed minimum (1,000,000 bits/s)"
+    m = a.RE_BITRATE.search(real)
+    assert m and int(m.group(1).replace(",", "")) == 8123456
+    assert a.RE_ALARME.search(alarme) and not a.RE_ALARME.search(real)
