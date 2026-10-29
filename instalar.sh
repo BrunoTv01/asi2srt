@@ -24,8 +24,11 @@ echo "==> Dependências"
 if command -v apt-get >/dev/null; then
   apt-get update -qq
   apt-get install -y -qq python3 python3-yaml curl ca-certificates >/dev/null
+  # ffmpeg: usado pelas saídas RTMP/RTMPS
+  apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null || echo "aviso: ffmpeg não instalado (saídas RTMP indisponíveis)"
 elif command -v dnf >/dev/null; then
   dnf install -y -q python3 python3-pyyaml curl
+  dnf install -y -q ffmpeg 2>/dev/null || echo "aviso: ffmpeg não instalado (saídas RTMP indisponíveis; habilite RPM Fusion)"
 fi
 
 echo "==> Baixando o asi2srt"

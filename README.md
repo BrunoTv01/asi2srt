@@ -97,6 +97,18 @@ sudo asi2srt instalar-tsduck
 asi2srt verificar
 ```
 
+## Tipos de saída
+
+| Saída | Como | Observações |
+|---|---|---|
+| **SRT** | TSDuck | caller ou listener, AES, stream ID, estatísticas do link |
+| **UDP** | TSDuck | unicast ou multicast (TTL, interface) |
+| **RTP** | TSDuck (`--rtp`) | unicast ou multicast; payload type (padrão 33 = MP2T) e SSRC configuráveis |
+| **RTMP / RTMPS** | ffmpeg | YouTube, Facebook, Wowza, nginx-rtmp… Servidor e chave em campos separados (a chave nunca aparece no log). RTMP aceita H.264 + AAC: por padrão **copia o vídeo e converte o áudio para AAC** (ISDB-Tb usa AAC LATM). Para origem MPEG-2/HEVC, escolha vídeo `h264` (usa CPU). Em MPTS, informe o número do programa. |
+
+Cada saída roda em processo próprio: se uma falhar, só ela tenta de novo, sem afetar a entrada e as outras.
+Linha de comando: `-s "rtp://239.2.2.2:5004?ttl=8"` · `-s "rtmp://a.rtmp.youtube.com/live2/SUA-CHAVE"`.
+
 ## Só análise (sem saída)
 
 As saídas são opcionais. Um canal sem saída apenas recebe o sinal (SRT, UDP ou ASI) e mostra a
@@ -294,7 +306,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.8.0 && git push origin v2.8.0
+git tag v2.9.0 && git push origin v2.9.0
 ```
 
 ## Licença

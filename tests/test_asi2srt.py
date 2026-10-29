@@ -1,4 +1,5 @@
 import base64
+import shutil
 import json
 import os
 import socket
@@ -215,7 +216,8 @@ OPCOES_TSDUCK = {
     "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets", "--verbose"},
     "srt": {"--caller", "--listener", "--transtype", "--latency", "--ohead-bw", "--passphrase",
             "--pbkeylen", "--streamid", "--statistics-interval", "--json-line"},
-    "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout", "--buffer-size"},
+    "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout", "--buffer-size",
+           "--rtp", "--payload-type", "--ssrc-identifier"},
     "dektec": {"--device", "--channel", "--receive-timeout"},
     "file": {"--infinite"},
     "fork": {"--nowait", "--buffered-packets"},
@@ -251,7 +253,8 @@ def test_opcoes_existem_no_tsduck(entrada):
     canal = {"entrada": a.entrada_de_texto(entrada),
              "saidas": [a.saida_de_url("srt://h:1?passphrase=1234567890&streamid=s&oheadbw=30"),
                         a.saida_de_url("udp://239.1.1.1:1?ttl=4&local=10.0.0.2"),
-                        a.saida_de_url("srt://:9001?mode=listener")],
+                        a.saida_de_url("srt://:9001?mode=listener"),
+                        a.saida_de_url("rtp://239.2.2.2:5004?ttl=8&pt=96&ssrc=0x1234")],
              "processamento": {"remover_pids": ["0x20"], "bitrate_min": 1, "bitrate_max": 9}}
     _verificar_opcoes(a.montar_comando(canal, porta_analise=40000, porta_dist=41000))
     for i, s in enumerate(canal["saidas"]):
@@ -548,3 +551,90 @@ def test_saida_com_falha_nao_derruba_a_entrada():
         assert st["srt"]["SRTOUT0"]["estado"] == "aguardando"
     finally:
         c.encerrar()
+
+
+
+# ---------------- saídas RTP e RTMP ----------------
+def test_saida_rtp():
+    s = a.saida_de_url("rtp://239.2.2.2:5004?ttl=8&local=10.0.0.5&pt=96&ssrc=0x1234")
+    cmd = " ".join(a.montar_saida(s, 0, porta_entrada=42000))
+    assert "-O ip 239.2.2.2:5004 --packet-burst 7 --ttl 8 --local-address 10.0.0.5 --rtp --payload-type 96 --ssrc-identifier 4660" in cmd
+    padrao = " ".join(a.montar_saida(a.saida_de_url("rtp://10.0.0.9:5004"), 0))
+    assert "--rtp" in padrao and "--payload-type" not in padrao     # 33 (MP2T) é o padrão do TSDuck
+    with pytest.raises(ValueError, match="payload type"):
+        a.montar_saida({"tipo": "rtp", "endereco": "1.2.3.4:5", "payload_type": 200}, 0)
+
+
+def test_saida_rtmp_comando_e_chave_mascarada():
+    s = a.saida_de_url("rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl")
+    assert s["video"] == "copiar" and s["audio"] == "aac"
+    cmd = a.montar_saida(s, 0, porta_entrada=42000)
+    assert cmd[0] == "ffmpeg" and "udp://127.0.0.1:42000" in cmd[cmd.index("-i") + 1]
+    assert cmd[cmd.index("-c:v") + 1] == "copy" and cmd[cmd.index("-c:a") + 1] == "aac"
+    assert cmd[-3:] == ["-flvflags", "no_duration_filesize", "rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl"]
+    erro = "[out#0/flv @ 0x5] Error opening output rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl: Connection timed out"
+    assert "abcd-efgh-ijkl" not in a.mascarar(erro) and "Connection timed out" in a.mascarar(erro)
+    assert "segredo123" not in a.mascarar("srt://h:1?mode=caller&passphrase=segredo123&latency=200")
+    assert "abcd-efgh-ijkl" not in a.comando_para_log(cmd) and "live2/********" in a.comando_para_log(cmd)
+    # servidor e chave em campos separados (como o painel salva)
+    sep = a.montar_saida({"tipo": "rtmp", "url": "rtmps://live-api-s.facebook.com:443/rtmp/", "chave": "FB-123-abc"}, 0)
+    assert sep[-1] == "rtmps://live-api-s.facebook.com:443/rtmp/FB-123-abc"
+    assert "FB-123-abc" not in a.comando_para_log(sep)
+    # recodificando vídeo e escolhendo o programa (serviço) num MPTS
+    cmd2 = a.montar_saida({**s, "video": "h264", "video_kbps": 3000, "programa": "257"}, 0)
+    assert "libx264" in cmd2 and "3000k" in cmd2 and "0:p:257:v:0" in cmd2
+
+
+@pytest.mark.parametrize("cfg,erro", [
+    ({"tipo": "rtmp", "url": "http://x/y"}, "URL completa"),
+    ({"tipo": "rtmp", "url": "rtmp://servidor"}, "URL completa"),
+    ({"tipo": "rtmp", "url": "rtmp://s/app/k", "video": "hevc"}, "copiar"),
+    ({"tipo": "rtmp", "url": "rtmp://s/app/k", "programa": "abc"}, "programa"),
+])
+def test_saida_rtmp_validacao(cfg, erro):
+    with pytest.raises(ValueError, match=erro):
+        a.montar_comando({"entrada": {"tipo": "udp", "endereco": "1234"}, "saidas": [cfg]})
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="precisa do ffmpeg")
+def test_rtmp_ponta_a_ponta_com_audio_latm():
+    """TS no padrão ISDB-Tb (H.264 + AAC LATM) -> saída RTMP do asi2srt -> servidor RTMP local."""
+    d = tempfile.mkdtemp()
+    ts = os.path.join(d, "entrada.ts")
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
+                    "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000", "-t", "15",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "1M", "-g", "30",
+                    "-c:a", "aac", "-mpegts_flags", "latm", "-f", "mpegts", ts], check=True)
+    tsp = os.path.join(d, "tsp")
+    with open(tsp, "w") as f:
+        f.write("#!/usr/bin/env python3\n"
+                "import sys,re,socket,time\n"
+                "p=(re.findall(r'-O ip 127\\.0\\.0\\.1:(\\d+)',' '.join(sys.argv)) or [None])[-1]\n"
+                "s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);d=open(%r,'rb').read();t0=time.time();n=0\n"
+                "while True:\n"
+                "  for i in range(0,len(d)-1316,1316):\n"
+                "    s.sendto(d[i:i+1316],('127.0.0.1',int(p)));n+=1316\n"
+                "    w=n/150000-(time.time()-t0)\n"
+                "    if w>0: time.sleep(w)\n" % ts)
+    os.chmod(tsp, 0o755)
+    porta = _porta_livre()
+    flv = os.path.join(d, "recebido.flv")
+    srv = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-listen", "1", "-i",
+                            f"rtmp://127.0.0.1:{porta}/live/chave", "-c", "copy", "-f", "flv", "-y", flv])
+    time.sleep(1.5)
+    c = a.Canal({"nome": "rtmp", "entrada": a.entrada_de_texto("udp://239.1.1.1:1234"),
+                 "saidas": [a.saida_de_url(f"rtmp://127.0.0.1:{porta}/live/chave")]},
+                {"tsp": tsp, "reinicio_min_s": 1})
+    c.start()
+    try:
+        time.sleep(9)
+        st = c.status()["saidas"][0]
+        assert st["estado"] == "rodando" and st["info"]["taxa_kbps"] > 0
+    finally:
+        c.encerrar()
+        time.sleep(1)
+        srv.terminate()
+        srv.wait(10)
+    info = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
+                           "-of", "csv=p=0", flv], capture_output=True, text=True).stdout.split()
+    assert info == ["h264", "aac"]

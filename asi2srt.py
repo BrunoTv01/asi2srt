@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -58,7 +58,7 @@ log = logging.getLogger("asi2srt")
 TIPOS_ENTRADA = ("dektec", "linuxasi", "udp", "srt", "arquivo")
 # O DTAPI da DekTec só existe para Linux em processadores Intel/AMD (não há para ARM/Raspberry Pi)
 DEKTEC_DISPONIVEL = platform.machine().lower() in ("x86_64", "amd64", "i686", "i386")
-TIPOS_SAIDA = ("srt", "udp")
+TIPOS_SAIDA = ("srt", "udp", "rtp", "rtmp")
 
 # ======================================================================
 # Configuração de exemplo (gerada por "asi2srt init")
@@ -242,7 +242,16 @@ def saida_de_url(url: str) -> dict:
         return _srt_de_url(u, "caller")
     if u.scheme == "udp":
         return _udp_de_url(u)
-    raise SystemExit(f"saída inválida: {url!r} (use srt://... ou udp://...)")
+    if u.scheme == "rtp":
+        d = _udp_de_url(u)
+        q = {k: v[-1] for k, v in parse_qs(u.query).items()}
+        d.update(tipo="rtp", payload_type=int(q.get("pt", 33)), ssrc=q.get("ssrc", ""))
+        return d
+    if u.scheme in ("rtmp", "rtmps"):
+        # a URL vai inteira para o servidor (pode ter parâmetros próprios); opções no painel ou na config
+        return {"tipo": "rtmp", "url": url, "video": "copiar", "audio": "aac",
+                "video_kbps": 4000, "audio_kbps": 128, "programa": ""}
+    raise SystemExit(f"saída inválida: {url!r} (use srt://, udp://, rtp://, rtmp:// ou rtmps://)")
 
 
 # ======================================================================
@@ -291,7 +300,54 @@ def _args_saida(s: dict, prefixo=None) -> list:
         if s.get("interface_local"):
             a += ["--local-address", s["interface_local"]]
         return a
+    if tipo == "rtp":
+        a = _args_saida({**s, "tipo": "udp"})
+        a += ["--rtp"]
+        if s.get("payload_type") not in (None, "", 33):
+            pt = int(s["payload_type"])
+            if not 0 <= pt <= 127:
+                raise ValueError("payload type RTP deve estar entre 0 e 127")
+            a += ["--payload-type", str(pt)]
+        if str(s.get("ssrc") or "").strip():
+            a += ["--ssrc-identifier", str(int(str(s["ssrc"]).strip(), 0))]
+        return a
     raise ValueError(f"tipo de saída desconhecido: {tipo}")
+
+
+def _args_ffmpeg_rtmp(s: dict, porta_entrada) -> list:
+    """Saída RTMP/RTMPS via ffmpeg (o TSDuck não tem RTMP). RTMP (FLV) aceita H.264 + AAC:
+    por padrão copia o vídeo e converte o áudio para AAC (ISDB-Tb usa AAC LATM, que o FLV não aceita)."""
+    url = str(s.get("url", "")).strip()
+    chave = str(s.get("chave") or "").strip()
+    if chave:  # servidor e chave em campos separados (como no YouTube/Facebook)
+        url = url.rstrip("/") + "/" + chave.lstrip("/")
+    if not re.match(r"^rtmps?://[^/\s]+/\S+", url):
+        raise ValueError("saída RTMP precisa da URL completa, ex.: rtmp://servidor/app/chave")
+    video, audio = s.get("video", "copiar"), s.get("audio", "aac")
+    if video not in ("copiar", "h264") or audio not in ("aac", "copiar"):
+        raise ValueError("vídeo deve ser 'copiar' ou 'h264' e áudio 'aac' ou 'copiar'")
+    prog = str(s.get("programa") or "").strip()
+    if prog and not prog.isdigit():
+        raise ValueError("programa deve ser o número do serviço (ex.: 257) ou vazio")
+    sel = f"p:{prog}:" if prog else ""
+    entrada = (f"udp://127.0.0.1:{porta_entrada or 'PORTA_SAIDA'}?fifo_size=1000000&overrun_nonfatal=1"
+               f"&buffer_size=4194304&timeout=10000000")
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning", "-progress", "pipe:1",
+           "-stats_period", "2", "-fflags", "+genpts+discardcorrupt", "-i", entrada,
+           "-map", f"0:{sel}v:0", "-map", f"0:{sel}a:0?"]
+    if video == "copiar":
+        cmd += ["-c:v", "copy"]
+    else:
+        vk = int(s.get("video_kbps") or 4000)
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p",
+                "-b:v", f"{vk}k", "-maxrate", f"{vk}k", "-bufsize", f"{2 * vk}k", "-g", "60"]
+    if audio == "copiar":
+        cmd += ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", f"{int(s.get('audio_kbps') or 128)}k", "-ar", "48000", "-ac", "2"]
+    cmd += ["-rw_timeout", "15000000",  # desiste em 15 s se o servidor RTMP não responder
+            "-f", "flv", "-flvflags", "no_duration_filesize", url]
+    return cmd
 
 
 def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
@@ -355,8 +411,8 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     # As saídas NÃO ficam neste processo: se uma saída falhar (ex.: SRT sem resposta), o TSDuck
     # derrubaria a entrada e a análise junto. Este processo entrega o TS a um distribuidor local
     # e cada saída roda em seu próprio processo (montar_saida), supervisionado separadamente.
-    for s in saidas:
-        _args_saida(s)  # valida a configuração de cada saída
+    for i, s in enumerate(saidas):
+        montar_saida(s, i, tsp_bin)  # valida a configuração de cada saída
     if so_analise:
         cmd += ["-O", "drop"]
     else:
@@ -365,7 +421,9 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
 
 
 def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None) -> list:
-    """Processo de uma saída: recebe o TS do distribuidor local e envia por SRT ou UDP."""
+    """Processo de uma saída: recebe o TS do distribuidor local e envia por SRT, UDP, RTP ou RTMP."""
+    if s.get("tipo") == "rtmp":
+        return _args_ffmpeg_rtmp(s, porta_entrada)
     cmd = [tsp_bin, "--realtime"]
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
@@ -374,9 +432,15 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     return cmd
 
 
+def mascarar(txt: str) -> str:
+    """Esconde senhas SRT e chaves de transmissão RTMP em textos que vão para log/painel."""
+    txt = re.sub(r"(--passphrase\s+)('[^']*'|[^\s']+)", r"\1********", txt)
+    txt = re.sub(r"(passphrase=)([^&\s']+)", r"\1********", txt)
+    return re.sub(r"(rtmps?://[^\s'\"]+/)([^/\s'\".:]+)", r"\1********", txt)
+
+
 def comando_para_log(cmd: list) -> str:
-    txt = " ".join(shlex.quote(a) for a in cmd)
-    return re.sub(r"(--passphrase\s+)('[^']*'|[^\s']+)", r"\1********", txt)
+    return mascarar(" ".join(shlex.quote(a) for a in cmd))
 
 
 # ======================================================================
@@ -1141,6 +1205,11 @@ class EstatSRT:
 # Saídas independentes e distribuidor local
 # ======================================================================
 RE_SRT_PEER_SAIDA = re.compile(r"srt: connected to (\S+)")
+# avisos normais do ffmpeg ao entrar no meio de um fluxo ao vivo (não são falhas)
+RE_FFMPEG_AVISO_NORMAL = re.compile(r"no frame!|non-existing PPS|decode_slice_header error|"
+                                    r"Last message repeated|Packet corrupt|PES packet size mismatch|"
+                                    r"Invalid timestamps|co located POCs unavailable|mmco: unref short failure|"
+                                    r"timestamp discontinuity|Non-monotonic DTS|Queue input is backward")
 
 
 def _porta_udp_livre():
@@ -1165,10 +1234,12 @@ class ProcSaida(threading.Thread):
         self.cmd = montar_saida(cfg, indice, canal.sup.get("tsp", "tsp"), self.porta)
         self.proc = None
         self.parar = threading.Event()
-        self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None}
+        self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None, "info": {}}
+        self._prog = {}
 
     def status(self):
         s = dict(self.st)
+        s["info"] = dict(self.st.get("info") or {})
         if s["desde"] and s["estado"] == "rodando":
             s["uptime_s"] = int(time.time() - s["desde"])
         return s
@@ -1191,10 +1262,26 @@ class ProcSaida(threading.Thread):
                     except ValueError:
                         pass
                 continue
+            if self.cfg.get("tipo") == "rtmp" and re.match(r"^[a-z_0-9]+=", linha):
+                k, _, v = linha.partition("=")   # progresso do ffmpeg (-progress pipe:1)
+                self._prog[k] = v.strip()
+                if k == "progress":
+                    br = re.match(r"([\d.]+)kbits/s", self._prog.get("bitrate", ""))
+                    self.st["info"] = {"taxa_kbps": float(br.group(1)) if br else 0,
+                                       "velocidade": self._prog.get("speed", "").strip(),
+                                       "quadros": int(self._prog.get("frame", 0) or 0),
+                                       "fps": float(self._prog.get("fps", 0) or 0)}
+                    if self.st["estado"] != "rodando":
+                        self.st.update(estado="rodando", desde=time.time())
+                continue
             mp = RE_SRT_PEER_SAIDA.search(linha)
             if mp and est:
                 est.peer = mp.group(1)
                 self.st.update(estado="rodando", desde=time.time())
+            linha = mascarar(linha)
+            if RE_FFMPEG_AVISO_NORMAL.search(linha):
+                log.debug("[%s] [saída %d] %s", self.canal.name, self.indice + 1, linha)
+                continue
             self.canal._registrar(logging.INFO, f"[saída {self.indice + 1}] {linha}")
             self.st["ultima_msg"] = linha[-300:]
 
@@ -1209,12 +1296,13 @@ class ProcSaida(threading.Thread):
                 self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                              text=True, bufsize=1)
             except FileNotFoundError:
-                self.st.update(estado="erro", ultima_msg="tsp não encontrado")
+                self.st.update(estado="erro", ultima_msg=f"{self.cmd[0]} não encontrado"
+                               + (" (sudo apt install ffmpeg)" if self.cmd[0] == "ffmpeg" else ""))
                 self.parar.wait(espera_max)
                 continue
             # UDP não tem "conexão": está no ar assim que o processo sobe
-            self.st.update(estado="rodando" if self.cfg.get("tipo") == "udp" else "conectando",
-                           desde=t0 if self.cfg.get("tipo") == "udp" else None)
+            udp = self.cfg.get("tipo") in ("udp", "rtp")
+            self.st.update(estado="rodando" if udp else "conectando", desde=t0 if udp else None, info={})
             self._ler(self.proc.stdout)
             rc = self.proc.wait()
             if self.parar.is_set():
@@ -1223,7 +1311,7 @@ class ProcSaida(threading.Thread):
                 espera = espera_min
             self.st["reinicios"] += 1
             self.st.update(estado="reiniciando", desde=None)
-            self.canal._registrar(logging.ERROR, f"[saída {self.indice + 1}] tsp saiu (código {rc}). "
+            self.canal._registrar(logging.ERROR, f"[saída {self.indice + 1}] {os.path.basename(self.cmd[0])} saiu (código {rc}). "
                                   f"Tentando de novo em {espera}s.")
             self.parar.wait(espera)
             espera = min(espera * 2, espera_max)
@@ -1389,6 +1477,7 @@ class Canal(threading.Thread):
                 self._set(bitrate_bps=bps, ultimo_bitrate_em=time.time(), estado="rodando")
                 log.debug("[%s] %s", self.name, linha)
                 continue
+            linha = mascarar(linha)
             if RE_ALARME.search(linha):
                 with self.lock:
                     self.st["alarmes_bitrate"] += 1
@@ -1911,6 +2000,13 @@ def cmd_verificar(args):
     asi = sorted(f for f in os.listdir("/dev") if f.startswith("asirx")) if os.path.isdir("/dev") else []
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
     print("PyYAML: " + ("instalado" if yaml else "ausente (configuração será salva em JSON)"))
+    ff = shutil.which("ffmpeg")
+    if ff:
+        r = subprocess.run([ff, "-hide_banner", "-protocols"], capture_output=True, text=True)
+        tem = "rtmps" in r.stdout
+        print(f"✓ ffmpeg (saídas RTMP{'/RTMPS' if tem else ''})")
+    else:
+        print("· ffmpeg ausente (só necessário para saídas RTMP)  ->  sudo apt install ffmpeg")
     return 0 if ok else 1
 
 
@@ -2436,12 +2532,17 @@ const CS={
  srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
       ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25]],
- udp:[['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']]};
+ udp:[['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']],
+ rtp:[['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text',''],
+      ['payload_type','Payload type','number',33],['ssrc','SSRC (opcional)','text','']],
+ rtmp:[['url','Servidor (ex.: rtmp://a.rtmp.youtube.com/live2)','text',''],['chave','Chave de transmissão','password',''],['video','Vídeo','sel:copiar,h264','copiar'],['audio','Áudio','sel:aac,copiar','aac'],
+      ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['programa','Programa/serviço (vazio = 1º)','text','']]};
 const NOMES_E={srt:'SRT',udp:'UDP / Multicast',dektec:'ASI — placa DekTec',linuxasi:'ASI — driver Linux (DVEO)',arquivo:'Arquivo .ts'};
 
 function resE(e){switch(e.tipo){case'dektec':return`DekTec ${e.dispositivo??0}:${e.canal??0}`;case'linuxasi':return`ASI ${e.dispositivo}`;
  case'udp':return`UDP ${e.endereco}`;case'srt':return`SRT ${e.modo} ${e.endereco}${e.senha?' 🔒':''}`;case'arquivo':return`Arquivo ${(e.caminho||'').split('/').pop()}`}return e.tipo}
-const resS=s=>s.tipo==='udp'?`UDP ${s.endereco}`:`SRT ${s.modo} ${s.endereco}${s.senha?' 🔒':''}`;
+const urlSemChave=u=>String(u||'').replace(/^(rtmps?:\/\/[^?#]+\/)[^/?#]+/,'$1••••');
+const resS=s=>s.tipo==='udp'?`UDP ${s.endereco}`:s.tipo==='rtp'?`RTP ${s.endereco}`:s.tipo==='rtmp'?(s.chave?String(s.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(s.url)).replace(/^rtmp/,'RTMP').replace(/^RTMPs/,'RTMPS'):`SRT ${s.modo} ${s.endereco}${s.senha?' 🔒':''}`;
 
 function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=Math.max(...h)*1.15||1,w=100,hh=38;
  const p=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(2)},${(hh-v/mx*hh).toFixed(2)}`).join(' ');
@@ -2490,8 +2591,8 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
 
 let VIS='rotas';try{VIS=localStorage.getItem('asi2srt.vis')||'rotas'}catch(e){}
-const TIPO_TXT={srt:'SRT',udp:'UDP',dektec:'ASI',linuxasi:'ASI',arquivo:'ARQ'};
-function endTxt(x){return x.tipo==='srt'?`${x.modo==='listener'?'listener :':'caller → '}${x.endereco}`:x.tipo==='udp'?x.endereco:x.tipo==='dektec'?`placa ${x.dispositivo??0} · porta ${x.canal??0}`:x.tipo==='linuxasi'?x.dispositivo:(x.caminho||'').split('/').pop()}
+const TIPO_TXT={srt:'SRT',udp:'UDP',rtp:'RTP',rtmp:'RTMP',dektec:'ASI',linuxasi:'ASI',arquivo:'ARQ'};
+function endTxt(x){return x.tipo==='rtmp'?(x.chave?String(x.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(x.url))+(x.video==='h264'?' · vídeo→H.264':'')+(x.audio==='aac'?' · áudio→AAC':''):x.tipo==='rtp'?x.endereco:x.tipo==='srt'?`${x.modo==='listener'?'listener :':'caller → '}${x.endereco}`:x.tipo==='udp'?x.endereco:x.tipo==='dektec'?`placa ${x.dispositivo??0} · porta ${x.canal??0}`:x.tipo==='linuxasi'?x.dispositivo:(x.caminho||'').split('/').pop()}
 function mspark(h){if(!h||h.length<2)return'<svg class="mspark"></svg>';const v=h.map(x=>x[0]),mx=Math.max(...v)*1.2||1,mxp=Math.max(...h.map(x=>x[1]),1),W=90,H=22;
  const p=v.map((y,i)=>`${(i/(v.length-1)*W).toFixed(1)},${(H-y/mx*H).toFixed(1)}`).join(' ');
  const lp=h.some(x=>x[1]>0)?`<polyline class="lp" points="${h.map((x,i)=>`${(i/(h.length-1)*W).toFixed(1)},${(H-x[1]/mxp*H*.9).toFixed(1)}`).join(' ')}"/>`:'';
@@ -2509,7 +2610,7 @@ function no(rot,x,e,ativo,ps){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp
  else if(ps&&ativo){const ok=ps.estado==='rodando';st=`<span class="st ${ok?'ativo':'aguardando'}"><i></i>${ok?'ativo':ps.estado}</span>`}
  else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
- <span class="chips">${st}${e?chipsSRT(e):''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
+ <span class="chips">${st}${e?chipsSRT(e):''}${ps&&ps.info&&ps.info.taxa_kbps&&ps.estado==='rodando'?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>${ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
  const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
@@ -2558,7 +2659,9 @@ function desenhar(){const c=editando,e=c.entrada,p=c.processamento||{};
  ${c.saidas.map((s,i)=>`<div class="saida"><div class="sh"><span>${i===0?'Principal':'Cópia '+i} — ${s.tipo.toUpperCase()}</span>
   <button type="button" class="mini perigo" data-rm="${i}">Remover</button></div>
   <input type="hidden" name="s.${i}.tipo" value="${s.tipo}"><div class="campos">${CS[s.tipo].map(f=>campo(`s.${i}.`,f,s)).join('')}</div></div>`).join('')}
- <button type="button" data-add="srt">+ Saída SRT</button> <button type="button" data-add="udp">+ Saída UDP</button></fieldset>`;
+ <button type="button" data-add="srt">+ Saída SRT</button> <button type="button" data-add="udp">+ Saída UDP</button>
+ <button type="button" data-add="rtp">+ Saída RTP</button> <button type="button" data-add="rtmp">+ Saída RTMP</button>
+ ${c.saidas.some(s=>s.tipo==='rtmp')?'<p class="msg" style="white-space:normal;margin:8px 0 0">RTMP aceita H.264 + AAC. Padrão: copia o vídeo e converte o áudio para AAC (ISDB-Tb usa AAC LATM). Escolha "h264" no vídeo se a origem for MPEG-2 ou HEVC (usa mais CPU).</p>':''}</fieldset>`;
  $('#etipo').onchange=()=>{coletar();editando.entrada.tipo=$('#etipo').value;desenhar()};
  $('#dcorpo').querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{coletar();editando.saidas.splice(+b.dataset.rm,1);desenhar()});
  $('#dcorpo').querySelectorAll('[data-add]').forEach(b=>b.onclick=()=>{coletar();editando.saidas.push({tipo:b.dataset.add});desenhar()})}
