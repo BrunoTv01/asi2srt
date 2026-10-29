@@ -59,6 +59,16 @@ def test_comando_dektec_srt():
     assert "senhasecreta1" not in a.comando_para_log(cmd)
 
 
+def test_comando_com_analise():
+    canal = {"entrada": a.entrada_de_texto("dektec:0:0"), "saidas": [a.saida_de_url("udp://1.2.3.4:5")]}
+    cmd = a.montar_comando(canal, porta_analise=40000)
+    i = cmd.index("fork")
+    assert cmd.index("fork") < cmd.index("filter")          # analisa o TS bruto, antes do filtro
+    assert "-O ip 127.0.0.1:40000" in cmd[i + 4]
+    canal["processamento"] = {"analise_tr101290": False}
+    assert "fork" not in a.montar_comando(canal, porta_analise=40000)
+
+
 def test_comando_srt_para_udp_e_srt():
     canal = {"entrada": a.entrada_de_texto("srt://:9000?mode=listener"),
              "saidas": [a.saida_de_url("udp://239.1.1.1:1234?ttl=4"),
@@ -166,7 +176,9 @@ def test_api_completa(gateway):
     time.sleep(2.5)
     _, lista = _req(base, "GET", "/api/canais")
     st = lista[0]["status"]
-    assert st["estado"] == "rodando" and st["bitrate_bps"] == 8000000 and st["erros_cc"] >= 1
+    assert st["estado"] == "rodando" and st["bitrate_bps"] == 8000000
+    assert set(st["tr101290"]["contadores"]) == {"sync_loss", "sync_byte", "cc", "pat", "pmt", "pid"}
+    assert _req(base, "POST", f"/api/canais/{cid}/zerar")[0] == 200
     assert len(_req(base, "GET", f"/api/canais/{cid}/log")[1]) >= 1
 
     # inválido é rejeitado

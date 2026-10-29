@@ -4,7 +4,8 @@ asi2srt - gateway DVB-ASI / UDP / SRT  ->  SRT / UDP, em um único programa.
 
 Captura um transport stream (placa DVB-ASI DekTec ou driver Linux ASI/DVEO, UDP,
 SRT ou arquivo) e o reenvia para uma ou mais saídas SRT e/ou UDP, usando o
-TSDuck (tsp) como motor. Inclui painel web para gerenciar os canais.
+TSDuck (tsp) como motor. Inclui painel web para gerenciar os canais e análise
+TR 101 290 Prioridade 1 (sync loss, sync byte, CC, PAT, PMT, PID) de cada entrada.
 
 Subcomandos:
   rodar             executa o gateway + painel web (http://IP:8088)
@@ -45,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -84,6 +85,7 @@ canais:
       # arquivo: caminho: teste.ts   loop: true
 
     processamento:
+      analise_tr101290: true  # sync loss, sync byte, CC, PAT, PMT, PID (TR 101 290 P1)
       remover_nulos: true     # tira o stuffing (PID 0x1FFF) e economiza banda
       remover_pids: []        # PIDs a descartar, ex.: ["0x0012", "0x0014"]
       bitrate_min: 1000000    # alarme abaixo disto (bit/s). 0 = desligado
@@ -268,7 +270,8 @@ def _args_saida(s: dict) -> list:
     raise ValueError(f"tipo de saída desconhecido: {tipo}")
 
 
-def montar_comando(canal: dict, tsp_bin: str = "tsp") -> list:
+def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> list:
+    """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
     canal = normalizar_canal(canal)
     ent = canal["entrada"]
     proc = canal.get("processamento") or {}
@@ -304,9 +307,13 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp") -> list:
     else:
         raise ValueError(f"tipo de entrada desconhecido: {tipo}")
 
-    cmd += ["-P", "continuity"]
+    # cópia do TS bruto (logo após a entrada, antes de filtros) para o analisador TR 101 290
+    if porta_analise and proc.get("analise_tr101290", True):
+        filho = [tsp_bin, "-O", "ip", f"127.0.0.1:{porta_analise}", "--packet-burst", "7"]
+        cmd += ["-P", "fork", "--nowait", "--buffered-packets", "7",
+                " ".join(shlex.quote(a) for a in filho)]
 
-    pids = [_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
+    pids =[_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
     if proc.get("remover_nulos", True):
         pids.append(0x1FFF)
     if pids:
@@ -336,10 +343,267 @@ def comando_para_log(cmd: list) -> str:
 
 
 # ======================================================================
+# Analisador TR 101 290 - Prioridade 1
+# ======================================================================
+TIPOS_TR101290 = ("sync_loss", "sync_byte", "cc", "pat", "pmt", "pid")
+
+
+class AnalisadorTS:
+    """Verificações TR 101 290 (ETSI) de Prioridade 1 sobre o TS recebido:
+
+      1.1 TS sync loss    - 2+ sync bytes corrompidos seguidos, ou perda do sinal de entrada
+                            (sem pacotes por mais de 1 s); volta ao sync após 5 bons
+      1.2 Sync byte error - pacote com sync byte diferente de 0x47
+      1.3 PAT error       - PID 0 ausente por mais de 0,5 s, table_id != 0x00 ou PAT embaralhada
+      1.4 CC error        - contador de continuidade fora de ordem, perdido ou duplicado 2x
+      1.5 PMT error       - PID de PMT (citado na PAT) ausente por mais de 0,5 s,
+                            table_id != 0x02 ou PMT embaralhada
+      1.6 PID error       - PID citado em uma PMT ausente por mais de 5 s
+
+    Métodos recebem o instante (monotônico) como parâmetro para facilitar testes.
+    """
+    LIM_PAT = 0.5
+    LIM_PMT = 0.5
+    LIM_PID = 5.0
+    LIM_SINAL = 1.0
+    RECENTE_S = 10.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.zerar()
+        self.reiniciar_estado()
+        self._sock = None
+        self._parar = threading.Event()
+        self.porta = None
+
+    # --- estado -------------------------------------------------------
+    def zerar(self):
+        self.cont = {t: 0 for t in TIPOS_TR101290}
+        self.ultimo_erro = {}
+        self.desde = time.time()
+
+    def reiniciar_estado(self):
+        """Esquece o estado do fluxo (usado em cada (re)início do tsp e retomada de sinal)."""
+        self.cc = {}            # pid -> (último cc, já houve duplicado)
+        self.visto = {}         # pid -> último instante em que chegou
+        self.ref = {}           # pid -> instante em que passou a ser exigido
+        self.reportado = {}     # pid -> último instante em que gerou erro de ausência
+        self.pmt_pids = {}      # pid da PMT -> número do programa
+        self.es_pids = {}       # pid elementar -> (pid da PMT, stream_type)
+        self.secoes = {}        # pid -> bytes acumulados da seção
+        self.em_sync = True
+        self.ruins = 0
+        self.bons = 0
+        self.ultimo_pacote = None
+        self.inicio_fluxo = None
+        self.fluindo = False
+        self.pacotes = 0
+
+    def _erro(self, tipo, agora):
+        self.cont[tipo] += 1
+        self.ultimo_erro[tipo] = agora
+
+    # --- processamento ------------------------------------------------
+    def processar(self, dados, agora):
+        if self.ultimo_pacote is None or agora - self.ultimo_pacote >= self.LIM_SINAL:
+            # início ou retomada do sinal: zera referências de tempo e de continuidade
+            self.cc.clear()
+            self.visto.clear()
+            self.reportado.clear()
+            self.secoes.clear()
+            self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
+            self.inicio_fluxo = agora
+        self.ultimo_pacote = agora
+        self.fluindo = True
+        n = len(dados) // 188
+        self.pacotes += n
+        for i in range(0, n * 188, 188):
+            p = dados[i:i + 188]
+            if p[0] != 0x47:
+                self._erro("sync_byte", agora)
+                self.ruins += 1
+                self.bons = 0
+                if self.em_sync and self.ruins >= 2:
+                    self.em_sync = False
+                    self._erro("sync_loss", agora)
+                continue
+            self.ruins = 0
+            if not self.em_sync:
+                self.bons += 1
+                if self.bons >= 5:
+                    self.em_sync = True
+                    self.bons = 0
+                continue
+            pid = ((p[1] & 0x1F) << 8) | p[2]
+            self.visto[pid] = agora
+            if pid == 0x1FFF:
+                continue
+            afc = (p[3] >> 4) & 3
+            # continuidade (só pacotes com carga útil)
+            if afc & 1:
+                cc = p[3] & 0x0F
+                disc = (afc & 2) and p[4] > 0 and (p[5] & 0x80)
+                ant = self.cc.get(pid)
+                if ant is None or disc:
+                    self.cc[pid] = (cc, False)
+                elif cc == ant[0]:
+                    if ant[1]:
+                        self._erro("cc", agora)
+                    self.cc[pid] = (cc, True)
+                else:
+                    if cc != (ant[0] + 1) & 0x0F:
+                        self._erro("cc", agora)
+                    self.cc[pid] = (cc, False)
+            # PSI: PAT e PMTs
+            if pid == 0 or pid in self.pmt_pids:
+                if p[3] >> 6:
+                    self._erro("pat" if pid == 0 else "pmt", agora)
+                elif afc & 1:
+                    self._secao(pid, p, afc, agora)
+
+    def _secao(self, pid, p, afc, agora):
+        ini = 5 + p[4] if afc & 2 else 4
+        if ini >= 188:
+            return
+        carga = p[ini:]
+        if p[1] & 0x40:  # payload_unit_start: começa uma seção após o pointer_field
+            ptr = carga[0]
+            self.secoes[pid] = bytearray(carga[1 + ptr:])
+        elif pid in self.secoes:
+            self.secoes[pid] += carga
+        else:
+            return
+        buf = self.secoes[pid]
+        if len(buf) < 3:
+            return
+        if buf[0] == 0xFF:
+            del self.secoes[pid]
+            return
+        tam = (((buf[1] & 0x0F) << 8) | buf[2]) + 3
+        if len(buf) >= tam:
+            del self.secoes[pid]
+            self._tabela(pid, bytes(buf[:tam]), agora)
+        elif len(buf) > 4096:
+            del self.secoes[pid]
+
+    def _tabela(self, pid, sec, agora):
+        if len(sec) < 12:
+            return
+        if pid == 0:
+            if sec[0] != 0x00:
+                self._erro("pat", agora)
+                return
+            novos = {}
+            for j in range(8, len(sec) - 4 - 3, 4):
+                prog = (sec[j] << 8) | sec[j + 1]
+                ppid = ((sec[j + 2] & 0x1F) << 8) | sec[j + 3]
+                if prog != 0:
+                    novos[ppid] = prog
+            if novos != self.pmt_pids:
+                for ppid in novos:
+                    if ppid not in self.pmt_pids:
+                        self.ref[ppid] = agora
+                self.pmt_pids = novos
+                self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] in novos}
+            return
+        # PMT
+        if sec[0] != 0x02:
+            self._erro("pmt", agora)
+            return
+        pil = ((sec[10] & 0x0F) << 8) | sec[11]
+        j = 12 + pil
+        es = {}
+        while j + 5 <= len(sec) - 4:
+            epid = ((sec[j + 1] & 0x1F) << 8) | sec[j + 2]
+            es[epid] = (pid, sec[j])
+            j += 5 + (((sec[j + 3] & 0x0F) << 8) | sec[j + 4])
+        for epid in es:
+            if epid not in self.es_pids:
+                self.ref[epid] = agora
+        self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] != pid}
+        self.es_pids.update(es)
+
+    def verificar(self, agora):
+        """Checagens por tempo (chamar algumas vezes por segundo)."""
+        if self.ultimo_pacote is None:
+            return
+        fluindo = agora - self.ultimo_pacote < self.LIM_SINAL
+        if self.fluindo and not fluindo:
+            self._erro("sync_loss", agora)  # perda do sinal de entrada
+        self.fluindo = fluindo
+        if not fluindo:
+            return
+
+        def ausente(pid, lim, tipo, desde):
+            ult = self.visto.get(pid, desde)
+            if agora - ult > lim and agora - self.reportado.get(pid, -1e9) > lim:
+                self._erro(tipo, agora)
+                self.reportado[pid] = agora
+
+        ausente(0, self.LIM_PAT, "pat", self.inicio_fluxo)
+        for ppid in self.pmt_pids:
+            ausente(ppid, self.LIM_PMT, "pmt", self.ref.get(ppid, agora))
+        for epid in self.es_pids:
+            ausente(epid, self.LIM_PID, "pid", self.ref.get(epid, agora))
+
+    def status(self, agora=None):
+        agora = time.monotonic() if agora is None else agora
+        with self.lock:
+            fluindo = self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL
+            ausentes = sorted(p for p in self.es_pids
+                              if agora - self.visto.get(p, self.ref.get(p, agora)) > self.LIM_PID)
+            return {
+                "contadores": dict(self.cont),
+                "recentes": [t for t, q in self.ultimo_erro.items() if agora - q < self.RECENTE_S],
+                "sinal": fluindo,
+                "em_sync": self.em_sync,
+                "programas": len(self.pmt_pids),
+                "pids_referenciados": len(self.es_pids),
+                "pids_ausentes": [f"0x{p:04X}" for p in ausentes],
+                "pacotes": self.pacotes,
+                "desde": self.desde,
+            }
+
+    # --- recepção pela rede local -------------------------------------
+    def abrir(self):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        except OSError:
+            pass
+        s.bind(("127.0.0.1", 0))
+        s.settimeout(0.25)
+        self._sock = s
+        self.porta = s.getsockname()[1]
+        threading.Thread(target=self._loop, daemon=True, name="tr101290").start()
+        return self.porta
+
+    def _loop(self):
+        ultima = 0.0
+        while not self._parar.is_set():
+            try:
+                dados = self._sock.recv(65536)
+                agora = time.monotonic()
+                with self.lock:
+                    self.processar(dados, agora)
+            except OSError:  # timeout ou socket fechado
+                agora = time.monotonic()
+            if agora - ultima >= 0.25:
+                ultima = agora
+                with self.lock:
+                    self.verificar(agora)
+
+    def fechar(self):
+        self._parar.set()
+        if self._sock:
+            self._sock.close()
+
+
+# ======================================================================
 # Supervisor de um canal
 # ======================================================================
 RE_BITRATE = re.compile(r"bitrate_monitor:.*?([\d,.]+)\s*b(?:its)?/s", re.I)
-RE_CC = re.compile(r"continuity:.*(missing|discontinuity|duplicate)", re.I)
 RE_ALARME = re.compile(r"bitrate_monitor:.*(lower|greater|exceed|below|above|alarm)", re.I)
 
 
@@ -348,13 +612,16 @@ class Canal(threading.Thread):
         super().__init__(daemon=True, name=cfg.get("nome", "canal"))
         self.cfg = cfg
         self.sup = sup
-        self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"))
+        montar_comando(cfg, sup.get("tsp", "tsp"))  # valida antes de abrir recursos
+        self.analisador = AnalisadorTS()
+        porta = self.analisador.abrir()
+        self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta)
         self.proc = None
         self.parar = threading.Event()
         self.lock = threading.Lock()
         self.log = collections.deque(maxlen=300)
         self.hist = collections.deque(maxlen=60)
-        self.st = {"estado": "iniciando", "bitrate_bps": 0, "erros_cc": 0,
+        self.st = {"estado": "iniciando", "bitrate_bps": 0,
                    "alarmes_bitrate": 0, "reinicios": 0, "inicio_execucao": None,
                    "ultimo_bitrate_em": None, "ultima_msg": ""}
 
@@ -376,7 +643,16 @@ class Canal(threading.Thread):
         if s["estado"] == "rodando" and s["ultimo_bitrate_em"] \
                 and time.time() - s["ultimo_bitrate_em"] > 3 * intervalo:
             s["estado"] = "sem_dados"
+        s["tr101290"] = self.analisador.status()
+        s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         return s
+
+    def zerar_contadores(self):
+        with self.analisador.lock:
+            self.analisador.zerar()
+        with self.lock:
+            self.st["alarmes_bitrate"] = 0
+            self.st["reinicios"] = 0
 
     def _ler_saida(self, stream):
         for linha in iter(stream.readline, ""):
@@ -391,11 +667,7 @@ class Canal(threading.Thread):
                 self._set(bitrate_bps=bps, ultimo_bitrate_em=time.time(), estado="rodando")
                 log.debug("[%s] %s", self.name, linha)
                 continue
-            if RE_CC.search(linha):
-                with self.lock:
-                    self.st["erros_cc"] += 1
-                self._registrar(logging.WARNING, linha)
-            elif RE_ALARME.search(linha):
+            if RE_ALARME.search(linha):
                 with self.lock:
                     self.st["alarmes_bitrate"] += 1
                 self._registrar(logging.WARNING, linha)
@@ -409,6 +681,8 @@ class Canal(threading.Thread):
         espera = espera_min
         while not self.parar.is_set():
             self._registrar(logging.INFO, "iniciando: " + comando_para_log(self.cmd))
+            with self.analisador.lock:
+                self.analisador.reiniciar_estado()
             t0 = time.time()
             try:
                 self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE,
@@ -444,6 +718,7 @@ class Canal(threading.Thread):
                 p.wait(5)
             except subprocess.TimeoutExpired:
                 p.kill()
+        self.analisador.fechar()
 
 
 # ======================================================================
@@ -512,6 +787,11 @@ class Gerenciador:
         self.parar(cid, marcar=False)
         self.iniciar(cid)
 
+    def zerar(self, cid):
+        t = self.exec.get(cid)
+        if t:
+            t.zerar_contadores()
+
     def salvar_canal(self, dados: dict, cid=None) -> dict:
         dados = dict(dados)
         dados.pop("status", None)
@@ -549,7 +829,8 @@ class Gerenciador:
         for cid, c in itens:
             t = self.exec.get(cid)
             st = t.status() if t else {"estado": "parado", "bitrate_bps": 0, "erros_cc": 0,
-                                       "alarmes_bitrate": 0, "reinicios": 0, "historico": []}
+                                       "alarmes_bitrate": 0, "reinicios": 0, "historico": [],
+                                       "tr101290": None}
             out.append({**c, "status": st})
         return out
 
@@ -615,7 +896,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__).encode(),
                                       "text/html; charset=utf-8")
                 if metodo == "GET" and caminho == "/status.json":
-                    return self._resp(200, [{"nome": c["nome"], "id": c["id"], **c["status"]}
+                    return self._resp(200, [{"nome": c["nome"], "id": c["id"],
+                                             **{k: v for k, v in c["status"].items() if k != "historico"}}
                                             for c in ger.listar()])
                 if metodo == "GET" and caminho == "/api/info":
                     return self._resp(200, {"versao": __version__, "config": ger.caminho,
@@ -644,7 +926,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         if metodo == "GET" and acao == "comando":
                             return self._resp(200, {"comando": comando_para_log(
                                 montar_comando(ger.defs[cid], ger.sup.get("tsp", "tsp")))})
-                        if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar"):
+                        if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar", "zerar"):
                             getattr(ger, acao)(cid)
                             return self._resp(200, {"ok": True})
                 return self._resp(404, {"erro": "rota não encontrada"})
@@ -751,7 +1033,7 @@ def cmd_comando(args):
     for c in cfg.get("canais") or []:
         c = normalizar_canal(c)
         print(f"# {c['nome']}{'' if c.get('ativo', True) else ' (inativo)'}")
-        print(comando_para_log(montar_comando(c, tsp)) + "\n")
+        print(comando_para_log(montar_comando(c, tsp, porta_analise="PORTA_LOCAL")) + "\n")
 
 
 def cmd_init(args):
@@ -773,7 +1055,7 @@ def cmd_verificar(args):
     print(f"✓ TSDuck: {(ver.stdout or ver.stderr).strip().splitlines()[0]}")
     plugins = subprocess.run([tsp, "--list-plugins"], capture_output=True, text=True)
     texto = plugins.stdout + plugins.stderr
-    for nome, obrig in (("srt", True), ("ip", True), ("fork", True), ("continuity", True),
+    for nome, obrig in (("srt", True), ("ip", True), ("fork", True),
                         ("bitrate_monitor", True), ("filter", True), ("dektec", False)):
         tem = re.search(rf"\b{nome}\b", texto) is not None
         print(f"{'✓' if tem else ('✗' if obrig else '·')} plugin {nome}"
@@ -930,11 +1212,23 @@ main{padding:20px;max-width:1400px;margin:auto}
 .fluxo{display:flex;flex-direction:column;gap:3px;font-size:12.5px}
 .fluxo .l{color:var(--mut);display:inline-block;width:52px}
 .tag{display:inline-block;background:var(--in);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin:1px 4px 1px 0;font-family:ui-monospace,monospace;font-size:12px}
-.met{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:6px;align-items:end}
+.met{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:6px;align-items:end}
 .met div{display:flex;flex-direction:column}.met small{color:var(--mut);font-size:11px}
 .met b{font-size:15px;font-variant-numeric:tabular-nums}.met .big{font-size:22px}
 .spark{width:100%;height:38px;display:block}.spark polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}
 .spark .area{fill:var(--acc);opacity:.12;stroke:none}
+.tr{border:1px solid var(--line);border-radius:9px;padding:8px;background:#11161d}
+.trh{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--mut);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.trh .semsinal{color:var(--err);font-weight:600}
+.lamps{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
+.lamp{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:6px;padding:5px 7px;border-radius:6px;background:var(--in);border:1px solid transparent}
+.lamp i{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.lamp.w i{background:var(--warn);box-shadow:0 0 6px var(--warn)}
+.lamp.e{border-color:#5c1f22}.lamp.e i{background:var(--err);box-shadow:0 0 9px var(--err)}
+.lamp.x i{background:#484f58;box-shadow:none}
+.lamp small{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lamp b{font-variant-numeric:tabular-nums;font-size:12.5px}.lamp.e b{color:var(--err)}
+.aus{font-size:11.5px;color:var(--err);margin-top:6px;font-family:ui-monospace,monospace}
 .msg{font-size:11.5px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:16px}
 .acoes{display:flex;gap:6px;flex-wrap:wrap}
 button{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer}
@@ -960,6 +1254,7 @@ max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#3d1214;border:1px solid var(--err);
 color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .toast.bom{background:#0f2e17;border-color:var(--ok);color:#c9f5d1}
+@media(max-width:420px){.lamps{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>asi2srt</h1><span class="v">v__VERSAO__</span><span class="sp"></span>
@@ -1009,16 +1304,28 @@ function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=M
  return`<svg class="spark" viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none"><polygon class="area" points="0,${hh} ${p} ${w},${hh}"/><polyline points="${p}"/></svg>`}
 
 let dados=[],editando=null,logId=null;
+const TR=[['sync_loss','TS sync loss','1.1 Perda de sincronismo: 2+ sync bytes errados seguidos ou perda do sinal de entrada'],
+ ['sync_byte','Sync byte','1.2 Pacote com sync byte diferente de 0x47'],
+ ['pat','PAT','1.3 PAT ausente por mais de 0,5 s, table_id errado ou embaralhada'],
+ ['cc','Continuity','1.4 Contador de continuidade fora de ordem, perdido ou duplicado'],
+ ['pmt','PMT','1.5 PMT ausente por mais de 0,5 s, table_id errado ou embaralhada'],
+ ['pid','PID','1.6 PID citado na PMT ausente por mais de 5 s']];
+function tr(s){const t=s.tr101290;if(!t)return'';
+ const info=t.sinal?`${t.programas} prog · ${t.pids_referenciados} PIDs`:'<span class="semsinal">sem sinal</span>';
+ return`<div class="tr"><div class="trh"><span>TR 101 290 · Prioridade 1</span><span>${info}</span></div><div class="lamps">
+ ${TR.map(([k,n,d])=>{const v=t.contadores[k]||0,c=t.recentes.includes(k)?'e':v?'w':(t.sinal?'':'x');
+  return`<div class="lamp ${c}" title="${esc(d)}"><i></i><small>${n}</small><b>${v}</b></div>`}).join('')}</div>
+ ${t.pids_ausentes.length?`<div class="aus">PIDs ausentes: ${t.pids_ausentes.map(esc).join(', ')}</div>`:''}</div>`}
 function card(c){const s=c.status||{},ativo=s.estado!=='parado';
  return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
  <div><span class="l">Saídas</span>${c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join('')}</div></div>
  ${spark(s.historico)}
  <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
- <div><small>Erros CC</small><b style="color:${s.erros_cc?'var(--err)':''}">${s.erros_cc||0}</b></div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>
+ ${tr(s)}
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
- <div class="acoes">${ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻ Reiniciar</button>`
+ <div class="acoes">${ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻ Reiniciar</button><button data-a="zerar" data-id="${c.id}" title="Zerar contadores">Zerar</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>`}
  <button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
@@ -1044,6 +1351,7 @@ function desenhar(){const c=editando,e=c.entrada,p=c.processamento||{};
  ${Object.entries(NOMES_E).map(([k,n])=>`<option value="${k}" ${e.tipo===k?'selected':''}>${n}</option>`).join('')}</select></label>
  ${CE[e.tipo].map(f=>campo('e.',f,e)).join('')}</div></fieldset>
  <fieldset><legend>Processamento</legend><div class="campos">
+ <label class="chk"><input type="checkbox" name="p.analise_tr101290" ${p.analise_tr101290!==false?'checked':''}> Análise TR 101 290</label>
  <label class="chk"><input type="checkbox" name="p.remover_nulos" ${p.remover_nulos!==false?'checked':''}> Remover pacotes nulos</label>
  <label>PIDs a remover (ex.: 0x12, 0x14)<input name="p.remover_pids" value="${esc((p.remover_pids||[]).join(', '))}"></label>
  <label>Alarme bitrate mín. (Mb/s)<input type="number" step="0.1" name="p.bitrate_min" value="${(p.bitrate_min||0)/1e6}"></label>
@@ -1062,7 +1370,7 @@ function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
  c.nome=g('nome').value.trim();c.ativo=g('ativo').checked;
  const tipo=g('e_tipo').value,ent={...c.entrada,tipo};
  CE[tipo].forEach(([k,,t])=>{const v=val(g('e.'+k),t);if(v!==undefined)ent[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});c.entrada=ent;
- c.processamento={...(c.processamento||{}),remover_nulos:g('p.remover_nulos').checked,
+ c.processamento={...(c.processamento||{}),remover_nulos:g('p.remover_nulos').checked,analise_tr101290:g('p.analise_tr101290').checked,
   remover_pids:g('p.remover_pids').value.split(/[,\s]+/).filter(Boolean),
   bitrate_min:Math.round(Number(g('p.bitrate_min').value||0)*1e6),bitrate_max:Math.round(Number(g('p.bitrate_max').value||0)*1e6)};
  c.saidas=c.saidas.map((s,i)=>{const o={tipo:s.tipo};CS[s.tipo].forEach(([k,,t])=>{const v=val(g(`s.${i}.${k}`),t);
@@ -1070,7 +1378,7 @@ function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
 
 function abrir(id){const c=id?dados.find(x=>x.id===id):null;
  editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'dektec'},
-  processamento:{remover_nulos:true,intervalo_relatorio_s:5},saidas:[{tipo:'srt'}]};
+  processamento:{remover_nulos:true,analise_tr101290:true,intervalo_relatorio_s:5},saidas:[{tipo:'srt'}]};
  delete editando.status;$('#dtit').textContent=c?'Editar canal':'Novo canal';desenhar();$('#dlg').showModal()}
 
 $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();

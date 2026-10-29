@@ -56,10 +56,31 @@ Pelo painel você:
 - escolhe a entrada (DekTec, Linux ASI, UDP, SRT, arquivo)
 - adiciona várias saídas SRT e UDP por canal
 - inicia, para e reinicia cada canal
-- acompanha bitrate (com gráfico), erros de continuidade, reinícios e uptime
+- acompanha bitrate (com gráfico), indicadores TR 101 290, reinícios e uptime
 - vê o log de cada canal
 
 Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive a reinícios.
+
+## Análise TR 101 290 (Prioridade 1)
+
+Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro, e mostra no painel
+uma "luz" por indicador: verde = sem erros, amarelo = já houve erros, vermelho = erro nos últimos 10 s.
+
+| Indicador | O que conta |
+|---|---|
+| **1.1 TS sync loss** | 2 ou mais sync bytes corrompidos seguidos, ou perda do sinal de entrada (sem pacotes por mais de 1 s) |
+| **1.2 Sync byte error** | pacote com sync byte diferente de `0x47` |
+| **1.3 PAT error** | PID 0 ausente por mais de 0,5 s, `table_id` diferente de `0x00` ou PAT embaralhada |
+| **1.4 Continuity count error** | contador de continuidade fora de ordem, pacote perdido ou duplicado mais de uma vez |
+| **1.5 PMT error** | PID de PMT citado na PAT ausente por mais de 0,5 s, `table_id` diferente de `0x02` ou PMT embaralhada |
+| **1.6 PID error** | PID citado em uma PMT ausente por mais de 5 s (o painel mostra quais PIDs) |
+
+Os contadores também saem no `status.json` (campo `tr101290`) para alarmes no Zabbix/Grafana,
+e podem ser zerados pelo botão **Zerar** ou por `POST /api/canais/{id}/zerar`.
+A análise pode ser desligada por canal ("Análise TR 101 290" no formulário ou `analise_tr101290: false`).
+
+Observação: placas e drivers ASI normalmente descartam pacotes sem sync antes de entregá-los
+ao software, então na prática o "TS sync loss" aparece sobretudo como perda do sinal de entrada.
 
 ## Linha de comando (sem painel nem arquivo)
 
@@ -124,7 +145,7 @@ Todas as rotas usam autenticação básica. Rotas que alteram algo exigem o cabe
 | GET | `/api/canais` | lista canais e status |
 | POST | `/api/canais` | cria canal |
 | PUT / DELETE | `/api/canais/{id}` | edita / exclui |
-| POST | `/api/canais/{id}/iniciar` · `parar` · `reiniciar` | controle |
+| POST | `/api/canais/{id}/iniciar` · `parar` · `reiniciar` · `zerar` | controle |
 | GET | `/api/canais/{id}/log` · `comando` | log / comando tsp |
 
 ## Teste sem hardware
@@ -148,7 +169,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.0.0 && git push origin v2.0.0
+git tag v2.1.0 && git push origin v2.1.0
 ```
 
 ## Licença
