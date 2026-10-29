@@ -44,8 +44,8 @@ asi2srt verificar
 asi2srt rodar
 ```
 
-Abra `http://IP-DO-SERVIDOR:8088`. Na primeira execução é gerada uma senha (usuário `admin`),
-mostrada no log e salva no arquivo de configuração.
+Abra `http://IP-DO-SERVIDOR:8088` e entre com **admin / admin**. Para trocar, altere
+`usuario` e `senha_painel` no arquivo de configuração e reinicie o serviço.
 
 ![Painel](docs/painel.png)
 
@@ -108,7 +108,7 @@ asi2srt rodar -c asi2srt.yaml
 ```bash
 sudo asi2srt instalar-servico
 sudo systemctl enable --now asi2srt
-journalctl -u asi2srt | grep "senha do painel"
+# painel: http://IP:8088  (admin / admin)
 ```
 
 ## Monitoração externa
@@ -134,7 +134,7 @@ asi2srt teste
 ```
 
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
-Painel em `http://127.0.0.1:8088` (admin / teste).
+Painel em `http://127.0.0.1:8088` (admin / admin).
 
 ## Dicas
 

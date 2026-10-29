@@ -45,7 +45,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -111,7 +111,7 @@ supervisor:
   tsp: tsp                    # caminho do executável do TSDuck
   status_http: "0.0.0.0:8088" # painel web. Vazio desativa
   usuario: admin              # login do painel
-  senha_painel: ""            # vazio = gera uma senha na 1ª execução (aparece no log)
+  senha_painel: admin         # troque se o painel ficar acessível fora da rede local
   log_arquivo: ""
 """
 
@@ -469,13 +469,13 @@ class Gerenciador:
             salvar_config(self.caminho, cfg)
 
     def garantir_senha(self):
+        self.sup.setdefault("usuario", "admin")
         if not self.sup.get("senha_painel"):
-            self.sup["senha_painel"] = secrets.token_urlsafe(9)
+            self.sup["senha_painel"] = "admin"
             self.persistir()
-            aviso = (f"senha do painel gerada -> usuário: {self.sup.get('usuario', 'admin')}  "
-                     f"senha: {self.sup['senha_painel']}"
-                     + (f"  (salva em {self.caminho})" if self.caminho else ""))
-            log.warning(aviso)
+        if self.sup["usuario"] == "admin" and self.sup["senha_painel"] == "admin":
+            log.warning("painel com login padrão admin/admin - troque 'senha_painel' em %s "
+                        "se o servidor for acessível fora da rede local", self.caminho or "--senha-painel")
 
     # --- controle ----------------------------------------------------
     def iniciar_ativos(self):
@@ -701,7 +701,7 @@ def _carregar(args):
         caminho = "asi2srt.yaml" if yaml else "asi2srt.json"
         salvar_config(caminho, {"canais": [], "supervisor": {
             "reinicio_min_s": 2, "reinicio_max_s": 60, "tsp": "tsp",
-            "status_http": "0.0.0.0:8088", "usuario": "admin", "senha_painel": ""}})
+            "status_http": "0.0.0.0:8088", "usuario": "admin", "senha_painel": "admin"}})
         log.info("nenhuma configuração encontrada; criada %s (adicione canais pelo painel)", caminho)
     cfg = carregar_config(caminho)
     sup = cfg.setdefault("supervisor", {}) or {}
@@ -871,7 +871,7 @@ def cmd_instalar_servico(args):
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     print("serviço instalado.\n"
           "  1. sudo systemctl enable --now asi2srt\n"
-          "  2. veja a senha do painel:  journalctl -u asi2srt | grep 'senha do painel'\n"
+          "  2. login do painel: admin / admin  (troque em senha_painel no arquivo de configuração)\n"
           "  3. abra http://<ip-do-servidor>:8088/ e configure os canais")
 
 
@@ -893,10 +893,10 @@ def cmd_teste(args):
                                    "latencia_ms": 120, "senha": senha},
                                   {"tipo": "udp", "endereco": "127.0.0.1:5000"}]}],
            "supervisor": {"status_http": "127.0.0.1:8088", "tsp": args.tsp,
-                          "usuario": "admin", "senha_painel": "teste"}}
+                          "usuario": "admin", "senha_painel": "admin"}}
     url = f"srt://127.0.0.1:{args.porta}?mode=caller&passphrase={senha}&latency=120000"
     print(f"\nreceptor SRT:  ffplay \"{url}\"\nreceptor UDP:  ffplay udp://127.0.0.1:5000"
-          f"\npainel:        http://127.0.0.1:8088/  (admin / teste)\nCtrl+C para sair\n")
+          f"\npainel:        http://127.0.0.1:8088/  (admin / admin)\nCtrl+C para sair\n")
     if shutil.which("ffplay") and not args.sem_player:
         threading.Timer(2, lambda: subprocess.Popen(
             ["ffplay", "-loglevel", "warning", url])).start()
@@ -1121,7 +1121,7 @@ def main(argv=None):
         p.add_argument("--bitrate-min", type=int, default=0, help="alarme de bitrate mínimo (bit/s)")
         p.add_argument("--status", default="0.0.0.0:8088", help="endereço do painel ('' desativa)")
         p.add_argument("--usuario", default="admin", help="usuário do painel")
-        p.add_argument("--senha-painel", default="", help="senha do painel (padrão: gerada)")
+        p.add_argument("--senha-painel", default="", help="senha do painel (padrão: admin)")
         p.add_argument("--tsp", default="tsp", help="caminho do tsp")
 
     p = sub.add_parser("rodar", help="executa o gateway e o painel web")
