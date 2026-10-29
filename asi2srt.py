@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -294,7 +294,7 @@ def _args_saida(s: dict, prefixo=None) -> list:
     raise ValueError(f"tipo de saída desconhecido: {tipo}")
 
 
-def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> list:
+def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
     """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
     canal = normalizar_canal(canal)
     ent = canal["entrada"]
@@ -352,12 +352,25 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
     if proc.get("bitrate_max"):
         cmd += ["--max", str(int(proc["bitrate_max"]))]
 
-    # saídas extras: cada uma recebe uma cópia do TS por um tsp filho (plugin fork)
-    for i, s in enumerate(saidas[1:], start=1):
-        filho = [tsp_bin, "--realtime", "-O"] + _args_saida(s, prefixo=f"SRTOUT{i}")
-        cmd += ["-P", "fork", "--nowait", " ".join(shlex.quote(a) for a in filho)]
+    # As saídas NÃO ficam neste processo: se uma saída falhar (ex.: SRT sem resposta), o TSDuck
+    # derrubaria a entrada e a análise junto. Este processo entrega o TS a um distribuidor local
+    # e cada saída roda em seu próprio processo (montar_saida), supervisionado separadamente.
+    for s in saidas:
+        _args_saida(s)  # valida a configuração de cada saída
+    if so_analise:
+        cmd += ["-O", "drop"]
+    else:
+        cmd += ["-O", "ip", f"127.0.0.1:{porta_dist or 'PORTA_DIST'}", "--packet-burst", "7"]
+    return cmd
 
-    cmd += ["-O", "drop"] if so_analise else ["-O"] + _args_saida(saidas[0], prefixo="SRTOUT0")
+
+def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None) -> list:
+    """Processo de uma saída: recebe o TS do distribuidor local e envia por SRT ou UDP."""
+    cmd = [tsp_bin, "--realtime"]
+    if s.get("tipo", "srt") == "srt":
+        cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
+    cmd += ["-I", "ip", f"127.0.0.1:{porta_entrada or 'PORTA_SAIDA'}", "--buffer-size", "4000000",
+            "-O"] + _args_saida(s, prefixo=f"SRTOUT{indice}")
     return cmd
 
 
@@ -1125,6 +1138,148 @@ class EstatSRT:
 
 
 # ======================================================================
+# Saídas independentes e distribuidor local
+# ======================================================================
+RE_SRT_PEER_SAIDA = re.compile(r"srt: connected to (\S+)")
+
+
+def _porta_udp_livre():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    porta = s.getsockname()[1]
+    s.close()
+    return porta
+
+
+class ProcSaida(threading.Thread):
+    """Uma saída do canal rodando no próprio processo tsp, com reinício independente."""
+
+    def __init__(self, canal, indice, cfg):
+        super().__init__(daemon=True, name=f"{canal.name}-saida{indice + 1}")
+        self.canal = canal
+        self.indice = indice
+        self.cfg = cfg
+        self.chave = f"SRTOUT{indice}"
+        self.porta = _porta_udp_livre()
+        self.cmd = montar_saida(cfg, indice, canal.sup.get("tsp", "tsp"), self.porta)
+        self.proc = None
+        self.parar = threading.Event()
+        self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None}
+
+    def status(self):
+        s = dict(self.st)
+        if s["desde"] and s["estado"] == "rodando":
+            s["uptime_s"] = int(time.time() - s["desde"])
+        return s
+
+    def _ler(self, stream):
+        est = self.canal.srt.get(self.chave)
+        for linha in iter(stream.readline, ""):
+            linha = linha.rstrip()
+            if not linha:
+                continue
+            ms = RE_SRT_ESTAT.search(linha)
+            if ms:
+                if est and ms.group(1) == self.chave:
+                    try:
+                        dados = json.loads(ms.group(2))
+                        with self.canal.lock:
+                            est.atualizar(dados, time.monotonic())
+                        self.st["estado"] = "rodando"
+                        self.st["desde"] = self.st["desde"] or time.time()
+                    except ValueError:
+                        pass
+                continue
+            mp = RE_SRT_PEER_SAIDA.search(linha)
+            if mp and est:
+                est.peer = mp.group(1)
+                self.st.update(estado="rodando", desde=time.time())
+            self.canal._registrar(logging.INFO, f"[saída {self.indice + 1}] {linha}")
+            self.st["ultima_msg"] = linha[-300:]
+
+    def run(self):
+        espera_min = self.canal.sup.get("reinicio_min_s", 2)
+        espera_max = self.canal.sup.get("reinicio_max_s", 60)
+        espera = espera_min
+        while not self.parar.is_set():
+            self.canal._registrar(logging.INFO, f"[saída {self.indice + 1}] iniciando: {comando_para_log(self.cmd)}")
+            t0 = time.time()
+            try:
+                self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             text=True, bufsize=1)
+            except FileNotFoundError:
+                self.st.update(estado="erro", ultima_msg="tsp não encontrado")
+                self.parar.wait(espera_max)
+                continue
+            # UDP não tem "conexão": está no ar assim que o processo sobe
+            self.st.update(estado="rodando" if self.cfg.get("tipo") == "udp" else "conectando",
+                           desde=t0 if self.cfg.get("tipo") == "udp" else None)
+            self._ler(self.proc.stdout)
+            rc = self.proc.wait()
+            if self.parar.is_set():
+                break
+            if time.time() - t0 > 60:
+                espera = espera_min
+            self.st["reinicios"] += 1
+            self.st.update(estado="reiniciando", desde=None)
+            self.canal._registrar(logging.ERROR, f"[saída {self.indice + 1}] tsp saiu (código {rc}). "
+                                  f"Tentando de novo em {espera}s.")
+            self.parar.wait(espera)
+            espera = min(espera * 2, espera_max)
+        self.st.update(estado="parado", desde=None)
+
+    def encerrar(self):
+        self.parar.set()
+        p = self.proc
+        if p and p.poll() is None:
+            p.send_signal(signal.SIGINT)
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+
+class Distribuidor:
+    """Recebe o TS do processo de entrada e entrega uma cópia a cada saída (UDP local)."""
+
+    def __init__(self):
+        import socket
+        self._s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        except OSError:
+            pass
+        self._s.bind(("127.0.0.1", 0))
+        self._s.settimeout(0.5)
+        self.porta = self._s.getsockname()[1]
+        self.destinos = []
+        self.pacotes = 0
+        self._parar = threading.Event()
+
+    def iniciar(self, portas):
+        self.destinos = [("127.0.0.1", p) for p in portas]
+        threading.Thread(target=self._loop, daemon=True, name="distribuidor").start()
+
+    def _loop(self):
+        while not self._parar.is_set():
+            try:
+                d = self._s.recv(65536)
+            except OSError:
+                continue
+            self.pacotes += len(d) // 188
+            for dst in self.destinos:
+                try:
+                    self._s.sendto(d, dst)
+                except OSError:
+                    pass  # saída reiniciando: o datagrama é simplesmente descartado
+
+    def fechar(self):
+        self._parar.set()
+        self._s.close()
+
+
+# ======================================================================
 # Supervisor de um canal
 # ======================================================================
 RE_BITRATE = re.compile(r"bitrate_monitor:.*?([\d,.]+)\s*b(?:its)?/s", re.I)
@@ -1140,7 +1295,10 @@ class Canal(threading.Thread):
         self.analisador = AnalisadorTS()
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
-        self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta)
+        c0 = normalizar_canal(cfg)
+        self.distribuidor = Distribuidor() if c0["saidas"] else None
+        self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta,
+                                  porta_dist=self.distribuidor.porta if self.distribuidor else None)
         self.proc = None
         self.parar = threading.Event()
         self.lock = threading.Lock()
@@ -1156,6 +1314,7 @@ class Canal(threading.Thread):
         for i, s in enumerate(c["saidas"]):
             if s.get("tipo") == "srt":
                 self.srt[f"SRTOUT{i}"] = EstatSRT("saida", s, f"Saída {i + 1}")
+        self.procs_saida = [ProcSaida(self, i, s) for i, s in enumerate(c["saidas"])]
 
     def srt_status(self):
         rodando = not self.parar.is_set()
@@ -1183,6 +1342,7 @@ class Canal(threading.Thread):
         s["tr101290"] = self.analisador.status()
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         s["srt"] = self.srt_status()
+        s["saidas"] = [p.status() for p in self.procs_saida]
         return s
 
     def relatorio(self, motivo):
@@ -1241,6 +1401,10 @@ class Canal(threading.Thread):
         espera_min = self.sup.get("reinicio_min_s", 2)
         espera_max = self.sup.get("reinicio_max_s", 60)
         espera = espera_min
+        if self.distribuidor:
+            self.distribuidor.iniciar([p.porta for p in self.procs_saida])
+            for p in self.procs_saida:
+                p.start()
         while not self.parar.is_set():
             self._registrar(logging.INFO, "iniciando: " + comando_para_log(self.cmd))
             with self.analisador.lock:
@@ -1280,6 +1444,10 @@ class Canal(threading.Thread):
                 p.wait(5)
             except subprocess.TimeoutExpired:
                 p.kill()
+        for ps in self.procs_saida:
+            ps.encerrar()
+        if self.distribuidor:
+            self.distribuidor.fechar()
         self.analisador.fechar()
 
 
@@ -1583,8 +1751,11 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                 return self._resp(200, dados, baixar=f"asi2srt-{nome}-{data}.json")
                             return self._resp(200, dados)
                         if metodo == "GET" and acao == "comando":
-                            return self._resp(200, {"comando": comando_para_log(
-                                montar_comando(ger.defs[cid], ger.sup.get("tsp", "tsp")))})
+                            c = normalizar_canal(ger.defs[cid])
+                            tspb = ger.sup.get("tsp", "tsp")
+                            return self._resp(200, {"comando": comando_para_log(montar_comando(c, tspb)),
+                                                    "saidas": [comando_para_log(montar_saida(s, i, tspb))
+                                                               for i, s in enumerate(c["saidas"])]})
                         if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar", "zerar"):
                             getattr(ger, acao)(cid)
                             return self._resp(200, {"ok": True})
@@ -1692,7 +1863,10 @@ def cmd_comando(args):
     for c in cfg.get("canais") or []:
         c = normalizar_canal(c)
         print(f"# {c['nome']}{'' if c.get('ativo', True) else ' (inativo)'}")
-        print(comando_para_log(montar_comando(c, tsp, porta_analise="PORTA_LOCAL")) + "\n")
+        print(comando_para_log(montar_comando(c, tsp, porta_analise="PORTA_ANALISE")))
+        for i, s in enumerate(c["saidas"]):
+            print(f"  saída {i + 1}: " + comando_para_log(montar_saida(s, i, tsp)))
+        print()
 
 
 def cmd_init(args):
@@ -2327,12 +2501,15 @@ function chipsSRT(e){if(e.estado!=='conectado')return'';const lat=e.latencia_ms|
  return`<span class="chip ${cr}"><small>RTT</small>${e.rtt_ms} ms</span><span class="chip ${cp}"><small>Perda</small>${(e.perda_pct||0).toFixed(2)}%</span>
  <span class="chip ${e.retransmitidos?'w':''}"><small>Retrans</small>${e.retransmitidos}/s</span><span class="chip"><small>Taxa</small>${(e.taxa_mbps||0).toFixed(2)} Mb/s</span>
  ${e.banda_mbps?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
-function no(rot,x,e,ativo){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+const msgCurta=m=>String(m||'').replace(/^\*\s*(Error|Warning):\s*/i,'').replace(/^srt:\s*/,'').replace(/^\[saída \d+\]\s*/,'').slice(0,90);
+function no(rot,x,e,ativo,ps){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+ const falha=ativo&&ps&&ps.estado!=='rodando'&&ps.ultima_msg&&(!e||e.estado!=='conectado')?`<span class="chip w" title="${esc(ps.ultima_msg)}">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` · ${ps.reinicios} tentativa(s)`:''}</span>`:'';
  let st;if(e){const tx={conectado:'conectado',aguardando:x.modo==='listener'?'aguardando conexão':'conectando…',parado:'parado'}[e.estado];
   st=`<span class="st ${e.estado}"><i></i>${tx}${e.peer?` · <code>${esc(e.peer)}</code>`:''}${e.estado==='conectado'&&e.conectado_s?` · ${dur(e.conectado_s)}`:''}</span>`}
+ else if(ps&&ativo){const ok=ps.estado==='rodando';st=`<span class="st ${ok?'ativo':'aguardando'}"><i></i>${ok?'ativo':ps.estado}</span>`}
  else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
- <span class="chips">${st}${e?chipsSRT(e):''}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
+ <span class="chips">${st}${e?chipsSRT(e):''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
  const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
@@ -2340,7 +2517,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
  const acs=(ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻</button><button data-a="analise" data-id="${c.id}">Análise</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
- const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
+ const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i])).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
  ${dots}<span class="rb">${ativo?`${mb(s.bitrate_bps||0)} <small>Mb/s</small>`:r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}${destinos}
@@ -2446,7 +2623,8 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   $('#agraf').innerHTML=`<div class="gw"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}<polygon points="0,${H} ${pts} ${W},${H}"/><polyline points="${pts}"/></svg>${rot}</div>`}
  else $('#agraf').innerHTML='<div class="msg">aguardando dados…</div>';
  // conexões SRT
- const ls=Object.values(a.srt||{});$('#psrt').hidden=!ls.length;$('#asrtn').textContent=ls.length?ls.length+' conexão(ões)':'';
+ const ch=dados.find(x=>x.id===anaId),pss=(ch&&ch.status&&ch.status.saidas)||[];
+ const ls=Object.entries(a.srt||{}).map(([k,v])=>({...v,_ps:k.startsWith('SRTOUT')?pss[+k.slice(6)]:null}));$('#psrt').hidden=!ls.length;$('#asrtn').textContent=ls.length?ls.length+' conexão(ões)':'';
  $('#asrt').innerHTML=ls.map(e=>{const c=e.estado==='conectado',tt=e.totais||{},W=600,H=90,h=e.hist||[];
   let g='';if(h.length>1){const mx=Math.max(...h.map(x=>x[0]))*1.2||1,mr=Math.max(...h.map(x=>x[2]))*1.2||1,X=i=>(i/(h.length-1)*W).toFixed(1);
    g=`<div class="leg"><span style="color:var(--acc)">— taxa (máx ${(mx/1.2).toFixed(2)} Mb/s)</span><span style="color:#d2a8ff">— RTT (máx ${(mr/1.2).toFixed(0)} ms)</span><span style="color:var(--err)">▮ perda</span></div>
@@ -2457,6 +2635,7 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   return`<div class="srtl"><div class="sh"><b>${esc(e.rotulo)}</b><span class="tp">SRT ${esc(e.modo)}</span><code>${esc(e.endereco)}</code>
   <span class="st ${a.salvo?'parado':e.estado}"><i></i>${a.salvo?'encerrada':e.estado}${e.peer?` · <code>${esc(e.peer)}</code>`:''}</span>
   <span style="margin-left:auto;color:var(--mut);font-size:12px">${e.conexoes} conexão(ões)${c&&!a.salvo?' · há '+dur(e.conectado_s):''}</span></div>
+  ${!c&&!a.salvo&&e._ps&&e._ps.ultima_msg?`<div style="padding:7px 11px;color:var(--warn);font-size:12.5px;border-bottom:1px solid var(--line)">⚠ ${esc(msgCurta(e._ps.ultima_msg))}${e._ps.reinicios?` — ${e._ps.reinicios} tentativa(s), tentando de novo sozinho`:''}</div>`:''}
   <div class="sk">${c&&!a.salvo?K('Taxa',(e.taxa_mbps||0).toFixed(2)+' Mb/s')+K('RTT',e.rtt_ms+' ms')+K('Perda agora',(e.perda_pct||0).toFixed(2)+'%',e.perda_pct>1?'e':e.perda_pct>0?'w':'')
    +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps?K('Banda do link',e.banda_mbps+' Mb/s'):''):''}
    ${K('RTT médio / máx',e.rtt_medio_ms+' / '+e.rtt_max_ms+' ms')}${K('Pacotes',(tt.pacotes||0).toLocaleString('pt-BR'))}

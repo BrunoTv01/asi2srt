@@ -146,6 +146,11 @@ taxa, RTT e perda. Esses dados entram no relatório salvo ao parar o canal.
 
 As estatísticas vêm do próprio TSDuck (`--statistics-interval 1000 --json-line`), sem custo extra.
 
+**Saídas independentes:** cada destino roda em seu próprio processo. A entrada e a análise ficam num
+processo que entrega o TS a um distribuidor local, e o distribuidor manda uma cópia para cada saída.
+Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
+sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
+
 ## Análise do TS (estilo analisador profissional)
 
 Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro. No card aparecem as
@@ -289,7 +294,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.7.0 && git push origin v2.7.0
+git tag v2.8.0 && git push origin v2.8.0
 ```
 
 ## Licença

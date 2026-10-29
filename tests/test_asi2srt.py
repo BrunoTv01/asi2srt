@@ -51,12 +51,15 @@ def test_comando_dektec_srt():
     canal = {"entrada": a.entrada_de_texto("dektec:0:0"),
              "saidas": [a.saida_de_url("srt://h:1?passphrase=senhasecreta1")],
              "processamento": {"remover_pids": ["0x12"], "bitrate_min": 1000}}
-    cmd = a.montar_comando(canal)
+    cmd = a.montar_comando(canal, porta_dist=41000)
     linha = " ".join(cmd)
     assert "-I dektec --device 0 --channel 0" in linha
-    assert "--pid 0x0012 --pid 0x1FFF" in linha
-    assert "-O srt --caller h:1" in linha and "--min 1000" in linha
-    assert "senhasecreta1" not in a.comando_para_log(cmd)
+    assert "--pid 0x0012 --pid 0x1FFF" in linha and "--min 1000" in linha
+    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", "7"]   # entrega ao distribuidor local
+    assert "srt" not in cmd                                                # a saída não fica neste processo
+    sai = a.montar_saida(canal["saidas"][0], 0, porta_entrada=42000)
+    assert "-I ip 127.0.0.1:42000" in " ".join(sai) and "-O srt --caller h:1" in " ".join(sai)
+    assert "senhasecreta1" not in a.comando_para_log(sai)
 
 
 def test_comando_com_analise():
@@ -74,12 +77,12 @@ def test_comando_srt_para_udp_e_srt():
              "saidas": [a.saida_de_url("udp://239.1.1.1:1234?ttl=4"),
                         a.saida_de_url("srt://h:2?passphrase=outrasenha1")]}
     cmd = a.montar_comando(canal)
-    linha = " ".join(cmd)
-    assert "-I srt --listener 9000" in linha
-    assert "-O ip 239.1.1.1:1234 --packet-burst 7 --ttl 4" in linha
-    i = cmd.index("fork")
-    assert "-O srt --caller h:2" in cmd[i + 2]
-    log = a.comando_para_log(cmd)
+    assert "-I srt --listener 9000" in " ".join(cmd)
+    s0 = " ".join(a.montar_saida(canal["saidas"][0], 0))
+    s1 = a.montar_saida(canal["saidas"][1], 1)
+    assert "-O ip 239.1.1.1:1234 --packet-burst 7 --ttl 4" in s0
+    assert "-O srt --caller h:2" in " ".join(s1) and "--json-line=SRTOUT1:" in s1
+    log = a.comando_para_log(s1)
     assert "outrasenha1" not in log and "********" in log
 
 
@@ -212,7 +215,7 @@ OPCOES_TSDUCK = {
     "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets", "--verbose"},
     "srt": {"--caller", "--listener", "--transtype", "--latency", "--ohead-bw", "--passphrase",
             "--pbkeylen", "--streamid", "--statistics-interval", "--json-line"},
-    "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout"},
+    "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout", "--buffer-size"},
     "dektec": {"--device", "--channel", "--receive-timeout"},
     "file": {"--infinite"},
     "fork": {"--nowait", "--buffered-packets"},
@@ -250,7 +253,9 @@ def test_opcoes_existem_no_tsduck(entrada):
                         a.saida_de_url("udp://239.1.1.1:1?ttl=4&local=10.0.0.2"),
                         a.saida_de_url("srt://:9001?mode=listener")],
              "processamento": {"remover_pids": ["0x20"], "bitrate_min": 1, "bitrate_max": 9}}
-    _verificar_opcoes(a.montar_comando(canal, porta_analise=40000))
+    _verificar_opcoes(a.montar_comando(canal, porta_analise=40000, porta_dist=41000))
+    for i, s in enumerate(canal["saidas"]):
+        _verificar_opcoes(a.montar_saida(s, i, porta_entrada=42000 + i))
 
 
 def test_linhas_reais_do_bitrate_monitor():
@@ -470,7 +475,7 @@ def test_estatisticas_srt_entrada_e_saida():
     c = a.Canal(canal, {"tsp": "tsp"})
     try:
         assert set(c.srt) == {"SRTIN", "SRTOUT1"}
-        assert "--json-line=SRTIN:" in c.cmd and any("--json-line=SRTOUT1:" in x for x in c.cmd)
+        assert "--json-line=SRTIN:" in c.cmd and "--json-line=SRTOUT1:" in c.procs_saida[1].cmd
         linhas = ["* srt: connected from 187.60.226.82:6001 (local: 172.20.15.119:40122)",
                   _linha_srt("SRTIN", perd=11, pac=1089, retr=5),
                   _linha_srt("SRTOUT1", rx=False, taxa=11.8, retr=2),
@@ -491,3 +496,55 @@ def test_estatisticas_srt_entrada_e_saida():
         assert est.status(agora=est.ultimo + 5)["estado"] == "aguardando"
     finally:
         c.analisador.fechar()
+
+
+
+# ---------------- saídas independentes ----------------
+def test_distribuidor_entrega_copia_a_cada_saida():
+    import socket
+    dist = a.Distribuidor()
+    receptores = []
+    for _ in range(3):
+        r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        r.bind(("127.0.0.1", 0))
+        r.settimeout(2)
+        receptores.append(r)
+    dist.iniciar([r.getsockname()[1] for r in receptores])
+    try:
+        pacote = bytes([0x47, 0x01, 0x00, 0x10]).ljust(188, b"\xff") * 7
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(pacote, ("127.0.0.1", dist.porta))
+        assert all(r.recv(2048) == pacote for r in receptores)
+    finally:
+        dist.fechar()
+
+
+TSP_SAIDA_FALHA = r"""#!/bin/sh
+case "$*" in
+  *"-O srt"*) echo "* Error: srt: error during srt_connect: Connection setup failure: connection timed out"; exit 1;;
+  *"-I ip 127.0.0.1"*) sleep 30;;
+  *) while true; do echo "* bitrate_monitor: TS bitrate: 9,000,000 bits/s"; sleep 0.5; done;;
+esac
+"""
+
+
+def test_saida_com_falha_nao_derruba_a_entrada():
+    d = tempfile.mkdtemp()
+    tsp = os.path.join(d, "tsp")
+    with open(tsp, "w") as f:
+        f.write(TSP_SAIDA_FALHA)
+    os.chmod(tsp, 0o755)
+    canal = {"nome": "x", "entrada": a.entrada_de_texto("udp://239.1.1.1:1234"),
+             "saidas": [a.saida_de_url("srt://200.136.26.171:8099"), a.saida_de_url("udp://127.0.0.1:5000")]}
+    c = a.Canal(canal, {"tsp": tsp, "reinicio_min_s": 1, "reinicio_max_s": 2})
+    c.start()
+    try:
+        time.sleep(4)
+        st = c.status()
+        assert st["estado"] == "rodando" and st["bitrate_bps"] == 9_000_000 and st["reinicios"] == 0
+        srt_out, udp_out = st["saidas"]
+        assert srt_out["reinicios"] >= 1 and srt_out["estado"] in ("reiniciando", "conectando")
+        assert "connection timed out" in srt_out["ultima_msg"]
+        assert udp_out["estado"] == "rodando" and udp_out["reinicios"] == 0
+        assert st["srt"]["SRTOUT0"]["estado"] == "aguardando"
+    finally:
+        c.encerrar()
