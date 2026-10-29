@@ -61,23 +61,46 @@ Pelo painel você:
 
 Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive a reinícios.
 
-## Análise TR 101 290 (Prioridade 1)
+## Análise do TS (estilo analisador profissional)
 
-Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro, e mostra no painel
-uma "luz" por indicador: verde = sem erros, amarelo = já houve erros, vermelho = erro nos últimos 10 s.
+Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro. No card aparecem as
+6 luzes da Prioridade 1 e o total de P2/P3; o botão **Análise** abre a tela completa do canal:
 
-| Indicador | O que conta |
-|---|---|
-| **1.1 TS sync loss** | 2 ou mais sync bytes corrompidos seguidos, ou perda do sinal de entrada (sem pacotes por mais de 1 s) |
-| **1.2 Sync byte error** | pacote com sync byte diferente de `0x47` |
-| **1.3 PAT error** | PID 0 ausente por mais de 0,5 s, `table_id` diferente de `0x00` ou PAT embaralhada |
-| **1.4 Continuity count error** | contador de continuidade fora de ordem, pacote perdido ou duplicado mais de uma vez |
-| **1.5 PMT error** | PID de PMT citado na PAT ausente por mais de 0,5 s, `table_id` diferente de `0x02` ou PMT embaralhada |
-| **1.6 PID error** | PID citado em uma PMT ausente por mais de 5 s (o painel mostra quais PIDs) |
+![Análise do canal](docs/analise.png)
 
-Os contadores também saem no `status.json` (campo `tr101290`) para alarmes no Zabbix/Grafana,
-e podem ser zerados pelo botão **Zerar** ou por `POST /api/canais/{id}/zerar`.
-A análise pode ser desligada por canal ("Análise TR 101 290" no formulário ou `analise_tr101290: false`).
+- **TR 101 290** com as três prioridades, contador e "há quanto tempo" de cada indicador
+- **Serviços** (SDT + PAT/PMT): nome, provedor, tipo, PMT, PCR, intervalo e jitter de PCR, componentes com bitrate
+- **Tabela de PIDs** ordenável: descrição, serviço, bitrate, %, pacotes, erros CC por PID, PCR, embaralhado, ausente
+- **Gráfico** do bitrate do TS (5 min) e resumo: bitrate total e útil, CBR/VBR, TS ID, rede (NIT), hora do TS (TDT/TOT)
+
+| Prioridade | Indicador | O que conta |
+|---|---|---|
+| 1 | 1.1 TS sync loss | 2+ sync bytes errados seguidos, ou perda do sinal de entrada (> 1 s sem pacotes) |
+| 1 | 1.2 Sync byte error | sync byte diferente de `0x47` |
+| 1 | 1.3 PAT error | PAT ausente > 0,5 s, `table_id` errado ou embaralhada |
+| 1 | 1.4 Continuity count error | CC fora de ordem, pacote perdido ou duplicado mais de uma vez |
+| 1 | 1.5 PMT error | PMT ausente > 0,5 s, `table_id` errado ou embaralhada |
+| 1 | 1.6 PID error | PID citado na PMT ausente > 5 s |
+| 2 | 2.1 Transport error | `transport_error_indicator` = 1 |
+| 2 | 2.2 CRC error | CRC32 inválido em PAT, CAT, PMT, NIT, SDT, EIT, TOT |
+| 2 | 2.3a PCR repetition | intervalo entre PCRs > 40 ms |
+| 2 | 2.3b PCR discontinuity | salto de PCR fora de 0–100 ms sem `discontinuity_indicator` |
+| 2 | 2.4 PCR accuracy | jitter de PCR > ±500 ns (só em TS CBR, com pacotes nulos) |
+| 2 | 2.5 PTS error | PTS ausente > 700 ms em vídeo/áudio |
+| 2 | 2.6 CAT error | pacotes embaralhados sem CAT, ou `table_id` errado no PID 1 |
+| 3 | 3.1 NIT error | NIT actual ausente > 10 s ou `table_id` inválido no PID 0x10 |
+| 3 | 3.4 Unreferenced PID | PID presente sem referência em PAT/PMT/CAT/SI |
+| 3 | 3.5 SDT error | SDT actual ausente > 2 s ou `table_id` inválido no PID 0x11 |
+| 3 | 3.6 EIT error | EIT p/f ausente > 2 s ou `table_id` inválido no PID 0x12 |
+| 3 | 3.8 TDT error | TDT/TOT ausente > 30 s ou `table_id` inválido no PID 0x14 |
+
+Cores: verde = sem erros, amarelo = já houve erros, vermelho = erro nos últimos 10 s, cinza = não se
+aplica a este TS (por exemplo, PCR accuracy em TS VBR, ou NIT/SDT/EIT/TDT que o feed nunca transmitiu —
+as verificações de P3 só começam depois que a tabela foi vista uma vez, porque muitos feeds de
+contribuição não carregam SI).
+
+Os dados também estão em `GET /api/canais/{id}/analise` (JSON) e os contadores no `status.json`.
+Zerar: botão **Zerar** ou `POST /api/canais/{id}/zerar`. A análise pode ser desligada por canal.
 
 Observação: placas e drivers ASI normalmente descartam pacotes sem sync antes de entregá-los
 ao software, então na prática o "TS sync loss" aparece sobretudo como perda do sinal de entrada.
@@ -146,6 +169,7 @@ Todas as rotas usam autenticação básica. Rotas que alteram algo exigem o cabe
 | POST | `/api/canais` | cria canal |
 | PUT / DELETE | `/api/canais/{id}` | edita / exclui |
 | POST | `/api/canais/{id}/iniciar` · `parar` · `reiniciar` · `zerar` | controle |
+| GET | `/api/canais/{id}/analise` | análise completa (TR 101 290, PIDs, serviços) |
 | GET | `/api/canais/{id}/log` · `comando` | log / comando tsp |
 
 ## Teste sem hardware
@@ -169,7 +193,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.1.0 && git push origin v2.1.0
+git tag v2.2.0 && git push origin v2.2.0
 ```
 
 ## Licença

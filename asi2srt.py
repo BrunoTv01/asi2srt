@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.1.2"
+__version__ = "2.2.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -348,29 +348,98 @@ def comando_para_log(cmd: list) -> str:
 
 
 # ======================================================================
-# Analisador TR 101 290 - Prioridade 1
+# Analisador de TS: TR 101 290 (P1, P2, P3), PIDs, serviços e PCR
 # ======================================================================
-TIPOS_TR101290 = ("sync_loss", "sync_byte", "cc", "pat", "pmt", "pid")
+TR_ITENS = [
+    # chave, prioridade, código, nome, descrição
+    ("sync_loss", 1, "1.1", "TS sync loss",
+     "2 ou mais sync bytes corrompidos seguidos, ou perda do sinal de entrada (sem pacotes por mais de 1 s)"),
+    ("sync_byte", 1, "1.2", "Sync byte error", "Pacote com sync byte diferente de 0x47"),
+    ("pat", 1, "1.3", "PAT error", "PAT ausente por mais de 0,5 s, table_id diferente de 0x00 ou PAT embaralhada"),
+    ("cc", 1, "1.4", "Continuity count error",
+     "Contador de continuidade fora de ordem, pacote perdido ou duplicado mais de uma vez"),
+    ("pmt", 1, "1.5", "PMT error", "PMT ausente por mais de 0,5 s, table_id diferente de 0x02 ou PMT embaralhada"),
+    ("pid", 1, "1.6", "PID error", "PID citado em uma PMT ausente por mais de 5 s"),
+    ("transport", 2, "2.1", "Transport error", "Pacote com transport_error_indicator = 1"),
+    ("crc", 2, "2.2", "CRC error", "Seção PSI/SI (PAT, CAT, PMT, NIT, SDT, EIT, TOT) com CRC32 inválido"),
+    ("pcr_rep", 2, "2.3a", "PCR repetition error", "Intervalo entre PCRs consecutivos maior que 40 ms"),
+    ("pcr_disc", 2, "2.3b", "PCR discontinuity error",
+     "Diferença entre PCRs fora de 0–100 ms sem discontinuity_indicator"),
+    ("pcr_acc", 2, "2.4", "PCR accuracy error", "Jitter de PCR maior que ±500 ns (só se aplica a TS de taxa constante)"),
+    ("pts", 2, "2.5", "PTS error", "PTS ausente por mais de 700 ms em um PID de vídeo ou áudio"),
+    ("cat", 2, "2.6", "CAT error", "Pacotes embaralhados sem CAT, ou table_id diferente de 0x01 no PID 1"),
+    ("nit", 3, "3.1", "NIT error", "NIT actual ausente por mais de 10 s, ou table_id inválido no PID 0x10"),
+    ("unref", 3, "3.4", "Unreferenced PID", "PID presente que não é citado em PAT, PMT, CAT nem é PID de SI"),
+    ("sdt", 3, "3.5", "SDT error", "SDT actual ausente por mais de 2 s, ou table_id inválido no PID 0x11"),
+    ("eit", 3, "3.6", "EIT error", "EIT presente/seguinte ausente por mais de 2 s, ou table_id inválido no PID 0x12"),
+    ("tdt", 3, "3.8", "TDT error", "TDT/TOT ausente por mais de 30 s, ou table_id inválido no PID 0x14"),
+]
+TIPOS_TR101290 = tuple(i[0] for i in TR_ITENS)
+
+TIPOS_STREAM = {
+    0x01: ("MPEG-1 vídeo", "video"), 0x02: ("MPEG-2 vídeo", "video"), 0x03: ("MPEG-1 áudio", "audio"),
+    0x04: ("MPEG-2 áudio", "audio"), 0x05: ("Seções privadas", "dados"), 0x06: ("PES privado", "dados"),
+    0x0B: ("DSM-CC", "dados"), 0x0C: ("DSM-CC", "dados"), 0x0D: ("DSM-CC", "dados"),
+    0x0F: ("AAC áudio", "audio"), 0x10: ("MPEG-4 vídeo", "video"), 0x11: ("AAC LATM áudio", "audio"),
+    0x15: ("Metadados", "dados"), 0x1B: ("H.264/AVC vídeo", "video"), 0x24: ("H.265/HEVC vídeo", "video"),
+    0x42: ("AVS vídeo", "video"), 0x81: ("AC-3 áudio", "audio"), 0x86: ("SCTE-35", "dados"),
+    0x87: ("E-AC-3 áudio", "audio"),
+}
+DESCRITOR_PES_PRIVADO = {
+    0x6A: ("AC-3 áudio", "audio"), 0x7A: ("E-AC-3 áudio", "audio"), 0x7C: ("AAC áudio", "audio"),
+    0x56: ("Teletexto", "dados"), 0x59: ("Legendas DVB", "dados"), 0xFD: ("Dados ISDB (legenda/CC)", "dados"),
+}
+TIPOS_SERVICO = {
+    0x01: "TV digital", 0x02: "Rádio digital", 0x0C: "Dados", 0x11: "TV HD MPEG-2", 0x16: "TV SD H.264",
+    0x19: "TV HD H.264", 0x1F: "TV HEVC", 0xA1: "TV 1-seg", 0xC0: "Dados ISDB",
+}
+
+_INV_BITS = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
+
+
+def crc32_mpeg(dados: bytes) -> int:
+    """CRC-32/MPEG-2 (usado nas seções PSI/SI). Calculado com zlib sobre os bits invertidos."""
+    import zlib
+    c = zlib.crc32(dados.translate(_INV_BITS)) ^ 0xFFFFFFFF
+    return int(f"{c:032b}"[::-1], 2)
+
+
+def _descritores(buf, ini, fim):
+    j, out = ini, []
+    while j + 2 <= fim:
+        tag, n = buf[j], buf[j + 1]
+        out.append((tag, buf[j + 2:j + 2 + n]))
+        j += 2 + n
+    return out
+
+
+def _texto_dvb(b: bytes) -> str:
+    if b and b[0] < 0x20:
+        b = b[3:] if b[0] == 0x10 else b[1:]
+    try:
+        s = b.decode("utf-8")
+    except UnicodeDecodeError:
+        s = b.decode("latin-1")
+    return "".join(ch for ch in s if ch >= " ").strip()
 
 
 class AnalisadorTS:
-    """Verificações TR 101 290 (ETSI) de Prioridade 1 sobre o TS recebido:
+    """Analisa o TS recebido (TR 101 290 prioridades 1, 2 e 3, bitrate por PID, serviços e PCR).
 
-      1.1 TS sync loss    - 2+ sync bytes corrompidos seguidos, ou perda do sinal de entrada
-                            (sem pacotes por mais de 1 s); volta ao sync após 5 bons
-      1.2 Sync byte error - pacote com sync byte diferente de 0x47
-      1.3 PAT error       - PID 0 ausente por mais de 0,5 s, table_id != 0x00 ou PAT embaralhada
-      1.4 CC error        - contador de continuidade fora de ordem, perdido ou duplicado 2x
-      1.5 PMT error       - PID de PMT (citado na PAT) ausente por mais de 0,5 s,
-                            table_id != 0x02 ou PMT embaralhada
-      1.6 PID error       - PID citado em uma PMT ausente por mais de 5 s
-
-    Métodos recebem o instante (monotônico) como parâmetro para facilitar testes.
+    Os métodos recebem o instante (monotônico) como parâmetro para facilitar testes.
+    As verificações de prioridade 3 só passam a valer depois que a tabela foi vista ao menos
+    uma vez (muitos feeds de contribuição não carregam NIT/SDT/EIT/TDT).
     """
     LIM_PAT = 0.5
     LIM_PMT = 0.5
     LIM_PID = 5.0
     LIM_SINAL = 1.0
+    LIM_PTS = 0.7
+    LIM_PCR_AUSENTE = 0.5
+    LIM_SI = {"nit": 10.0, "sdt": 2.0, "eit": 2.0, "tdt": 30.0}
+    PCR_REP = int(0.040 * 27_000_000)
+    PCR_DISC = int(0.100 * 27_000_000)
+    PCR_ACC_NS = 500
     RECENTE_S = 10.0
 
     def __init__(self):
@@ -385,17 +454,19 @@ class AnalisadorTS:
     def zerar(self):
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
+        self.cc_pid = {}
         self.desde = time.time()
 
     def reiniciar_estado(self):
-        """Esquece o estado do fluxo (usado em cada (re)início do tsp e retomada de sinal)."""
-        self.cc = {}            # pid -> (último cc, já houve duplicado)
-        self.visto = {}         # pid -> último instante em que chegou
-        self.ref = {}           # pid -> instante em que passou a ser exigido
-        self.reportado = {}     # pid -> último instante em que gerou erro de ausência
-        self.pmt_pids = {}      # pid da PMT -> número do programa
-        self.es_pids = {}       # pid elementar -> (pid da PMT, stream_type)
-        self.secoes = {}        # pid -> bytes acumulados da seção
+        """Esquece o estado do fluxo (em cada (re)início do tsp)."""
+        self.cc = {}
+        self.visto = {}
+        self.ref = {}
+        self.reportado = {}
+        self.pmt_pids = {}          # pid PMT -> número do programa
+        self.es_pids = {}           # pid -> (pid PMT, stream_type, tipo, nome)
+        self.programas = {}         # pid PMT -> {"pcr_pid": int, "ca": set}
+        self.secoes = {}
         self.em_sync = True
         self.ruins = 0
         self.bons = 0
@@ -403,28 +474,62 @@ class AnalisadorTS:
         self.inicio_fluxo = None
         self.fluindo = False
         self.pacotes = 0
+        # contagem e taxa por PID
+        self.n_pid = {}
+        self.n_ant = {}
+        self.t_taxa = None
+        self.taxa = {}
+        self.taxa_total = 0
+        self.hist_total = collections.deque(maxlen=300)
+        self.emb = {}               # pid -> último pacote embaralhado?
+        self.ultimo_scr = None
+        # PCR
+        self.pcr = {}               # pid -> [pcr, idx, pcr_ancora, idx_ancora, pacotes_por_tick]
+        self.pcr_chegada = {}
+        self.pcr_janela = {}        # pid -> [intervalo máx (ticks), jitter máx (ns)]
+        self.pcr_info = {}          # pid -> {"intervalo_ms", "jitter_ns"}
+        self.pts_visto = {}
+        # SI
+        self.tsid = None
+        self.onid = None
+        self.rede = None
+        self.hora_ts = None
+        self.servicos_sdt = {}      # service_id -> (nome, provedor, tipo)
+        self.ca_pids = set()
+        self.si_visto = {}
+        self.cat_visto = None
+        self.cat_erro_tid = False
+        self.nao_ref = set()
 
     def _erro(self, tipo, agora):
         self.cont[tipo] += 1
         self.ultimo_erro[tipo] = agora
 
-    # --- processamento ------------------------------------------------
-    def processar(self, dados, agora):
+    def _retomar(self, agora):
+        self.cc.clear()
+        self.visto.clear()
+        self.reportado.clear()
+        self.secoes.clear()
+        self.pcr.clear()
+        self.pcr_chegada.clear()
+        self.pts_visto.clear()
+        self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
+        self.si_visto = {k: agora for k in self.si_visto}
+        self.inicio_fluxo = agora
+
+    # --- processamento por pacote --------------------------------------
+    def processar(self, d, agora):
         if self.ultimo_pacote is None or agora - self.ultimo_pacote >= self.LIM_SINAL:
-            # início ou retomada do sinal: zera referências de tempo e de continuidade
-            self.cc.clear()
-            self.visto.clear()
-            self.reportado.clear()
-            self.secoes.clear()
-            self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
-            self.inicio_fluxo = agora
+            self._retomar(agora)
         self.ultimo_pacote = agora
         self.fluindo = True
-        n = len(dados) // 188
+        n = len(d) // 188
+        idx0 = self.pacotes
         self.pacotes += n
-        for i in range(0, n * 188, 188):
-            p = dados[i:i + 188]
-            if p[0] != 0x47:
+        npid, visto, cc_est, es_pids, pmt_pids = self.n_pid, self.visto, self.cc, self.es_pids, self.pmt_pids
+        for k in range(n):
+            i = k * 188
+            if d[i] != 0x47:
                 self._erro("sync_byte", agora)
                 self.ruins += 1
                 self.bons = 0
@@ -439,118 +544,321 @@ class AnalisadorTS:
                     self.em_sync = True
                     self.bons = 0
                 continue
-            pid = ((p[1] & 0x1F) << 8) | p[2]
-            self.visto[pid] = agora
+            b1 = d[i + 1]
+            pid = ((b1 & 0x1F) << 8) | d[i + 2]
+            npid[pid] = npid.get(pid, 0) + 1
+            visto[pid] = agora
             if pid == 0x1FFF:
                 continue
-            afc = (p[3] >> 4) & 3
-            # continuidade (só pacotes com carga útil)
+            if b1 & 0x80:
+                self._erro("transport", agora)
+            b3 = d[i + 3]
+            afc = (b3 >> 4) & 3
+            scr = b3 >> 6
+            if scr:
+                self.emb[pid] = True
+                self.ultimo_scr = agora
+            elif pid in self.emb:
+                self.emb[pid] = False
+            disc = 0
+            if afc & 2:
+                alen = d[i + 4]
+                if alen:
+                    flags = d[i + 5]
+                    disc = flags & 0x80
+                    if flags & 0x10 and alen >= 7:
+                        self._pcr(pid, d, i, idx0 + k, disc, agora)
             if afc & 1:
-                cc = p[3] & 0x0F
-                disc = (afc & 2) and p[4] > 0 and (p[5] & 0x80)
-                ant = self.cc.get(pid)
+                cc = b3 & 0x0F
+                ant = cc_est.get(pid)
                 if ant is None or disc:
-                    self.cc[pid] = (cc, False)
+                    cc_est[pid] = (cc, False)
                 elif cc == ant[0]:
                     if ant[1]:
                         self._erro("cc", agora)
-                    self.cc[pid] = (cc, True)
+                        self.cc_pid[pid] = self.cc_pid.get(pid, 0) + 1
+                    cc_est[pid] = (cc, True)
                 else:
                     if cc != (ant[0] + 1) & 0x0F:
                         self._erro("cc", agora)
-                    self.cc[pid] = (cc, False)
-            # PSI: PAT e PMTs
-            if pid == 0 or pid in self.pmt_pids:
-                if p[3] >> 6:
+                        self.cc_pid[pid] = self.cc_pid.get(pid, 0) + 1
+                    cc_est[pid] = (cc, False)
+                if b1 & 0x40 and pid in es_pids:
+                    self._pes(pid, d, i, afc, agora)
+            if pid < 0x20 or pid in pmt_pids:
+                if scr and (pid == 0 or pid in pmt_pids):
                     self._erro("pat" if pid == 0 else "pmt", agora)
-                elif afc & 1:
-                    self._secao(pid, p, afc, agora)
+                elif afc & 1 and not scr:
+                    self._psi(pid, d[i:i + 188], afc, agora)
 
-    def _secao(self, pid, p, afc, agora):
+    def _pcr(self, pid, d, i, idx, disc, agora):
+        b0, b1, b2, b3, b4, b5 = d[i + 6:i + 12]
+        pcr = ((b0 << 25) | (b1 << 17) | (b2 << 9) | (b3 << 1) | (b4 >> 7)) * 300 + (((b4 & 1) << 8) | b5)
+        self.pcr_chegada[pid] = agora
+        jan = self.pcr_janela.setdefault(pid, [0, 0.0])
+        st = self.pcr.get(pid)
+        if st is None or disc:
+            self.pcr[pid] = [pcr, idx, pcr, idx, st[4] if st and not disc else None]
+            return
+        ult, uidx, apcr, aidx, taxa = st
+        dif = pcr - ult
+        if dif < 0 or dif > self.PCR_DISC:
+            self._erro("pcr_disc", agora)
+            self.pcr[pid] = [pcr, idx, pcr, idx, None]
+            return
+        if dif > self.PCR_REP:
+            self._erro("pcr_rep", agora)
+        if dif > jan[0]:
+            jan[0] = dif
+        if taxa:
+            previsto = ult + (idx - uidx) / taxa
+            jit = abs(pcr - previsto) * 1000.0 / 27.0
+            if jit > jan[1]:
+                jan[1] = jit
+            if jit > self.PCR_ACC_NS and self.taxa.get(0x1FFF, 0) > 0:  # só em TS CBR
+                self._erro("pcr_acc", agora)
+        span = pcr - apcr
+        if span >= 27_000_000:
+            taxa = (idx - aidx) / span
+            if span > 27_000_000 * 30:
+                apcr, aidx = pcr, idx
+        self.pcr[pid] = [pcr, idx, apcr, aidx, taxa]
+
+    def _pes(self, pid, d, i, afc, agora):
+        ini = i + 5 + d[i + 4] if afc & 2 else i + 4
+        if ini + 9 > i + 188:
+            return
+        if d[ini] == 0 and d[ini + 1] == 0 and d[ini + 2] == 1:
+            sid = d[ini + 3]
+            if (0xC0 <= sid <= 0xEF or sid == 0xBD) and d[ini + 7] & 0x80:
+                self.pts_visto[pid] = agora
+
+    def _psi(self, pid, p, afc, agora):
         ini = 5 + p[4] if afc & 2 else 4
         if ini >= 188:
             return
         carga = p[ini:]
-        if p[1] & 0x40:  # payload_unit_start: começa uma seção após o pointer_field
+        if p[1] & 0x40:
             ptr = carga[0]
-            self.secoes[pid] = bytearray(carga[1 + ptr:])
-        elif pid in self.secoes:
-            self.secoes[pid] += carga
+            anterior = self.secoes.pop(pid, None)
+            if anterior is not None and ptr:
+                anterior += carga[1:1 + ptr]
+                self._extrair(pid, anterior, agora)
+            buf = bytearray(carga[1 + ptr:])
         else:
-            return
-        buf = self.secoes[pid]
-        if len(buf) < 3:
-            return
-        if buf[0] == 0xFF:
-            del self.secoes[pid]
-            return
-        tam = (((buf[1] & 0x0F) << 8) | buf[2]) + 3
-        if len(buf) >= tam:
-            del self.secoes[pid]
+            buf = self.secoes.get(pid)
+            if buf is None:
+                return
+            buf += carga
+        resto = self._extrair(pid, buf, agora)
+        if resto:
+            self.secoes[pid] = resto
+        else:
+            self.secoes.pop(pid, None)
+
+    def _extrair(self, pid, buf, agora):
+        while len(buf) >= 3 and buf[0] != 0xFF:
+            tam = (((buf[1] & 0x0F) << 8) | buf[2]) + 3
+            if tam > 4096:
+                return None
+            if len(buf) < tam:
+                return buf
             self._tabela(pid, bytes(buf[:tam]), agora)
-        elif len(buf) > 4096:
-            del self.secoes[pid]
+            buf = buf[tam:]
+        return None
 
     def _tabela(self, pid, sec, agora):
-        if len(sec) < 12:
+        tid = sec[0]
+        if tid == 0x72:          # stuffing table
+            return
+        if sec[1] & 0x80 and len(sec) >= 12 and crc32_mpeg(sec) != 0:
+            self._erro("crc", agora)
             return
         if pid == 0:
-            if sec[0] != 0x00:
-                self._erro("pat", agora)
+            self._pat(sec, agora)
+        elif pid == 1:
+            if tid != 0x01:
+                self._erro("cat", agora)
                 return
-            novos = {}
-            for j in range(8, len(sec) - 4 - 3, 4):
-                prog = (sec[j] << 8) | sec[j + 1]
-                ppid = ((sec[j + 2] & 0x1F) << 8) | sec[j + 3]
-                if prog != 0:
-                    novos[ppid] = prog
-            if novos != self.pmt_pids:
-                for ppid in novos:
-                    if ppid not in self.pmt_pids:
-                        self.ref[ppid] = agora
-                self.pmt_pids = novos
-                self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] in novos}
+            self.cat_visto = agora
+            for tag, dd in _descritores(sec, 8, len(sec) - 4):
+                if tag == 0x09 and len(dd) >= 4:
+                    self.ca_pids.add(((dd[2] & 0x1F) << 8) | dd[3])
+        elif pid in self.pmt_pids:
+            self._pmt(pid, sec, agora)
+        elif pid == 0x10:
+            if tid == 0x40 and len(sec) >= 12:
+                self.si_visto["nit"] = agora
+                ndl = ((sec[8] & 0x0F) << 8) | sec[9]
+                for tag, dd in _descritores(sec, 10, min(10 + ndl, len(sec) - 4)):
+                    if tag == 0x40:
+                        self.rede = _texto_dvb(dd)
+            elif tid != 0x41:
+                self._erro("nit", agora)
+        elif pid == 0x11:
+            if tid == 0x42:
+                self.si_visto["sdt"] = agora
+                self._sdt(sec)
+            elif tid not in (0x46, 0x4A):
+                self._erro("sdt", agora)
+        elif pid == 0x12:
+            if tid == 0x4E:
+                self.si_visto["eit"] = agora
+            elif not 0x4F <= tid <= 0x6F:
+                self._erro("eit", agora)
+        elif pid == 0x14:
+            if tid in (0x70, 0x73) and len(sec) >= 8:
+                self.si_visto["tdt"] = agora
+                self.hora_ts = self._hora_mjd(sec[3:8])
+            else:
+                self._erro("tdt", agora)
+
+    def _pat(self, sec, agora):
+        if sec[0] != 0x00:
+            self._erro("pat", agora)
             return
-        # PMT
+        if len(sec) < 12:
+            return
+        self.tsid = (sec[3] << 8) | sec[4]
+        novos = {}
+        for j in range(8, len(sec) - 4 - 3, 4):
+            prog = (sec[j] << 8) | sec[j + 1]
+            ppid = ((sec[j + 2] & 0x1F) << 8) | sec[j + 3]
+            if prog != 0:
+                novos[ppid] = prog
+        if novos != self.pmt_pids:
+            for ppid in novos:
+                if ppid not in self.pmt_pids:
+                    self.ref[ppid] = agora
+            self.pmt_pids = novos
+            self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] in novos}
+            self.programas = {k: v for k, v in self.programas.items() if k in novos}
+
+    def _pmt(self, pid, sec, agora):
         if sec[0] != 0x02:
             self._erro("pmt", agora)
             return
+        if len(sec) < 16:
+            return
+        pcr_pid = ((sec[8] & 0x1F) << 8) | sec[9]
         pil = ((sec[10] & 0x0F) << 8) | sec[11]
+        ca = set()
+        for tag, dd in _descritores(sec, 12, min(12 + pil, len(sec) - 4)):
+            if tag == 0x09 and len(dd) >= 4:
+                ca.add(((dd[2] & 0x1F) << 8) | dd[3])
         j = 12 + pil
         es = {}
         while j + 5 <= len(sec) - 4:
+            st = sec[j]
             epid = ((sec[j + 1] & 0x1F) << 8) | sec[j + 2]
-            es[epid] = (pid, sec[j])
-            j += 5 + (((sec[j + 3] & 0x0F) << 8) | sec[j + 4])
+            eil = ((sec[j + 3] & 0x0F) << 8) | sec[j + 4]
+            nome, tipo = TIPOS_STREAM.get(st, (f"stream_type 0x{st:02X}", "dados"))
+            for tag, dd in _descritores(sec, j + 5, min(j + 5 + eil, len(sec) - 4)):
+                if tag == 0x09 and len(dd) >= 4:
+                    ca.add(((dd[2] & 0x1F) << 8) | dd[3])
+                elif st == 0x06 and tag in DESCRITOR_PES_PRIVADO:
+                    nome, tipo = DESCRITOR_PES_PRIVADO[tag]
+            es[epid] = (pid, st, tipo, nome)
+            j += 5 + eil
         for epid in es:
             if epid not in self.es_pids:
                 self.ref[epid] = agora
         self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] != pid}
         self.es_pids.update(es)
+        self.programas[pid] = {"pcr_pid": pcr_pid, "ca": ca}
+        self.ca_pids |= ca
 
+    def _sdt(self, sec):
+        if len(sec) < 15:
+            return
+        self.onid = (sec[8] << 8) | sec[9]
+        j = 11
+        while j + 5 <= len(sec) - 4:
+            sid = (sec[j] << 8) | sec[j + 1]
+            dll = ((sec[j + 3] & 0x0F) << 8) | sec[j + 4]
+            for tag, dd in _descritores(sec, j + 5, min(j + 5 + dll, len(sec) - 4)):
+                if tag == 0x48 and len(dd) >= 3:
+                    tipo = dd[0]
+                    lp = dd[1]
+                    prov = _texto_dvb(dd[2:2 + lp])
+                    ln = dd[2 + lp] if len(dd) > 2 + lp else 0
+                    nome = _texto_dvb(dd[3 + lp:3 + lp + ln])
+                    self.servicos_sdt[sid] = (nome, prov, tipo)
+            j += 5 + dll
+
+    @staticmethod
+    def _hora_mjd(b):
+        import datetime
+        try:
+            mjd = (b[0] << 8) | b[1]
+            dia = datetime.date(1858, 11, 17) + datetime.timedelta(days=mjd)
+            bcd = [((x >> 4) * 10 + (x & 0x0F)) for x in b[2:5]]
+            return f"{dia.isoformat()} {bcd[0]:02d}:{bcd[1]:02d}:{bcd[2]:02d}"
+        except (ValueError, OverflowError):
+            return None
+
+    # --- verificações por tempo ---------------------------------------
     def verificar(self, agora):
-        """Checagens por tempo (chamar algumas vezes por segundo)."""
+        """Checagens por tempo e cálculo de taxas (chamar algumas vezes por segundo)."""
+        if self.t_taxa is None:
+            self.t_taxa, self.n_ant = agora, dict(self.n_pid)
+        elif agora - self.t_taxa >= 1.0:
+            dt = agora - self.t_taxa
+            self.taxa = {p: (n - self.n_ant.get(p, 0)) * 1504 / dt for p, n in self.n_pid.items()}
+            self.taxa_total = sum(self.taxa.values())
+            self.hist_total.append(int(self.taxa_total))
+            self.pcr_info = {p: {"intervalo_ms": round(j[0] / 27000, 2), "jitter_ns": int(j[1])}
+                             for p, j in self.pcr_janela.items()}
+            self.pcr_janela = {}
+            self.n_ant, self.t_taxa = dict(self.n_pid), agora
+
         if self.ultimo_pacote is None:
             return
         fluindo = agora - self.ultimo_pacote < self.LIM_SINAL
         if self.fluindo and not fluindo:
-            self._erro("sync_loss", agora)  # perda do sinal de entrada
+            self._erro("sync_loss", agora)
+            self.taxa = {}
+            self.taxa_total = 0
         self.fluindo = fluindo
         if not fluindo:
             return
 
-        def ausente(pid, lim, tipo, desde):
-            ult = self.visto.get(pid, desde)
-            if agora - ult > lim and agora - self.reportado.get(pid, -1e9) > lim:
+        def ausente(chave, lim, tipo, desde):
+            ult = self.visto.get(chave, desde) if isinstance(chave, int) else desde
+            if agora - ult > lim and agora - self.reportado.get((tipo, chave), -1e9) > lim:
                 self._erro(tipo, agora)
-                self.reportado[pid] = agora
+                self.reportado[(tipo, chave)] = agora
 
         ausente(0, self.LIM_PAT, "pat", self.inicio_fluxo)
         for ppid in self.pmt_pids:
             ausente(ppid, self.LIM_PMT, "pmt", self.ref.get(ppid, agora))
-        for epid in self.es_pids:
+        for epid, (_, _, tipo, _) in self.es_pids.items():
             ausente(epid, self.LIM_PID, "pid", self.ref.get(epid, agora))
+            if tipo in ("video", "audio") and epid in self.pts_visto:
+                ausente(f"pts{epid}", self.LIM_PTS, "pts", self.pts_visto[epid])
+        for prog in self.programas.values():
+            pp = prog["pcr_pid"]
+            if pp != 0x1FFF and pp in self.pcr_chegada:
+                ausente(f"pcr{pp}", self.LIM_PCR_AUSENTE, "pcr_rep", self.pcr_chegada[pp])
+        if self.ultimo_scr and agora - self.ultimo_scr < 1.0 and \
+                (self.cat_visto is None or agora - self.cat_visto > 10.0):
+            ausente("cat", 1.0, "cat", -1e9)
+        for chave, lim in self.LIM_SI.items():
+            if chave in self.si_visto:
+                ausente(f"si_{chave}", lim, chave, self.si_visto[chave])
+        if agora - self.inicio_fluxo > 2.0 and 0 in self.visto:
+            refs = self._referenciados()
+            for p, t in self.taxa.items():
+                if t > 0 and p not in refs and p not in self.nao_ref:
+                    self.nao_ref.add(p)
+                    self._erro("unref", agora)
 
+    def _referenciados(self):
+        refs = set(range(0x20)) | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
+        refs |= {p["pcr_pid"] for p in self.programas.values()}
+        return refs
+
+    # --- consultas ----------------------------------------------------
     def status(self, agora=None):
         agora = time.monotonic() if agora is None else agora
         with self.lock:
@@ -567,6 +875,107 @@ class AnalisadorTS:
                 "pids_ausentes": [f"0x{p:04X}" for p in ausentes],
                 "pacotes": self.pacotes,
                 "desde": self.desde,
+            }
+
+    def _desc_pid(self, pid):
+        fixos = {0: "PAT", 1: "CAT", 2: "TSDT", 0x10: "NIT", 0x11: "SDT/BAT", 0x12: "EIT",
+                 0x13: "RST", 0x14: "TDT/TOT", 0x1FFF: "Pacotes nulos"}
+        if pid in self.pmt_pids:
+            return f"PMT (programa {self.pmt_pids[pid]})", "psi"
+        if pid in self.es_pids:
+            return self.es_pids[pid][3], self.es_pids[pid][2]
+        if pid in fixos:
+            return fixos[pid], ("nulo" if pid == 0x1FFF else "psi")
+        if pid in self.ca_pids:
+            return "ECM/EMM (acesso condicional)", "ca"
+        if pid in {p["pcr_pid"] for p in self.programas.values()}:
+            return "PCR", "pcr"
+        if pid < 0x20:
+            return "SI reservado", "psi"
+        return "Não referenciado", "desconhecido"
+
+    def analise(self, agora=None):
+        agora = time.monotonic() if agora is None else agora
+        with self.lock:
+            fluindo = self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL
+            total = self.taxa_total if fluindo else 0
+            prog_de_pid = {}
+            for ppid, num in self.pmt_pids.items():
+                prog_de_pid[ppid] = num
+            for epid, v in self.es_pids.items():
+                prog_de_pid[epid] = self.pmt_pids.get(v[0])
+            for ppid, pr in self.programas.items():
+                prog_de_pid.setdefault(pr["pcr_pid"], self.pmt_pids.get(ppid))
+
+            def nome_serv(num):
+                if num is None:
+                    return ""
+                s = self.servicos_sdt.get(num)
+                return s[0] if s and s[0] else f"Programa {num}"
+
+            pcr_pids = {p["pcr_pid"] for p in self.programas.values()}
+            pids = []
+            for pid in sorted(set(self.n_pid) | set(self.es_pids) | set(self.pmt_pids)):
+                desc, tipo = self._desc_pid(pid)
+                t = self.taxa.get(pid, 0) if fluindo else 0
+                pids.append({
+                    "pid": pid, "hex": f"0x{pid:04X}", "desc": desc, "tipo": tipo,
+                    "servico": nome_serv(prog_de_pid.get(pid)),
+                    "taxa": int(t), "pct": round(100 * t / total, 2) if total else 0,
+                    "pacotes": self.n_pid.get(pid, 0), "cc": self.cc_pid.get(pid, 0),
+                    "emb": bool(self.emb.get(pid)), "pcr": pid in pcr_pids,
+                    "ausente": pid not in self.n_pid or (fluindo and agora - self.visto.get(pid, 0) > self.LIM_PID),
+                })
+            servicos = []
+            for ppid, num in sorted(self.pmt_pids.items(), key=lambda x: x[1]):
+                pr = self.programas.get(ppid, {"pcr_pid": None, "ca": set()})
+                sdt = self.servicos_sdt.get(num, ("", "", None))
+                comps = [{"pid": e, "hex": f"0x{e:04X}", "desc": v[3], "tipo": v[2],
+                          "stream_type": f"0x{v[1]:02X}", "taxa": int(self.taxa.get(e, 0)) if fluindo else 0,
+                          "emb": bool(self.emb.get(e))}
+                         for e, v in sorted(self.es_pids.items()) if v[0] == ppid]
+                pcr_pid = pr["pcr_pid"]
+                tx = sum(c["taxa"] for c in comps) + (int(self.taxa.get(ppid, 0)) if fluindo else 0)
+                if pcr_pid is not None and pcr_pid not in self.es_pids:
+                    tx += int(self.taxa.get(pcr_pid, 0)) if fluindo else 0
+                servicos.append({
+                    "numero": num, "nome": sdt[0] or f"Programa {num}", "provedor": sdt[1],
+                    "tipo": TIPOS_SERVICO.get(sdt[2], f"0x{sdt[2]:02X}" if sdt[2] is not None else ""),
+                    "pmt": f"0x{ppid:04X}", "pcr_pid": f"0x{pcr_pid:04X}" if pcr_pid is not None else "",
+                    "pcr": self.pcr_info.get(pcr_pid) if pcr_pid is not None else None,
+                    "embaralhado": bool(pr["ca"]) or any(c["emb"] for c in comps),
+                    "taxa": tx, "componentes": comps,
+                })
+            na = []
+            if self.taxa.get(0x1FFF, 0) <= 0:
+                na.append("pcr_acc")
+            if not pcr_pids:
+                na += ["pcr_rep", "pcr_disc", "pcr_acc"]
+            if not any(v[2] in ("video", "audio") for v in self.es_pids.values()):
+                na.append("pts")
+            if self.ultimo_scr is None and self.cat_visto is None and not self.cont["cat"]:
+                na.append("cat")
+            for chave in self.LIM_SI:
+                if chave not in self.si_visto and not self.cont[chave]:
+                    na.append(chave)
+            return {
+                "resumo": {
+                    "sinal": fluindo, "em_sync": self.em_sync, "taxa_total": int(total),
+                    "taxa_util": int(total - (self.taxa.get(0x1FFF, 0) if fluindo else 0)),
+                    "tsid": self.tsid, "onid": self.onid, "rede": self.rede, "hora_ts": self.hora_ts,
+                    "n_pids": len(self.n_pid), "n_servicos": len(self.pmt_pids),
+                    "cbr": self.taxa.get(0x1FFF, 0) > 0, "pacotes": self.pacotes, "desde": self.desde,
+                },
+                "tr101290": {
+                    "contadores": dict(self.cont),
+                    "ha_s": {t: round(agora - q, 1) for t, q in self.ultimo_erro.items()},
+                    "recentes": [t for t, q in self.ultimo_erro.items() if agora - q < self.RECENTE_S],
+                    "nao_aplicavel": sorted(set(na) - {t for t, q in self.ultimo_erro.items()
+                                                       if agora - q < self.RECENTE_S}),
+                },
+                "pids": pids,
+                "servicos": servicos,
+                "historico": list(self.hist_total),
             }
 
     # --- recepção pela rede local -------------------------------------
@@ -592,7 +1001,7 @@ class AnalisadorTS:
                 agora = time.monotonic()
                 with self.lock:
                     self.processar(dados, agora)
-            except OSError:  # timeout ou socket fechado
+            except OSError:
                 agora = time.monotonic()
             if agora - ultima >= 0.25:
                 ultima = agora
@@ -897,7 +1306,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
             caminho = urlparse(self.path).path.rstrip("/") or "/"
             partes = caminho.strip("/").split("/")
             try:
-                if metodo == "GET" and caminho == "/":
+                if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
                     return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__).encode(),
                                       "text/html; charset=utf-8")
                 if metodo == "GET" and caminho == "/status.json":
@@ -906,7 +1315,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                             for c in ger.listar()])
                 if metodo == "GET" and caminho == "/api/info":
                     return self._resp(200, {"versao": __version__, "config": ger.caminho,
-                                            "persistente": bool(ger.caminho)})
+                                            "persistente": bool(ger.caminho), "tr101290": TR_ITENS})
                 if partes[:2] == ["api", "canais"]:
                     if len(partes) == 2:
                         if metodo == "GET":
@@ -928,6 +1337,11 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         acao = partes[3]
                         if metodo == "GET" and acao == "log":
                             return self._resp(200, ger.log_canal(cid))
+                        if metodo == "GET" and acao == "analise":
+                            t = ger.exec.get(cid)
+                            if not t:
+                                return self._resp(409, {"erro": "canal parado"})
+                            return self._resp(200, {**t.analisador.analise(), "estado": t.status()["estado"]})
                         if metodo == "GET" and acao == "comando":
                             return self._resp(200, {"comando": comando_para_log(
                                 montar_comando(ger.defs[cid], ger.sup.get("tsp", "tsp")))})
@@ -1234,6 +1648,43 @@ main{padding:20px;max-width:1400px;margin:auto}
 .lamp small{font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lamp b{font-variant-numeric:tabular-nums;font-size:12.5px}.lamp.e b{color:var(--err)}
 .aus{font-size:11.5px;color:var(--err);margin-top:6px;font-family:ui-monospace,monospace}
+.trp{display:flex;gap:10px;align-items:center;margin-top:7px;font-size:11.5px;color:var(--mut)}
+.trp .e{color:var(--err)}.trp .w{color:var(--warn)}.trp a{margin-left:auto;color:var(--acc);cursor:pointer;text-decoration:none}
+#vana{padding:16px 20px;max-width:1500px;margin:auto}
+.atop{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.atop h2{margin:0;font-size:18px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:12px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:9px 11px}
+.kpi small{display:block;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.kpi b{font-size:16px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+.agrid{display:grid;grid-template-columns:minmax(300px,380px) 1fr;gap:12px;margin-bottom:12px;align-items:start}
+.acol{display:flex;flex-direction:column;gap:12px;min-width:0}
+.painel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;min-width:0}
+.painel h3{margin:0 0 10px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;font-weight:600;display:flex;gap:8px}
+.painel h3 span{margin-left:auto;text-transform:none;letter-spacing:0;font-weight:400}
+.trg h4{margin:10px 0 5px;font-size:11.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}.trg:first-child h4{margin-top:0}
+.trl{display:grid;grid-template-columns:12px 38px 1fr auto 44px;align-items:center;gap:7px;padding:6px 8px;border-radius:7px;background:var(--in);margin-bottom:4px;border:1px solid transparent;font-size:13px}
+.trl i{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.trl.w i{background:var(--warn);box-shadow:0 0 6px var(--warn)}.trl.e{border-color:#5c1f22}.trl.e i{background:var(--err);box-shadow:0 0 9px var(--err)}
+.trl.x{opacity:.55}.trl.x i{background:#484f58;box-shadow:none}
+.trl .cod{color:var(--mut);font-family:ui-monospace,monospace;font-size:12px}.trl .ha{color:var(--mut);font-size:11px;white-space:nowrap}
+.trl b{text-align:right;font-variant-numeric:tabular-nums}.trl.e b{color:var(--err)}
+.serv{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
+.serv .sh{display:flex;gap:8px;align-items:baseline;padding:9px 11px;background:#11161d;flex-wrap:wrap}
+.serv .sh b{font-size:14px}.serv .sh .m{color:var(--mut);font-size:12px}.serv .sh .tx{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:600}
+.serv .meta{display:flex;gap:14px;flex-wrap:wrap;padding:6px 11px;font-size:12px;color:var(--mut);border-bottom:1px solid var(--line)}
+.serv .meta b{color:var(--txt);font-weight:500;font-family:ui-monospace,monospace}
+.badge{font-size:10.5px;padding:1px 6px;border-radius:5px;border:1px solid var(--line);color:var(--mut)}.badge.r{color:var(--err);border-color:#5c1f22}
+.tabw{overflow-x:auto}
+table.t{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}
+table.t th{text-align:left;color:var(--mut);font-weight:500;font-size:11.5px;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap;cursor:pointer;user-select:none}
+table.t th.n,table.t td.n{text-align:right}table.t td{padding:5px 8px;border-bottom:1px solid #20262f;white-space:nowrap}
+table.t tr:hover td{background:#1b222c}table.t .mono{font-family:ui-monospace,monospace}
+table.t tr.unref td{color:var(--err)}table.t tr.aus td{opacity:.45}table.t td.ruim{color:var(--err);font-weight:600}
+.bar{display:inline-block;height:7px;border-radius:4px;background:var(--acc);vertical-align:middle;margin-right:6px;opacity:.85}
+.graf .gw{position:relative}.graf .gw span{position:absolute;left:4px;transform:translateY(-110%);font-size:10.5px;color:var(--mut)}
+.graf svg{width:100%;height:150px;display:block}.graf .gl{stroke:#232a34;stroke-width:1}.graf text{fill:var(--mut);font-size:10px}
+.graf polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}.graf polygon{fill:var(--acc);opacity:.12}
+@media(max-width:900px){.agrid{grid-template-columns:1fr}#vana{padding:12px}}
 .msg{font-size:11.5px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:16px}
 .acoes{display:flex;gap:6px;flex-wrap:wrap}
 button{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer}
@@ -1264,7 +1715,16 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 </style></head><body>
 <header><h1>asi2srt</h1><span class="v">v__VERSAO__</span><span class="sp"></span>
 <div class="resumo" id="resumo"></div><button class="pri" id="novo">+ Novo canal</button></header>
-<main><div id="avisos"></div><div class="grid" id="grid"></div></main>
+<main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
+<section id="vana" hidden>
+ <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
+  <span class="sp" style="flex:1"></span><button id="azerar">Zerar contadores</button></div>
+ <div class="kpis" id="akpi"></div>
+ <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
+  <div class="acol"><div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
+  <div class="painel"><h3>Serviços<span id="anserv"></span></h3><div id="aserv"></div></div></div></div>
+ <div class="painel"><h3>PIDs<span id="anpid"></span></h3><div class="tabw"><table class="t" id="apids"></table></div></div>
+</section>
 
 <dialog id="dlg"><form method="dialog" id="frm">
 <div class="dh"><h3 id="dtit">Canal</h3><button type="button" class="mini" data-fechar>✕</button></div>
@@ -1308,7 +1768,7 @@ function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=M
  const p=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(2)},${(hh-v/mx*hh).toFixed(2)}`).join(' ');
  return`<svg class="spark" viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none"><polygon class="area" points="0,${hh} ${p} ${w},${hh}"/><polyline points="${p}"/></svg>`}
 
-let dados=[],editando=null,logId=null;
+let dados=[],editando=null,logId=null,TRI=[],anaId=null,ordem={k:'pid',d:1},ana=null;
 const TR=[['sync_loss','TS sync loss','1.1 Perda de sincronismo: 2+ sync bytes errados seguidos ou perda do sinal de entrada'],
  ['sync_byte','Sync byte','1.2 Pacote com sync byte diferente de 0x47'],
  ['pat','PAT','1.3 PAT ausente por mais de 0,5 s, table_id errado ou embaralhada'],
@@ -1320,8 +1780,11 @@ function tr(s){const t=s.tr101290;if(!t)return'';
  return`<div class="tr"><div class="trh"><span>TR 101 290 · Prioridade 1</span><span>${info}</span></div><div class="lamps">
  ${TR.map(([k,n,d])=>{const v=t.contadores[k]||0,c=t.recentes.includes(k)?'e':v?'w':(t.sinal?'':'x');
   return`<div class="lamp ${c}" title="${esc(d)}"><i></i><small>${n}</small><b>${v}</b></div>`}).join('')}</div>
- ${t.pids_ausentes.length?`<div class="aus">PIDs ausentes: ${t.pids_ausentes.map(esc).join(', ')}</div>`:''}</div>`}
-function card(c){const s=c.status||{},ativo=s.estado!=='parado';
+ ${t.pids_ausentes.length?`<div class="aus">PIDs ausentes: ${t.pids_ausentes.map(esc).join(', ')}</div>`:''}
+ ${TRI.length?(()=>{const soma=p=>TRI.filter(x=>x[1]===p).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),
+  rec=p=>TRI.some(x=>x[1]===p&&t.recentes.includes(x[0])),cl=p=>rec(p)?'e':soma(p)?'w':'';
+  return`<div class="trp"><span class="${cl(2)}">P2 · ${soma(2)}</span><span class="${cl(3)}">P3 · ${soma(3)}</span><a data-ana="${s._id}">Análise completa →</a></div>`})():''}</div>`}
+function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
  <div><span class="l">Saídas</span>${c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join('')}</div></div>
@@ -1332,10 +1795,10 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
  <div class="acoes">${ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻ Reiniciar</button><button data-a="zerar" data-id="${c.id}" title="Zerar contadores">Zerar</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>`}
- <button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
+ ${ativo?`<button data-a="analise" data-id="${c.id}">Análise</button>`:''}<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
 
-function render(){$('#grid').innerHTML=dados.length?dados.map(card).join(''):
+function render(){if(anaId)return;$('#grid').innerHTML=dados.length?dados.map(card).join(''):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.bitrate_bps||0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
@@ -1390,14 +1853,67 @@ $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();
  try{if(editando.id)await api('PUT','/api/canais/'+editando.id,editando);else await api('POST','/api/canais',editando);
   $('#dlg').close();toast('Canal salvo e aplicado',1);atualizar()}catch(e){toast(e.message)}};
 
+// ---------- análise ----------
+const fmtR=b=>b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(1)+' kb/s';
+const fmtHa=s=>s<60?Math.round(s)+'s':s<3600?Math.round(s/60)+'min':(s/3600).toFixed(1)+'h';
+function rota(){const m=location.hash.match(/^#\/analise\/(\w+)/);anaId=m?m[1]:null;ana=null;
+ $('#vana').hidden=!anaId;$('#vlista').hidden=!!anaId;window.scrollTo(0,0);
+ if(anaId){$('#akpi').innerHTML=$('#atr').innerHTML=$('#aserv').innerHTML=$('#apids').innerHTML='';carregarAna()}else render()}
+async function carregarAna(){if(!anaId)return;const c=dados.find(x=>x.id===anaId);$('#anome').textContent=c?c.nome:'';
+ try{ana=await api('GET',`/api/canais/${anaId}/analise`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
+function kpi(r,v,t){return`<div class="kpi" title="${esc(t||'')}"><small>${r}</small><b>${v}</b></div>`}
+function rAna(){const a=ana,r=a.resumo,t=a.tr101290;
+ $('#aest').className='pill '+a.estado;$('#aest').textContent=(r.sinal?a.estado:'sem sinal').replace('_',' ');
+ $('#akpi').innerHTML=kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')
+  +kpi('Taxa',r.cbr?'CBR':'VBR','CBR = TS com pacotes nulos (taxa constante)')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'))
+  +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
+  +kpi('Pacotes',r.pacotes.toLocaleString('pt-BR'));
+ $('#adesde').textContent='desde '+new Date(r.desde*1000).toLocaleTimeString('pt-BR');
+ $('#atr').innerHTML=[1,2,3].map(p=>`<div class="trg"><h4>Prioridade ${p}</h4>${TRI.filter(x=>x[1]===p).map(([k,,cod,nome,desc])=>{
+  const v=t.contadores[k]||0,rec=t.recentes.includes(k),na=t.nao_aplicavel.includes(k),ha=t.ha_s[k];
+  const c=rec?'e':(na&&!v)?'x':v?'w':'';
+  return`<div class="trl ${c}" title="${esc(desc)}${na?' — não aplicável a este TS':''}"><i></i><span class="cod">${cod}</span><span>${nome}</span>
+  <span class="ha">${na&&!v?'n/a':ha!=null?'há '+fmtHa(ha):''}</span><b>${v}</b></div>`}).join('')}</div>`).join('');
+ // gráfico
+ const h=a.historico,W=600,H=150;if(h.length>1){const mx=Math.max(...h)*1.15||1,
+  pts=h.map((v,i)=>`${(i/(h.length-1)*W).toFixed(1)},${(H-v/mx*(H-14)).toFixed(1)}`).join(' ');
+  const fs=[.25,.5,.75,1],gl=fs.map(f=>{const y=(H-f*(H-14)).toFixed(1);return`<line class="gl" x1="0" x2="${W}" y1="${y}" y2="${y}"/>`}).join('');
+  const rot=fs.map(f=>`<span style="top:${((1-f*(H-14)/H)*100).toFixed(1)}%">${(mx*f/1e6).toFixed(1)} Mb/s</span>`).join('');
+  $('#agraf').innerHTML=`<div class="gw"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}<polygon points="0,${H} ${pts} ${W},${H}"/><polyline points="${pts}"/></svg>${rot}</div>`}
+ else $('#agraf').innerHTML='<div class="msg">aguardando dados…</div>';
+ // serviços
+ $('#anserv').textContent=a.servicos.length+' serviço(s)';
+ $('#aserv').innerHTML=a.servicos.map(s=>`<div class="serv"><div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
+  ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}<span class="tx">${fmtR(s.taxa)}</span></div>
+  <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span><span>PCR <b>${s.pcr_pid||'—'}</b></span>
+  ${s.pcr?`<span>Intervalo PCR <b>${s.pcr.intervalo_ms} ms</b></span><span>Jitter PCR <b>${s.pcr.jitter_ns} ns</b></span>`:''}</div>
+  <div class="tabw"><table class="t"><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>
+  ${s.componentes.map(c=>`<tr><td class="mono">${c.hex}</td><td>${esc(c.desc)}${c.emb?' <span class="badge r">emb</span>':''}</td><td class="mono">${c.stream_type}</td><td class="n">${fmtR(c.taxa)}</td></tr>`).join('')}</table></div></div>`).join('')
+  ||'<div class="msg">nenhum serviço (aguardando PAT/PMT)</div>';
+ rPids()}
+const COLS=[['pid','PID',1],['pid','Dec',1],['desc','Descrição'],['servico','Serviço'],['taxa','Bitrate',1],['pct','%',1],['pacotes','Pacotes',1],['cc','Erros CC',1],['f','Flags']];
+function rPids(){if(!ana)return;const l=[...ana.pids].sort((x,y)=>{const k=ordem.k,a=x[k],b=y[k];return(typeof a==='string'?a.localeCompare(b):a-b)*ordem.d});
+ $('#anpid').textContent=l.length+' PIDs';
+ $('#apids').innerHTML=`<tr>${COLS.map(([k,n,num])=>`<th class="${num?'n':''}" data-ord="${k}">${n}${ordem.k===k&&n!=='Dec'?(ordem.d>0?' ▲':' ▼'):''}</th>`).join('')}</tr>`
+ +l.map(p=>`<tr class="${p.tipo==='desconhecido'?'unref':''} ${p.ausente?'aus':''}"><td class="mono n">${p.hex}</td><td class="n">${p.pid}</td><td>${esc(p.desc)}</td>
+ <td>${esc(p.servico)}</td><td class="n">${fmtR(p.taxa)}</td><td class="n"><span class="bar" style="width:${Math.max(1,Math.min(60,p.pct*0.6))}px"></span>${p.pct.toFixed(1)}</td>
+ <td class="n">${p.pacotes.toLocaleString('pt-BR')}</td><td class="n ${p.cc?'ruim':''}">${p.cc}</td>
+ <td>${p.pcr?'<span class="badge">PCR</span> ':''}${p.emb?'<span class="badge r">emb</span>':''}${p.ausente?'<span class="badge r">ausente</span>':''}</td></tr>`).join('')}
+$('#apids').addEventListener('click',e=>{const th=e.target.closest('th');if(!th)return;const k=th.dataset.ord;ordem={k,d:ordem.k===k?-ordem.d:(k==='taxa'||k==='pct'||k==='cc'||k==='pacotes'?-1:1)};rPids()});
+$('#voltar').onclick=()=>{location.hash=''};
+$('#azerar').onclick=async()=>{try{await api('POST',`/api/canais/${anaId}/zerar`);carregarAna()}catch(e){toast(e.message)}};
+window.addEventListener('hashchange',rota);
+
 // ---------- log ----------
 async function carregarLog(){if(!logId)return;try{const l=await api('GET',`/api/canais/${logId}/log`),p=$('#logtxt'),
  fim=p.scrollTop+p.clientHeight>=p.scrollHeight-20;p.textContent=l.join('\n')||'(sem mensagens — canal parado ou recém-iniciado)';if(fim)p.scrollTop=p.scrollHeight}catch(e){}}
 
+document.addEventListener('click',ev=>{const l=ev.target.closest('[data-ana]');if(l)location.hash='#/analise/'+l.dataset.ana});
 document.addEventListener('click',async ev=>{const b=ev.target.closest('button');if(!b)return;
  if(b.hasAttribute('data-fechar')){b.closest('dialog').close();return}
  const a=b.dataset.a,id=b.dataset.id;if(!a)return;const c=dados.find(x=>x.id===id);
  try{if(a==='editar')return abrir(id);
+  if(a==='analise'){location.hash='#/analise/'+id;return}
   if(a==='log'){logId=id;$('#ltit').textContent='Log — '+c.nome;$('#logtxt').textContent='';$('#dlglog').showModal();return carregarLog()}
   if(a==='excluir'){if(!confirm(`Excluir o canal "${c.nome}"?`))return;await api('DELETE','/api/canais/'+id)}
   else{b.disabled=true;await api('POST',`/api/canais/${id}/${a}`)}
@@ -1405,8 +1921,8 @@ document.addEventListener('click',async ev=>{const b=ev.target.closest('button')
 $('#dlglog').addEventListener('close',()=>logId=null);
 $('#novo').onclick=()=>abrir();
 
-api('GET','/api/info').then(i=>{if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
-atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);
+api('GET','/api/info').then(i=>{TRI=i.tr101290||[];render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
+atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(carregarAna,1000);rota();
 </script></body></html>
 """
 

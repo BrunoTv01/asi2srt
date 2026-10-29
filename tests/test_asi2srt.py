@@ -177,7 +177,7 @@ def test_api_completa(gateway):
     _, lista = _req(base, "GET", "/api/canais")
     st = lista[0]["status"]
     assert st["estado"] == "rodando" and st["bitrate_bps"] == 8000000
-    assert set(st["tr101290"]["contadores"]) == {"sync_loss", "sync_byte", "cc", "pat", "pmt", "pid"}
+    assert set(st["tr101290"]["contadores"]) == set(a.TIPOS_TR101290)
     assert _req(base, "POST", f"/api/canais/{cid}/zerar")[0] == 200
     assert len(_req(base, "GET", f"/api/canais/{cid}/log")[1]) >= 1
 
