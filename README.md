@@ -1,90 +1,131 @@
-# asi2srt — Gateway DVB-ASI → SRT
+# asi2srt — Gateway ASI / UDP / SRT → SRT / UDP
 
-Um único programa que captura o transport stream de uma entrada **DVB-ASI** e o
-encapsula em **SRT** (caller ou listener, com criptografia AES opcional).
-Usa o [TSDuck](https://tsduck.io) como motor e adiciona supervisão, reinício
-automático, monitoração e painel web.
+Um único programa que recebe um transport stream (**placa DVB-ASI**, **UDP/multicast**,
+**SRT** ou arquivo) e o reenvia para uma ou mais saídas **SRT** e/ou **UDP**.
+Usa o [TSDuck](https://tsduck.io) como motor e inclui **painel web** para gerenciar
+os canais, supervisão com reinício automático e monitoração.
 
 ```
- Placa ASI ──► tsp: entrada ──► continuity ──► filter (nulos) ──► bitrate_monitor ──► SRT ──► rede
- (DekTec /         ▲                                                                   │
-  DVEO)            └──── asi2srt: supervisiona, reinicia, painel em :8088 ◄─────────────┘
+ Entradas                                                          Saídas (uma ou várias)
+ ─────────                                                         ──────────────────────
+ DekTec ASI ─┐                                                  ┌─► SRT caller / listener (AES)
+ DVEO ASI ───┤                                                  │
+ UDP/multic. ┼─► tsp: continuity ─► filter ─► bitrate_monitor ──┼─► UDP unicast / multicast
+ SRT ────────┤                                                  │
+ Arquivo .ts ┘        painel web :8088 · reinício automático     └─► ...
 ```
 
 ## Instalação
 
-**Opção 1 — binário pronto (não precisa de Python):** baixe o `asi2srt-linux-amd64` em
-[Releases](../../releases).
+**Binário pronto (não precisa de Python):** baixe em [Releases](../../releases).
 
 ```bash
 chmod +x asi2srt-linux-amd64 && sudo mv asi2srt-linux-amd64 /usr/local/bin/asi2srt
 ```
 
-**Opção 2 — script Python (3.8+):**
+**Ou script Python (3.8+):**
 
 ```bash
 curl -LO https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/asi2srt.py
 chmod +x asi2srt.py && sudo mv asi2srt.py /usr/local/bin/asi2srt
-pip install pyyaml   # opcional; sem ele use configuração em JSON
+pip install pyyaml   # opcional; sem ele a configuração é salva em JSON
 ```
 
-Depois instale o TSDuck e confira:
+Depois:
 
 ```bash
 sudo asi2srt instalar-tsduck
 asi2srt verificar
 ```
 
-## Uso rápido (sem arquivo de configuração)
+## Painel web
 
 ```bash
-# Placa DekTec 0, porta 0 -> envia para um receptor SRT (caller)
+asi2srt rodar
+```
+
+Abra `http://IP-DO-SERVIDOR:8088`. Na primeira execução é gerada uma senha (usuário `admin`),
+mostrada no log e salva no arquivo de configuração.
+
+![Painel](docs/painel.png)
+
+![Editar canal](docs/editar.png)
+
+Pelo painel você:
+- cria, edita e exclui canais
+- escolhe a entrada (DekTec, Linux ASI, UDP, SRT, arquivo)
+- adiciona várias saídas SRT e UDP por canal
+- inicia, para e reinicia cada canal
+- acompanha bitrate (com gráfico), erros de continuidade, reinícios e uptime
+- vê o log de cada canal
+
+Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive a reinícios.
+
+## Linha de comando (sem painel nem arquivo)
+
+```bash
+# DekTec 0, porta 0 -> SRT caller
 asi2srt rodar -e dektec:0:0 -s "srt://203.0.113.10:9000?latency=300"
 
-# Driver Linux ASI (DVEO) -> aguarda o receptor conectar (listener), com AES
-asi2srt rodar -e linuxasi:/dev/asirx0 -s "srt://:9000?mode=listener&passphrase=minhasenha123"
+# ASI (DVEO) -> SRT listener com AES + cópia em multicast
+asi2srt rodar -e linuxasi:/dev/asirx0 \
+  -s "srt://:9000?mode=listener&passphrase=minhasenha123" \
+  -s "udp://239.1.1.1:1234?ttl=16"
 
-# Para servidores com stream id (SRT Live Server, Haivision, etc.)
-asi2srt rodar -e dektec:0:1 -s "srt://srt.exemplo.com:8080?streamid=publish/live/canal1"
+# SRT recebido -> UDP multicast (retorno / recepção)
+asi2srt rodar -e "srt://:9000?mode=listener" -s "udp://239.10.0.1:5000?local=10.0.0.5"
+
+# UDP multicast -> SRT para um servidor com stream id
+asi2srt rodar -e "udp://239.1.1.1:1234?local=10.0.0.5" \
+  -s "srt://srt.exemplo.com:8080?streamid=publish/live/canal1"
 ```
 
 | Entrada | Formato |
 |---|---|
 | DekTec (DTA-2145, DTA-2138, DTU-245…) | `dektec:PLACA:CANAL` |
 | Driver Linux ASI (DVEO / Computer Modules) | `linuxasi:/dev/asirxN` |
-| UDP / multicast | `udp:239.1.1.1:1234[@IP_DA_NIC]` |
-| Arquivo .ts em loop (teste) | `arquivo:caminho.ts` |
+| UDP / multicast | `udp://IP:PORTA?local=IP_DA_NIC` |
+| SRT listener / caller | `srt://:PORTA?mode=listener` · `srt://HOST:PORTA` |
+| Arquivo .ts em loop | `arquivo:caminho.ts` |
 
-Parâmetros da URL SRT: `mode` (caller/listener), `latency` (ms), `passphrase`,
-`pbkeylen` (16/24/32), `streamid`, `oheadbw` (% de banda extra).
+| Saída | Formato |
+|---|---|
+| SRT | `srt://HOST:PORTA?mode=caller\|listener&latency=MS&passphrase=SENHA&pbkeylen=16&streamid=ID` |
+| UDP | `udp://IP:PORTA?ttl=N&local=IP_DA_NIC` |
 
-## Uso com configuração (vários canais)
+Repita `-s` para várias saídas. A primeira é a principal; as demais recebem uma cópia.
+
+## Arquivo de configuração
 
 ```bash
 asi2srt init                     # cria asi2srt.yaml comentado
-nano asi2srt.yaml
 asi2srt comando -c asi2srt.yaml  # mostra os comandos tsp sem executar
 asi2srt rodar -c asi2srt.yaml
 ```
 
-Cada item em `canais:` é uma porta ASI com seu próprio destino SRT.
-
 ## Serviço (inicia no boot)
 
 ```bash
-sudo asi2srt instalar-servico      # cria /etc/asi2srt/config.yaml e a unidade systemd
-sudo nano /etc/asi2srt/config.yaml
+sudo asi2srt instalar-servico
 sudo systemctl enable --now asi2srt
-journalctl -u asi2srt -f
+journalctl -u asi2srt | grep "senha do painel"
 ```
 
-## Monitoração
+## Monitoração externa
 
-- Painel: `http://<ip>:8088/`
-- JSON (Zabbix, Grafana, Prometheus via exporter): `http://<ip>:8088/status.json`
+`http://IP:8088/status.json` (autenticação básica) — para Zabbix, Grafana etc.
 
-Para cada canal: estado, bitrate, erros de continuidade (CC), alarmes de taxa,
-número de reinícios e uptime.
+## API
+
+Todas as rotas usam autenticação básica. Rotas que alteram algo exigem o cabeçalho `X-Asi2srt: 1`.
+
+| Método | Rota | Função |
+|---|---|---|
+| GET | `/api/canais` | lista canais e status |
+| POST | `/api/canais` | cria canal |
+| PUT / DELETE | `/api/canais/{id}` | edita / exclui |
+| POST | `/api/canais/{id}/iniciar` · `parar` · `reiniciar` | controle |
+| GET | `/api/canais/{id}/log` · `comando` | log / comando tsp |
 
 ## Teste sem hardware
 
@@ -92,36 +133,23 @@ número de reinícios e uptime.
 asi2srt teste
 ```
 
-Gera um TS de teste com ffmpeg, publica como SRT listener na porta 9000 e abre o ffplay.
-
-## Subcomandos
-
-| Comando | Função |
-|---|---|
-| `rodar` | executa o gateway |
-| `comando` | mostra os comandos tsp (dry-run) |
-| `init` | gera configuração de exemplo |
-| `verificar` | confere TSDuck, plugins, placas DekTec e dispositivos ASI |
-| `instalar-tsduck` | baixa e instala o TSDuck |
-| `instalar-servico` | instala como serviço systemd |
-| `teste` | teste ponta a ponta sem placa |
+Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
+Painel em `http://127.0.0.1:8088` (admin / teste).
 
 ## Dicas
 
-- **Latência SRT:** 3–4× o RTT do link. Internet pública: 500–2000 ms. LAN/MPLS: 120–200 ms.
-- **Pacotes nulos:** o ASI costuma vir completado com stuffing até a taxa nominal. Removê-los
-  (padrão) economiza banda. Use `--manter-nulos` se o receptor exigir CBR.
-- **Banda necessária:** `bitrate × (1 + oheadbw/100)`.
+- **Latência SRT:** 3–4× o RTT. Internet pública: 500–2000 ms. LAN/MPLS: 120–200 ms.
+- **Pacotes nulos:** removidos por padrão para economizar banda. Desligue se o receptor exigir CBR.
+- **Multicast:** informe o IP da placa de rede (`local=` / "IP da interface") em servidores com várias NICs.
 - **DekTec:** precisa do driver DekTec e do TSDuck com plugin `dektec`.
 - **DVEO:** configure o driver para pacotes de 188 bytes.
+- **Segurança:** o painel controla o gateway. Não exponha a porta 8088 na internet; use VPN ou firewall.
 
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v2.0.0 && git push origin v2.0.0
 ```
-
-O GitHub Actions compila o binário e o publica em Releases.
 
 ## Licença
 

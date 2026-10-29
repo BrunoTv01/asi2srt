@@ -1,32 +1,38 @@
 #!/usr/bin/env python3
 """
-asi2srt - gateway DVB-ASI -> SRT em um único programa.
+asi2srt - gateway DVB-ASI / UDP / SRT  ->  SRT / UDP, em um único programa.
 
-Captura o transport stream de uma entrada DVB-ASI (DekTec, driver Linux ASI/DVEO),
-UDP ou arquivo, e o encapsula em SRT usando o TSDuck (tsp) como motor.
+Captura um transport stream (placa DVB-ASI DekTec ou driver Linux ASI/DVEO, UDP,
+SRT ou arquivo) e o reenvia para uma ou mais saídas SRT e/ou UDP, usando o
+TSDuck (tsp) como motor. Inclui painel web para gerenciar os canais.
 
 Subcomandos:
-  rodar             executa o gateway (a partir de config ou direto pela linha de comando)
+  rodar             executa o gateway + painel web (http://IP:8088)
   init              gera um arquivo de configuração de exemplo
   comando           mostra os comandos tsp que seriam executados (dry-run)
-  verificar         confere TSDuck, plugins e placas DekTec
+  verificar         confere TSDuck, plugins e placas
   instalar-tsduck   baixa e instala o TSDuck (Debian/Ubuntu/Fedora/RHEL)
   instalar-servico  instala como serviço systemd (inicia no boot)
-  teste             teste ponta a ponta sem hardware (ffmpeg -> gateway -> SRT)
+  teste             teste ponta a ponta sem hardware
 
-Exemplos rápidos:
-  asi2srt rodar --entrada dektec:0:0 --saida "srt://203.0.113.10:9000?latency=200"
-  asi2srt rodar --entrada linuxasi:/dev/asirx0 --saida "srt://:9000?mode=listener&passphrase=minhasenha123"
-  asi2srt init && asi2srt rodar -c asi2srt.yaml
+Exemplos:
+  asi2srt rodar                                   # abre o painel e gerencia por lá
+  asi2srt rodar -e dektec:0:0 -s "srt://203.0.113.10:9000?latency=300"
+  asi2srt rodar -e linuxasi:/dev/asirx0 -s "srt://:9000?mode=listener" -s udp://239.1.1.1:1234
+  asi2srt rodar -e "srt://:9000?mode=listener" -s udp://239.10.0.1:5000?ttl=8
 """
 
 import argparse
-import html
+import base64
+import collections
+import copy
+import hmac
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -39,14 +45,17 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 try:
-    import yaml  # opcional: sem PyYAML, use configuração em JSON
+    import yaml  # opcional: sem PyYAML a configuração é salva em JSON
 except ImportError:
     yaml = None
 
 log = logging.getLogger("asi2srt")
+
+TIPOS_ENTRADA = ("dektec", "linuxasi", "udp", "srt", "arquivo")
+TIPOS_SAIDA = ("srt", "udp")
 
 # ======================================================================
 # Configuração de exemplo (gerada por "asi2srt init")
@@ -54,109 +63,119 @@ log = logging.getLogger("asi2srt")
 CONFIG_EXEMPLO = """\
 # ==========================================================
 #  asi2srt - configuração
-#  Captura DVB-ASI  ->  (monitoração / filtros)  ->  SRT
+#  Entrada (ASI / UDP / SRT / arquivo) -> monitoração -> saídas SRT e/ou UDP
+#  Tudo aqui também pode ser editado pelo painel web (http://IP:8088).
+#  Atenção: salvar pelo painel reescreve este arquivo (comentários se perdem).
 # ==========================================================
 
-# Uma entrada por porta ASI. Cada canal vira um processo tsp
-# independente, supervisionado e reiniciado se cair.
 canais:
   - nome: "ASI-1"
     ativo: true
 
     entrada:
-      # tipo: dektec | linuxasi | udp | arquivo
-      #   dektec   -> placas DekTec (DTA-2145, DTA-2138, DTU-245...) via DTAPI
-      #   linuxasi -> driver Linux ASI (DVEO/Computer Modules): /dev/asirx0
-      #   udp      -> TS em UDP/multicast
-      #   arquivo  -> arquivo .ts em loop (teste sem hardware)
+      # tipo: dektec | linuxasi | udp | srt | arquivo
       tipo: dektec
-      dektec:
-        dispositivo: 0        # índice da placa ("asi2srt verificar" lista as placas)
-        canal: 0              # porta de entrada na placa
-        timeout_ms: 5000      # sem sinal por este tempo => erro e reinício
-      linuxasi:
-        dispositivo: /dev/asirx0
-      udp:
-        endereco: "239.1.1.1:1234"
-        interface_local: ""   # IP da placa de rede que recebe o multicast
-      arquivo:
-        caminho: teste.ts
-        loop: true
+      dispositivo: 0          # dektec: índice da placa | linuxasi: /dev/asirx0
+      canal: 0                # dektec: porta de entrada da placa
+      timeout_ms: 5000        # dektec: sem sinal por este tempo => reinício
+      # udp:     endereco: "239.1.1.1:1234"   interface_local: "192.168.10.5"
+      # srt:     modo: listener|caller   endereco: "9000" ou "host:porta"
+      #          latencia_ms: 200   senha: ""   stream_id: ""
+      # arquivo: caminho: teste.ts   loop: true
 
     processamento:
       remover_nulos: true     # tira o stuffing (PID 0x1FFF) e economiza banda
-      remover_pids: []        # PIDs a descartar, ex.: [0x0012, 0x0014]
+      remover_pids: []        # PIDs a descartar, ex.: ["0x0012", "0x0014"]
       bitrate_min: 1000000    # alarme abaixo disto (bit/s). 0 = desligado
       bitrate_max: 0          # alarme acima disto (bit/s). 0 = desligado
       intervalo_relatorio_s: 5
 
-    saida:
-      modo: caller            # caller (conecta no destino) | listener (aguarda conexão)
-      endereco: "203.0.113.10:9000"   # caller: host:porta | listener: porta ou ip:porta
-      latencia_ms: 200        # 3 a 4x o RTT do link
-      senha: ""               # passphrase AES (10 a 79 caracteres). Vazio = sem criptografia
-      tamanho_chave: 16       # 16, 24 ou 32 (AES-128/192/256)
-      stream_id: ""           # para SRT Live Server, Haivision, etc.
-      overhead_pct: 25        # banda extra reservada para retransmissões
+    # Uma ou mais saídas. A primeira é a principal; as demais recebem cópia.
+    saidas:
+      - tipo: srt
+        modo: caller            # caller (conecta no destino) | listener (aguarda conexão)
+        endereco: "203.0.113.10:9000"
+        latencia_ms: 200        # 3 a 4x o RTT do link
+        senha: ""               # passphrase AES (10 a 79 caracteres). Vazio = sem criptografia
+        tamanho_chave: 16       # 16, 24 ou 32
+        stream_id: ""
+        overhead_pct: 25        # banda extra para retransmissões
+      # - tipo: udp
+      #   endereco: "239.1.1.1:1234"   # unicast ou multicast
+      #   ttl: 16
+      #   interface_local: ""          # IP da placa de rede de saída
 
 supervisor:
   reinicio_min_s: 2
   reinicio_max_s: 60
   tsp: tsp                    # caminho do executável do TSDuck
-  status_http: "0.0.0.0:8088" # painel web e /status.json. Vazio desativa
-  log_arquivo: ""             # ex.: /var/log/asi2srt.log
+  status_http: "0.0.0.0:8088" # painel web. Vazio desativa
+  usuario: admin              # login do painel
+  senha_painel: ""            # vazio = gera uma senha na 1ª execução (aparece no log)
+  log_arquivo: ""
 """
 
 
+# ======================================================================
+# Leitura / escrita / normalização da configuração
+# ======================================================================
 def carregar_config(caminho: str) -> dict:
     with open(caminho, encoding="utf-8") as f:
         texto = f.read()
     if caminho.lower().endswith(".json"):
-        return json.loads(texto)
+        return json.loads(texto or "{}")
     if yaml is None:
         sys.exit("Para configuração YAML instale o PyYAML (pip install pyyaml) "
                  "ou use um arquivo .json com a mesma estrutura.")
     return yaml.safe_load(texto) or {}
 
 
+def salvar_config(caminho: str, cfg: dict):
+    tmp = caminho + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        if caminho.lower().endswith(".json") or yaml is None:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        else:
+            f.write("# asi2srt - configuração (gerenciada também pelo painel web)\n")
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    os.replace(tmp, caminho)
+
+
+def normalizar_canal(c: dict) -> dict:
+    """Aceita o formato antigo (entrada aninhada, 'saida' única) e o novo (plano, 'saidas')."""
+    c = copy.deepcopy(c)
+    c.setdefault("id", secrets.token_hex(4))
+    c.setdefault("nome", f"canal-{c['id']}")
+    c.setdefault("ativo", True)
+    ent = c.get("entrada") or {}
+    tipo = ent.get("tipo", "dektec")
+    if isinstance(ent.get(tipo), dict):  # formato antigo: entrada.dektec.{...}
+        ent = {**ent[tipo], "tipo": tipo}
+    else:
+        ent = {k: v for k, v in ent.items() if not isinstance(v, dict)}
+    c["entrada"] = ent
+    if "saidas" not in c:
+        s = c.pop("saida", None)
+        c["saidas"] = [dict(s, tipo=s.get("tipo", "srt"))] if s else []
+    c["saidas"] = [dict(s, tipo=s.get("tipo", "srt")) for s in c["saidas"]]
+    c.setdefault("processamento", {"remover_nulos": True, "intervalo_relatorio_s": 5})
+    return c
+
+
 # ======================================================================
 # Atalhos de linha de comando: --entrada / --saida
 # ======================================================================
-def entrada_de_texto(txt: str) -> dict:
-    """dektec:0:0 | linuxasi:/dev/asirx0 | udp:239.1.1.1:1234[@ip_local] | arquivo:x.ts"""
-    tipo, _, resto = txt.partition(":")
-    tipo = tipo.lower()
-    if tipo == "dektec":
-        partes = (resto or "0:0").split(":")
-        return {"tipo": "dektec", "dektec": {
-            "dispositivo": int(partes[0] or 0),
-            "canal": int(partes[1]) if len(partes) > 1 else 0,
-            "timeout_ms": 5000}}
-    if tipo == "linuxasi":
-        return {"tipo": "linuxasi", "linuxasi": {"dispositivo": resto or "/dev/asirx0"}}
-    if tipo == "udp":
-        end, _, local = resto.partition("@")
-        return {"tipo": "udp", "udp": {"endereco": end, "interface_local": local}}
-    if tipo in ("arquivo", "file"):
-        return {"tipo": "arquivo", "arquivo": {"caminho": resto, "loop": True}}
-    raise SystemExit(f"entrada inválida: {txt!r} (use dektec:N:C, linuxasi:/dev/asirxN, "
-                     "udp:ip:porta ou arquivo:caminho.ts)")
-
-
-def saida_de_url(url: str) -> dict:
-    """srt://host:porta?mode=caller|listener&latency=ms&passphrase=x&pbkeylen=16&streamid=y"""
-    u = urlparse(url)
-    if u.scheme != "srt":
-        raise SystemExit(f"saída inválida: {url!r} (esperado srt://host:porta?...)")
+def _srt_de_url(u, padrao_modo):
     q = {k: v[-1] for k, v in parse_qs(u.query).items()}
-    modo = q.get("mode", "listener" if not u.hostname else "caller")
+    modo = q.get("mode", "listener" if not u.hostname else padrao_modo)
     if modo == "caller":
         if not u.hostname or not u.port:
-            raise SystemExit("modo caller precisa de host e porta: srt://host:porta")
+            raise SystemExit("SRT caller precisa de host e porta: srt://host:porta")
         endereco = f"{u.hostname}:{u.port}"
     else:
-        endereco = f"{u.hostname}:{u.port}" if u.hostname and u.hostname != "0.0.0.0" else str(u.port)
-    return {"modo": modo, "endereco": endereco,
+        endereco = (f"{u.hostname}:{u.port}" if u.hostname and u.hostname != "0.0.0.0"
+                    else str(u.port))
+    return {"tipo": "srt", "modo": modo, "endereco": endereco,
             "latencia_ms": int(q.get("latency", 200)),
             "senha": q.get("passphrase", ""),
             "tamanho_chave": int(q.get("pbkeylen", 16)),
@@ -164,47 +183,130 @@ def saida_de_url(url: str) -> dict:
             "overhead_pct": int(q.get("oheadbw", 25))}
 
 
+def _udp_de_url(u):
+    q = {k: v[-1] for k, v in parse_qs(u.query).items()}
+    host = u.hostname or ""
+    return {"tipo": "udp", "endereco": f"{host}:{u.port}" if host else str(u.port),
+            "ttl": int(q.get("ttl", 16)), "interface_local": q.get("local", "")}
+
+
+def entrada_de_texto(txt: str) -> dict:
+    """dektec:0:0 | linuxasi:/dev/asirx0 | udp:IP:PORTA[@IP] | udp://IP:PORTA?local=IP
+       | srt://:9000?mode=listener | srt://host:porta | arquivo:x.ts"""
+    if txt.startswith("srt://"):
+        s = _srt_de_url(urlparse(txt), "caller")
+        s.pop("overhead_pct", None)
+        return s
+    if txt.startswith("udp://"):
+        u = _udp_de_url(urlparse(txt))
+        return {"tipo": "udp", "endereco": u["endereco"], "interface_local": u["interface_local"]}
+    tipo, _, resto = txt.partition(":")
+    tipo = tipo.lower()
+    if tipo == "dektec":
+        p = (resto or "0:0").split(":")
+        return {"tipo": "dektec", "dispositivo": int(p[0] or 0),
+                "canal": int(p[1]) if len(p) > 1 else 0, "timeout_ms": 5000}
+    if tipo == "linuxasi":
+        return {"tipo": "linuxasi", "dispositivo": resto or "/dev/asirx0"}
+    if tipo == "udp":
+        end, _, local = resto.partition("@")
+        return {"tipo": "udp", "endereco": end, "interface_local": local}
+    if tipo in ("arquivo", "file"):
+        return {"tipo": "arquivo", "caminho": resto, "loop": True}
+    raise SystemExit(f"entrada inválida: {txt!r}")
+
+
+def saida_de_url(url: str) -> dict:
+    """srt://host:porta?mode=..&latency=..&passphrase=..&streamid=..  |  udp://IP:PORTA?ttl=..&local=IP"""
+    u = urlparse(url)
+    if u.scheme == "srt":
+        return _srt_de_url(u, "caller")
+    if u.scheme == "udp":
+        return _udp_de_url(u)
+    raise SystemExit(f"saída inválida: {url!r} (use srt://... ou udp://...)")
+
+
 # ======================================================================
 # Montagem do comando tsp
 # ======================================================================
 def _pid(valor):
-    return valor if isinstance(valor, int) else int(str(valor), 0)
+    return valor if isinstance(valor, int) else int(str(valor).strip(), 0)
+
+
+def _args_srt(s: dict, entrada: bool) -> list:
+    modo = s.get("modo", "listener" if entrada else "caller")
+    if modo not in ("caller", "listener"):
+        raise ValueError(f"modo SRT inválido: {modo}")
+    if not str(s.get("endereco", "")).strip():
+        raise ValueError("SRT sem endereço")
+    a = ["--" + modo, str(s["endereco"]).strip(), "--transtype", "live",
+         "--latency", str(int(s.get("latencia_ms") or 200))]
+    if not entrada:
+        a += ["--ohead-bandwidth", str(int(s.get("overhead_pct") or 25))]
+    if s.get("senha"):
+        if not 10 <= len(s["senha"]) <= 79:
+            raise ValueError("a senha SRT deve ter entre 10 e 79 caracteres")
+        a += ["--passphrase", s["senha"], "--pbkeylen", str(int(s.get("tamanho_chave") or 16))]
+    if s.get("stream_id"):
+        a += ["--streamid", s["stream_id"]]
+    return a
+
+
+def _args_saida(s: dict) -> list:
+    tipo = s.get("tipo", "srt")
+    if tipo == "srt":
+        return ["srt"] + _args_srt(s, entrada=False)
+    if tipo == "udp":
+        if not re.match(r"^[\w.\-]*:\d+$|^\d+$", str(s.get("endereco", "")).strip()):
+            raise ValueError("saída UDP precisa de ip:porta")
+        a = ["ip", str(s["endereco"]).strip(), "--packet-burst", "7"]
+        if s.get("ttl"):
+            a += ["--ttl", str(int(s["ttl"]))]
+        if s.get("interface_local"):
+            a += ["--local-address", s["interface_local"]]
+        return a
+    raise ValueError(f"tipo de saída desconhecido: {tipo}")
 
 
 def montar_comando(canal: dict, tsp_bin: str = "tsp") -> list:
+    canal = normalizar_canal(canal)
     ent = canal["entrada"]
     proc = canal.get("processamento") or {}
-    sai = canal["saida"]
+    saidas = canal.get("saidas") or []
+    if not saidas:
+        raise ValueError("o canal precisa de pelo menos uma saída")
 
     cmd = [tsp_bin, "--realtime", "--buffer-size-mb", "8", "--max-flushed-packets", "7"]
 
-    tipo = ent["tipo"]
+    tipo = ent.get("tipo")
     if tipo == "dektec":
-        d = ent.get("dektec") or {}
-        cmd += ["-I", "dektec",
-                "--device", str(d.get("dispositivo", 0)),
-                "--channel", str(d.get("canal", 0)),
-                "--receive-timeout", str(d.get("timeout_ms", 5000))]
+        cmd += ["-I", "dektec", "--device", str(int(ent.get("dispositivo") or 0)),
+                "--channel", str(int(ent.get("canal") or 0)),
+                "--receive-timeout", str(int(ent.get("timeout_ms") or 5000))]
     elif tipo == "linuxasi":
-        # O driver Linux ASI entrega o TS como dispositivo de caracteres (modo 188 bytes).
-        cmd += ["-I", "file", (ent.get("linuxasi") or {}).get("dispositivo", "/dev/asirx0")]
+        # driver Linux ASI: dispositivo de caracteres em modo 188 bytes
+        cmd += ["-I", "file", str(ent.get("dispositivo") or "/dev/asirx0")]
     elif tipo == "udp":
-        u = ent.get("udp") or {}
-        cmd += ["-I", "ip", u["endereco"]]
-        if u.get("interface_local"):
-            cmd += ["--local-address", u["interface_local"]]
+        if not ent.get("endereco"):
+            raise ValueError("entrada UDP precisa de ip:porta (ou só porta)")
+        cmd += ["-I", "ip", str(ent["endereco"])]
+        if ent.get("interface_local"):
+            cmd += ["--local-address", ent["interface_local"]]
         cmd += ["--receive-timeout", "5000"]
+    elif tipo == "srt":
+        cmd += ["-I", "srt"] + _args_srt(ent, entrada=True)
     elif tipo == "arquivo":
-        a = ent.get("arquivo") or {}
-        cmd += ["-I", "file", a["caminho"]]
-        if a.get("loop", True):
+        if not ent.get("caminho"):
+            raise ValueError("entrada de arquivo precisa do caminho")
+        cmd += ["-I", "file", str(ent["caminho"])]
+        if ent.get("loop", True):
             cmd += ["--infinite"]
     else:
         raise ValueError(f"tipo de entrada desconhecido: {tipo}")
 
     cmd += ["-P", "continuity"]
 
-    pids = [_pid(p) for p in (proc.get("remover_pids") or [])]
+    pids = [_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
     if proc.get("remover_nulos", True):
         pids.append(0x1FFF)
     if pids:
@@ -212,40 +314,25 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp") -> list:
         for p in sorted(set(pids)):
             cmd += ["--pid", f"0x{p:04X}"]
 
-    intervalo = str(proc.get("intervalo_relatorio_s", 5))
+    intervalo = str(int(proc.get("intervalo_relatorio_s") or 5))
     cmd += ["-P", "bitrate_monitor", "--periodic-bitrate", intervalo, "--time-interval", intervalo]
     if proc.get("bitrate_min"):
-        cmd += ["--min", str(proc["bitrate_min"])]
+        cmd += ["--min", str(int(proc["bitrate_min"]))]
     if proc.get("bitrate_max"):
-        cmd += ["--max", str(proc["bitrate_max"])]
+        cmd += ["--max", str(int(proc["bitrate_max"]))]
 
-    cmd += ["-O", "srt"]
-    modo = sai.get("modo", "caller")
-    if modo == "caller":
-        cmd += ["--caller", str(sai["endereco"])]
-    elif modo == "listener":
-        cmd += ["--listener", str(sai["endereco"])]
-    else:
-        raise ValueError(f"modo SRT desconhecido: {modo}")
+    # saídas extras: cada uma recebe uma cópia do TS por um tsp filho (plugin fork)
+    for s in saidas[1:]:
+        filho = [tsp_bin, "--realtime", "-O"] + _args_saida(s)
+        cmd += ["-P", "fork", "--nowait", " ".join(shlex.quote(a) for a in filho)]
 
-    cmd += ["--transtype", "live",
-            "--latency", str(sai.get("latencia_ms", 200)),
-            "--ohead-bandwidth", str(sai.get("overhead_pct", 25))]
-    if sai.get("senha"):
-        if not 10 <= len(sai["senha"]) <= 79:
-            raise ValueError("a senha SRT deve ter entre 10 e 79 caracteres")
-        cmd += ["--passphrase", sai["senha"], "--pbkeylen", str(sai.get("tamanho_chave", 16))]
-    if sai.get("stream_id"):
-        cmd += ["--streamid", sai["stream_id"]]
+    cmd += ["-O"] + _args_saida(saidas[0])
     return cmd
 
 
 def comando_para_log(cmd: list) -> str:
-    out = list(cmd)
-    for i, a in enumerate(out[:-1]):
-        if a == "--passphrase":
-            out[i + 1] = "********"
-    return " ".join(shlex.quote(a) for a in out)
+    txt = " ".join(shlex.quote(a) for a in cmd)
+    return re.sub(r"(--passphrase\s+)('[^']*'|[^\s']+)", r"\1********", txt)
 
 
 # ======================================================================
@@ -265,21 +352,24 @@ class Canal(threading.Thread):
         self.proc = None
         self.parar = threading.Event()
         self.lock = threading.Lock()
-        self.st = {
-            "nome": self.name, "estado": "iniciando", "bitrate_bps": 0,
-            "erros_cc": 0, "alarmes_bitrate": 0, "reinicios": 0,
-            "inicio_execucao": None, "ultimo_bitrate_em": None, "ultima_msg": "",
-            "destino": f'{cfg["saida"].get("modo", "caller")} {cfg["saida"]["endereco"]}',
-            "entrada": cfg["entrada"]["tipo"],
-        }
+        self.log = collections.deque(maxlen=300)
+        self.hist = collections.deque(maxlen=60)
+        self.st = {"estado": "iniciando", "bitrate_bps": 0, "erros_cc": 0,
+                   "alarmes_bitrate": 0, "reinicios": 0, "inicio_execucao": None,
+                   "ultimo_bitrate_em": None, "ultima_msg": ""}
 
     def _set(self, **kw):
         with self.lock:
             self.st.update(kw)
 
+    def _registrar(self, nivel, msg):
+        self.log.append(f"{time.strftime('%H:%M:%S')} {msg}")
+        log.log(nivel, "[%s] %s", self.name, msg)
+
     def status(self):
         with self.lock:
             s = dict(self.st)
+            s["historico"] = list(self.hist)
         if s["inicio_execucao"]:
             s["uptime_s"] = int(time.time() - s["inicio_execucao"])
         intervalo = (self.cfg.get("processamento") or {}).get("intervalo_relatorio_s", 5)
@@ -296,19 +386,21 @@ class Canal(threading.Thread):
             m = RE_BITRATE.search(linha)
             if m:
                 bps = int(float(m.group(1).replace(",", "")))
+                with self.lock:
+                    self.hist.append(bps)
                 self._set(bitrate_bps=bps, ultimo_bitrate_em=time.time(), estado="rodando")
                 log.debug("[%s] %s", self.name, linha)
                 continue
             if RE_CC.search(linha):
                 with self.lock:
                     self.st["erros_cc"] += 1
-                log.warning("[%s] %s", self.name, linha)
+                self._registrar(logging.WARNING, linha)
             elif RE_ALARME.search(linha):
                 with self.lock:
                     self.st["alarmes_bitrate"] += 1
-                log.warning("[%s] %s", self.name, linha)
+                self._registrar(logging.WARNING, linha)
             else:
-                log.info("[%s] %s", self.name, linha)
+                self._registrar(logging.INFO, linha)
             self._set(ultima_msg=linha[-300:])
 
     def run(self):
@@ -316,14 +408,14 @@ class Canal(threading.Thread):
         espera_max = self.sup.get("reinicio_max_s", 60)
         espera = espera_min
         while not self.parar.is_set():
-            log.info("[%s] iniciando: %s", self.name, comando_para_log(self.cmd))
+            self._registrar(logging.INFO, "iniciando: " + comando_para_log(self.cmd))
             t0 = time.time()
             try:
                 self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True, bufsize=1)
             except FileNotFoundError:
-                log.error("[%s] '%s' não encontrado. Rode: asi2srt instalar-tsduck",
-                          self.name, self.cmd[0])
+                self._registrar(logging.ERROR, f"'{self.cmd[0]}' não encontrado. "
+                                "Rode: sudo asi2srt instalar-tsduck")
                 self._set(estado="erro", ultima_msg="tsp não encontrado")
                 self.parar.wait(espera_max)
                 continue
@@ -333,102 +425,256 @@ class Canal(threading.Thread):
             rc = self.proc.wait()
             if self.parar.is_set():
                 break
-            if time.time() - t0 > 60:  # rodou estável: zera o backoff
+            if time.time() - t0 > 60:
                 espera = espera_min
             with self.lock:
                 self.st["reinicios"] += 1
             self._set(estado="reiniciando", bitrate_bps=0, inicio_execucao=None)
-            log.error("[%s] tsp saiu (código %s). Reiniciando em %ss.", self.name, rc, espera)
+            self._registrar(logging.ERROR, f"tsp saiu (código {rc}). Reiniciando em {espera}s.")
             self.parar.wait(espera)
             espera = min(espera * 2, espera_max)
-        self._set(estado="parado")
+        self._set(estado="parado", bitrate_bps=0, inicio_execucao=None)
 
     def encerrar(self):
         self.parar.set()
-        if self.proc and self.proc.poll() is None:
-            self.proc.send_signal(signal.SIGINT)
+        p = self.proc
+        if p and p.poll() is None:
+            p.send_signal(signal.SIGINT)
             try:
-                self.proc.wait(5)
+                p.wait(5)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                p.kill()
 
 
 # ======================================================================
-# Painel de status HTTP
+# Gerenciador: mantém as definições, os processos e a persistência
 # ======================================================================
-PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="3"><title>ASI → SRT</title>
-<style>body{{font-family:system-ui,sans-serif;margin:16px;background:#111;color:#eee}}
-table{{border-collapse:collapse;width:100%}}td,th{{padding:8px;border-bottom:1px solid #333;text-align:left}}
-.rodando{{color:#4ade80}}.conectando,.reiniciando,.iniciando{{color:#facc15}}
-.erro,.sem_dados,.parado{{color:#f87171}}small{{color:#999}}a{{color:#93c5fd}}
-.wrap{{overflow-x:auto}}</style></head><body><h2>Gateway ASI → SRT</h2><div class="wrap">
-<table><tr><th>Canal</th><th>Estado</th><th>Entrada</th><th>Destino SRT</th><th>Bitrate</th>
-<th>Erros CC</th><th>Alarmes</th><th>Reinícios</th><th>Uptime</th></tr>{linhas}</table></div>
-<p><small>asi2srt {versao} · atualiza a cada 3 s · <a href="/status.json">status.json</a></small></p>
-</body></html>"""
+class Gerenciador:
+    def __init__(self, cfg: dict, caminho=None):
+        self.caminho = caminho
+        self.sup = cfg.setdefault("supervisor", {}) or {}
+        self.lock = threading.RLock()
+        self.defs = collections.OrderedDict()
+        self.exec = {}
+        for c in cfg.get("canais") or []:
+            c = normalizar_canal(c)
+            self.defs[c["id"]] = c
+
+    # --- persistência ------------------------------------------------
+    def persistir(self):
+        if not self.caminho:
+            return
+        with self.lock:
+            cfg = {"canais": list(self.defs.values()), "supervisor": self.sup}
+            salvar_config(self.caminho, cfg)
+
+    def garantir_senha(self):
+        if not self.sup.get("senha_painel"):
+            self.sup["senha_painel"] = secrets.token_urlsafe(9)
+            self.persistir()
+            aviso = (f"senha do painel gerada -> usuário: {self.sup.get('usuario', 'admin')}  "
+                     f"senha: {self.sup['senha_painel']}"
+                     + (f"  (salva em {self.caminho})" if self.caminho else ""))
+            log.warning(aviso)
+
+    # --- controle ----------------------------------------------------
+    def iniciar_ativos(self):
+        for cid, c in list(self.defs.items()):
+            if c.get("ativo", True):
+                try:
+                    self.iniciar(cid, marcar=False)
+                except ValueError as e:
+                    log.error("[%s] configuração inválida: %s", c["nome"], e)
+
+    def iniciar(self, cid, marcar=True):
+        with self.lock:
+            c = self.defs[cid]
+            atual = self.exec.get(cid)
+            if atual and atual.is_alive():
+                return
+            t = Canal(c, self.sup)
+            self.exec[cid] = t
+            t.start()
+            if marcar and not c.get("ativo"):
+                c["ativo"] = True
+                self.persistir()
+
+    def parar(self, cid, marcar=True):
+        with self.lock:
+            t = self.exec.pop(cid, None)
+            if marcar and cid in self.defs and self.defs[cid].get("ativo"):
+                self.defs[cid]["ativo"] = False
+                self.persistir()
+        if t:
+            t.encerrar()
+
+    def reiniciar(self, cid):
+        self.parar(cid, marcar=False)
+        self.iniciar(cid)
+
+    def salvar_canal(self, dados: dict, cid=None) -> dict:
+        dados = dict(dados)
+        dados.pop("status", None)
+        if cid:
+            dados["id"] = cid
+        c = normalizar_canal(dados)
+        if c["entrada"].get("tipo") not in TIPOS_ENTRADA:
+            raise ValueError("tipo de entrada inválido")
+        montar_comando(c, self.sup.get("tsp", "tsp"))  # valida (levanta ValueError)
+        rodando = cid in self.exec
+        if rodando:
+            self.parar(cid, marcar=False)
+        with self.lock:
+            self.defs[c["id"]] = c
+            self.persistir()
+        if c.get("ativo", True):
+            self.iniciar(c["id"], marcar=False)
+        return c
+
+    def remover(self, cid):
+        self.parar(cid, marcar=False)
+        with self.lock:
+            self.defs.pop(cid, None)
+            self.persistir()
+
+    def encerrar_tudo(self):
+        for cid in list(self.exec):
+            self.parar(cid, marcar=False)
+
+    # --- consulta ----------------------------------------------------
+    def listar(self):
+        out = []
+        with self.lock:
+            itens = list(self.defs.items())
+        for cid, c in itens:
+            t = self.exec.get(cid)
+            st = t.status() if t else {"estado": "parado", "bitrate_bps": 0, "erros_cc": 0,
+                                       "alarmes_bitrate": 0, "reinicios": 0, "historico": []}
+            out.append({**c, "status": st})
+        return out
+
+    def log_canal(self, cid):
+        t = self.exec.get(cid)
+        return list(t.log) if t else []
 
 
-def servidor_status(canais, endereco):
+# ======================================================================
+# Servidor web: painel + API
+# ======================================================================
+def servidor_web(ger: Gerenciador, endereco: str):
     host, _, porta = endereco.rpartition(":")
+    usuario = ger.sup.get("usuario", "admin")
 
     class H(BaseHTTPRequestHandler):
+        server_version = "asi2srt/" + __version__
+
         def log_message(self, *a):
             pass
 
-        def do_GET(self):
-            dados = [c.status() for c in canais]
-            if self.path.startswith("/status.json"):
-                corpo = json.dumps(dados, ensure_ascii=False, indent=2).encode()
-                tipo = "application/json"
-            else:
-                linhas = "".join(
-                    f'<tr><td>{html.escape(d["nome"])}</td>'
-                    f'<td class="{d["estado"]}">{d["estado"]}</td>'
-                    f'<td>{html.escape(d["entrada"])}</td><td>{html.escape(d["destino"])}</td>'
-                    f'<td>{d["bitrate_bps"] / 1e6:.2f} Mb/s</td><td>{d["erros_cc"]}</td>'
-                    f'<td>{d["alarmes_bitrate"]}</td><td>{d["reinicios"]}</td>'
-                    f'<td>{d.get("uptime_s", 0)} s</td></tr>' for d in dados)
-                corpo = PAGINA.format(linhas=linhas, versao=__version__).encode()
-                tipo = "text/html; charset=utf-8"
-            self.send_response(200)
+        def _autorizado(self):
+            cab = self.headers.get("Authorization", "")
+            if cab.startswith("Basic "):
+                try:
+                    u, _, s = base64.b64decode(cab[6:]).decode().partition(":")
+                except Exception:
+                    return False
+                return hmac.compare_digest(u, usuario) and \
+                    hmac.compare_digest(s, str(ger.sup.get("senha_painel", "")))
+            return False
+
+        def _resp(self, codigo, corpo, tipo="application/json"):
+            if not isinstance(corpo, bytes):
+                corpo = json.dumps(corpo, ensure_ascii=False).encode()
+            self.send_response(codigo)
             self.send_header("Content-Type", tipo)
             self.send_header("Content-Length", str(len(corpo)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(corpo)
 
+        def _negar(self):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="asi2srt"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _corpo(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+        def _rota(self, metodo):
+            if not self._autorizado():
+                return self._negar()
+            # proteção contra CSRF: ações exigem cabeçalho próprio
+            if metodo != "GET" and self.headers.get("X-Asi2srt") != "1":
+                return self._resp(403, {"erro": "cabeçalho X-Asi2srt ausente"})
+            caminho = urlparse(self.path).path.rstrip("/") or "/"
+            partes = caminho.strip("/").split("/")
+            try:
+                if metodo == "GET" and caminho == "/":
+                    return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__).encode(),
+                                      "text/html; charset=utf-8")
+                if metodo == "GET" and caminho == "/status.json":
+                    return self._resp(200, [{"nome": c["nome"], "id": c["id"], **c["status"]}
+                                            for c in ger.listar()])
+                if metodo == "GET" and caminho == "/api/info":
+                    return self._resp(200, {"versao": __version__, "config": ger.caminho,
+                                            "persistente": bool(ger.caminho)})
+                if partes[:2] == ["api", "canais"]:
+                    if len(partes) == 2:
+                        if metodo == "GET":
+                            return self._resp(200, ger.listar())
+                        if metodo == "POST":
+                            dados = self._corpo()
+                            dados.pop("id", None)
+                            return self._resp(201, ger.salvar_canal(dados))
+                    cid = partes[2] if len(partes) > 2 else None
+                    if cid not in ger.defs:
+                        return self._resp(404, {"erro": "canal não encontrado"})
+                    if len(partes) == 3:
+                        if metodo == "PUT":
+                            return self._resp(200, ger.salvar_canal(self._corpo(), cid))
+                        if metodo == "DELETE":
+                            ger.remover(cid)
+                            return self._resp(200, {"ok": True})
+                    if len(partes) == 4:
+                        acao = partes[3]
+                        if metodo == "GET" and acao == "log":
+                            return self._resp(200, ger.log_canal(cid))
+                        if metodo == "GET" and acao == "comando":
+                            return self._resp(200, {"comando": comando_para_log(
+                                montar_comando(ger.defs[cid], ger.sup.get("tsp", "tsp")))})
+                        if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar"):
+                            getattr(ger, acao)(cid)
+                            return self._resp(200, {"ok": True})
+                return self._resp(404, {"erro": "rota não encontrada"})
+            except ValueError as e:
+                return self._resp(400, {"erro": str(e)})
+            except Exception as e:  # noqa: BLE001
+                log.exception("erro na API")
+                return self._resp(500, {"erro": str(e)})
+
+        def do_GET(self):
+            self._rota("GET")
+
+        def do_POST(self):
+            self._rota("POST")
+
+        def do_PUT(self):
+            self._rota("PUT")
+
+        def do_DELETE(self):
+            self._rota("DELETE")
+
     srv = ThreadingHTTPServer((host or "0.0.0.0", int(porta)), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("painel de status: http://%s:%s/", host or "0.0.0.0", porta)
+    log.info("painel: http://%s:%s/  (usuário: %s)", host or "0.0.0.0", porta, usuario)
     return srv
 
 
 # ======================================================================
 # Subcomandos
 # ======================================================================
-def _config_da_linha(args) -> dict:
-    """Monta a config a partir de -c ou de --entrada/--saida."""
-    if args.entrada or args.saida:
-        if not (args.entrada and args.saida):
-            raise SystemExit("use --entrada e --saida juntos (ou -c arquivo.yaml)")
-        canal = {"nome": args.nome, "entrada": entrada_de_texto(args.entrada),
-                 "saida": saida_de_url(args.saida),
-                 "processamento": {"remover_nulos": not args.manter_nulos,
-                                   "bitrate_min": args.bitrate_min,
-                                   "intervalo_relatorio_s": 5}}
-        return {"canais": [canal], "supervisor": {"status_http": args.status, "tsp": args.tsp}}
-    caminho = args.config or _achar_config()
-    if not caminho:
-        raise SystemExit("nenhuma configuração. Use -c arquivo.yaml, --entrada/--saida, "
-                         "ou gere uma com: asi2srt init")
-    cfg = carregar_config(caminho)
-    sup = cfg.setdefault("supervisor", {}) or {}
-    if args.tsp != "tsp":
-        sup["tsp"] = args.tsp
-    return cfg
-
-
 def _achar_config():
     for c in ("asi2srt.yaml", "asi2srt.yml", "asi2srt.json", "config.yaml",
               "/etc/asi2srt/config.yaml", "/etc/asi2srt/config.json"):
@@ -437,30 +683,56 @@ def _achar_config():
     return None
 
 
-def executar_gateway(cfg: dict):
-    sup = cfg.get("supervisor") or {}
+def _carregar(args):
+    """Devolve (cfg, caminho). caminho None = modo linha de comando (não persiste)."""
+    if args.entrada or args.saida:
+        if not (args.entrada and args.saida):
+            raise SystemExit("use --entrada e --saida juntos (ou -c arquivo)")
+        canal = {"nome": args.nome, "entrada": entrada_de_texto(args.entrada),
+                 "saidas": [saida_de_url(s) for s in args.saida],
+                 "processamento": {"remover_nulos": not args.manter_nulos,
+                                   "bitrate_min": args.bitrate_min,
+                                   "intervalo_relatorio_s": 5}}
+        sup = {"status_http": args.status, "tsp": args.tsp, "usuario": args.usuario,
+               "senha_painel": args.senha_painel}
+        return {"canais": [canal], "supervisor": sup}, None
+    caminho = args.config or _achar_config()
+    if not caminho:
+        caminho = "asi2srt.yaml" if yaml else "asi2srt.json"
+        salvar_config(caminho, {"canais": [], "supervisor": {
+            "reinicio_min_s": 2, "reinicio_max_s": 60, "tsp": "tsp",
+            "status_http": "0.0.0.0:8088", "usuario": "admin", "senha_painel": ""}})
+        log.info("nenhuma configuração encontrada; criada %s (adicione canais pelo painel)", caminho)
+    cfg = carregar_config(caminho)
+    sup = cfg.setdefault("supervisor", {}) or {}
+    if args.tsp != "tsp":
+        sup["tsp"] = args.tsp
+    if args.senha_painel:
+        sup["senha_painel"] = args.senha_painel
+    return cfg, caminho
+
+
+def executar_gateway(cfg: dict, caminho=None):
+    ger = Gerenciador(cfg, caminho)
+    sup = ger.sup
     if sup.get("log_arquivo"):
         logging.getLogger().addHandler(logging.FileHandler(sup["log_arquivo"]))
-    ativos = [c for c in cfg.get("canais", []) if c.get("ativo", True)]
-    if not ativos:
-        raise SystemExit("nenhum canal ativo na configuração")
-
-    canais = [Canal(c, sup) for c in ativos]
-    log.info("asi2srt %s - %d canal(is)", __version__, len(canais))
-    for c in canais:
-        c.start()
-    if sup.get("status_http"):
+    log.info("asi2srt %s - %d canal(is) configurado(s)", __version__, len(ger.defs))
+    if sup.get("status_http", "0.0.0.0:8088"):
+        ger.garantir_senha()
         try:
-            servidor_status(canais, sup["status_http"])
+            servidor_web(ger, sup.get("status_http", "0.0.0.0:8088"))
         except OSError as e:
             log.error("não foi possível abrir o painel em %s: %s", sup["status_http"], e)
+    elif not ger.defs:
+        raise SystemExit("nenhum canal e painel desativado: nada a fazer")
+    ger.iniciar_ativos()
 
     fim = threading.Event()
 
     def sair(*_):
         log.info("encerrando...")
-        for c in canais:
-            c.encerrar()
+        ger.encerrar_tudo()
         fim.set()
 
     signal.signal(signal.SIGINT, sair)
@@ -469,16 +741,17 @@ def executar_gateway(cfg: dict):
 
 
 def cmd_rodar(args):
-    executar_gateway(_config_da_linha(args))
+    cfg, caminho = _carregar(args)
+    executar_gateway(cfg, caminho)
 
 
 def cmd_comando(args):
-    cfg = _config_da_linha(args)
+    cfg, _ = _carregar(args)
     tsp = (cfg.get("supervisor") or {}).get("tsp", "tsp")
-    for c in cfg.get("canais", []):
-        if c.get("ativo", True):
-            print(f"# {c.get('nome', 'canal')}")
-            print(comando_para_log(montar_comando(c, tsp)) + "\n")
+    for c in cfg.get("canais") or []:
+        c = normalizar_canal(c)
+        print(f"# {c['nome']}{'' if c.get('ativo', True) else ' (inativo)'}")
+        print(comando_para_log(montar_comando(c, tsp)) + "\n")
 
 
 def cmd_init(args):
@@ -487,21 +760,21 @@ def cmd_init(args):
     with open(args.arquivo, "w", encoding="utf-8") as f:
         f.write(CONFIG_EXEMPLO)
     print(f"configuração criada: {args.arquivo}\n"
-          f"edite a entrada ASI e o destino SRT, depois rode: asi2srt rodar -c {args.arquivo}")
+          f"edite e rode: asi2srt rodar -c {args.arquivo}   (ou edite pelo painel web)")
 
 
 def cmd_verificar(args):
     ok = True
     tsp = shutil.which(args.tsp) or (args.tsp if os.path.exists(args.tsp) else None)
     if not tsp:
-        print("✗ TSDuck (tsp) não encontrado  ->  asi2srt instalar-tsduck")
+        print("✗ TSDuck (tsp) não encontrado  ->  sudo asi2srt instalar-tsduck")
         return 1
     ver = subprocess.run([tsp, "--version"], capture_output=True, text=True)
     print(f"✓ TSDuck: {(ver.stdout or ver.stderr).strip().splitlines()[0]}")
     plugins = subprocess.run([tsp, "--list-plugins"], capture_output=True, text=True)
     texto = plugins.stdout + plugins.stderr
-    for nome, obrig in (("srt", True), ("dektec", False), ("continuity", True),
-                        ("bitrate_monitor", True), ("filter", True)):
+    for nome, obrig in (("srt", True), ("ip", True), ("fork", True), ("continuity", True),
+                        ("bitrate_monitor", True), ("filter", True), ("dektec", False)):
         tem = re.search(rf"\b{nome}\b", texto) is not None
         print(f"{'✓' if tem else ('✗' if obrig else '·')} plugin {nome}"
               f"{'' if tem or obrig else ' (só necessário para placas DekTec)'}")
@@ -511,7 +784,7 @@ def cmd_verificar(args):
         print("\nPlacas DekTec:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma encontrada"))
     asi = sorted(f for f in os.listdir("/dev") if f.startswith("asirx")) if os.path.isdir("/dev") else []
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
-    print("PyYAML: " + ("instalado" if yaml else "ausente (use config .json ou pip install pyyaml)"))
+    print("PyYAML: " + ("instalado" if yaml else "ausente (configuração será salva em JSON)"))
     return 0 if ok else 1
 
 
@@ -553,14 +826,13 @@ def cmd_instalar_tsduck(args):
         subprocess.run(["apt-get", "update"], check=False)
         subprocess.run(["apt-get", "install", "-y", destino], check=True)
     else:
-        gerenciador = "dnf" if shutil.which("dnf") else "yum"
-        subprocess.run([gerenciador, "install", "-y", destino], check=True)
+        subprocess.run(["dnf" if shutil.which("dnf") else "yum", "install", "-y", destino], check=True)
     print("TSDuck instalado. Confira com: asi2srt verificar")
 
 
 UNIDADE_SYSTEMD = """\
 [Unit]
-Description=Gateway DVB-ASI -> SRT (asi2srt)
+Description=Gateway ASI/UDP/SRT -> SRT/UDP (asi2srt)
 After=network-online.target
 Wants=network-online.target
 
@@ -582,7 +854,6 @@ WantedBy=multi-user.target
 def cmd_instalar_servico(args):
     if os.geteuid() != 0:
         raise SystemExit("rode como root: sudo asi2srt instalar-servico")
-    # copia este programa para /usr/local/bin
     origem = sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
     destino = "/usr/local/bin/asi2srt"
     if os.path.abspath(origem) != destino:
@@ -593,15 +864,15 @@ def cmd_instalar_servico(args):
     if not os.path.exists(args.config):
         with open(args.config, "w", encoding="utf-8") as f:
             f.write(CONFIG_EXEMPLO)
-        print(f"configuração de exemplo criada em {args.config} - EDITE antes de iniciar")
+        os.chmod(args.config, 0o600)
+        print(f"configuração de exemplo criada em {args.config}")
     with open("/etc/systemd/system/asi2srt.service", "w") as f:
         f.write(UNIDADE_SYSTEMD.format(exe=exe, config=args.config))
     subprocess.run(["systemctl", "daemon-reload"], check=False)
-    print(f"serviço instalado.\n"
-          f"  1. edite {args.config}\n"
-          f"  2. sudo systemctl enable --now asi2srt\n"
-          f"  3. journalctl -u asi2srt -f\n"
-          f"  4. painel: http://<ip-do-servidor>:8088/")
+    print("serviço instalado.\n"
+          "  1. sudo systemctl enable --now asi2srt\n"
+          "  2. veja a senha do painel:  journalctl -u asi2srt | grep 'senha do painel'\n"
+          "  3. abra http://<ip-do-servidor>:8088/ e configure os canais")
 
 
 def cmd_teste(args):
@@ -616,13 +887,16 @@ def cmd_teste(args):
                     "-f", "mpegts", ts], check=True)
     senha = "asi2srt-teste"
     cfg = {"canais": [{"nome": "TESTE",
-                       "entrada": {"tipo": "arquivo", "arquivo": {"caminho": ts, "loop": True}},
+                       "entrada": {"tipo": "arquivo", "caminho": ts, "loop": True},
                        "processamento": {"bitrate_min": 0, "intervalo_relatorio_s": 2},
-                       "saida": {"modo": "listener", "endereco": str(args.porta),
-                                 "latencia_ms": 120, "senha": senha}}],
-           "supervisor": {"status_http": "127.0.0.1:8088", "tsp": args.tsp}}
+                       "saidas": [{"tipo": "srt", "modo": "listener", "endereco": str(args.porta),
+                                   "latencia_ms": 120, "senha": senha},
+                                  {"tipo": "udp", "endereco": "127.0.0.1:5000"}]}],
+           "supervisor": {"status_http": "127.0.0.1:8088", "tsp": args.tsp,
+                          "usuario": "admin", "senha_painel": "teste"}}
     url = f"srt://127.0.0.1:{args.porta}?mode=caller&passphrase={senha}&latency=120000"
-    print(f"\nreceptor:  ffplay \"{url}\"\npainel:    http://127.0.0.1:8088/\nCtrl+C para sair\n")
+    print(f"\nreceptor SRT:  ffplay \"{url}\"\nreceptor UDP:  ffplay udp://127.0.0.1:5000"
+          f"\npainel:        http://127.0.0.1:8088/  (admin / teste)\nCtrl+C para sair\n")
     if shutil.which("ffplay") and not args.sem_player:
         threading.Timer(2, lambda: subprocess.Popen(
             ["ffplay", "-loglevel", "warning", url])).start()
@@ -630,28 +904,227 @@ def cmd_teste(args):
 
 
 # ======================================================================
+# Painel web (HTML + JS embutidos)
+# ======================================================================
+PAINEL_HTML = r"""<!doctype html>
+<html lang="pt-br"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>asi2srt</title>
+<style>
+:root{--bg:#0e1116;--card:#161b22;--line:#2a313c;--txt:#e6edf3;--mut:#8b949e;--acc:#2f81f7;
+--ok:#3fb950;--warn:#d29922;--err:#f85149;--in:#0d1117}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);
+font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);
+position:sticky;top:0;background:var(--bg);z-index:5}
+header h1{font-size:17px;margin:0;font-weight:650}header .v{color:var(--mut);font-size:12px}
+header .sp{flex:1}
+.resumo{display:flex;gap:18px;color:var(--mut);font-size:13px}.resumo b{color:var(--txt)}
+main{padding:20px;max-width:1400px;margin:auto}
+.aviso{background:#3b2e00;border:1px solid #6b5300;padding:8px 12px;border-radius:8px;margin-bottom:14px;color:#f0d67a}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
+.top{display:flex;align-items:center;gap:8px}.top h2{font-size:15px;margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid currentColor;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.rodando{color:var(--ok)}.conectando,.reiniciando,.iniciando{color:var(--warn)}.erro,.sem_dados{color:var(--err)}.parado{color:var(--mut)}
+.fluxo{display:flex;flex-direction:column;gap:3px;font-size:12.5px}
+.fluxo .l{color:var(--mut);display:inline-block;width:52px}
+.tag{display:inline-block;background:var(--in);border:1px solid var(--line);border-radius:6px;padding:1px 6px;margin:1px 4px 1px 0;font-family:ui-monospace,monospace;font-size:12px}
+.met{display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:6px;align-items:end}
+.met div{display:flex;flex-direction:column}.met small{color:var(--mut);font-size:11px}
+.met b{font-size:15px;font-variant-numeric:tabular-nums}.met .big{font-size:22px}
+.spark{width:100%;height:38px;display:block}.spark polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}
+.spark .area{fill:var(--acc);opacity:.12;stroke:none}
+.msg{font-size:11.5px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:16px}
+.acoes{display:flex;gap:6px;flex-wrap:wrap}
+button{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font:inherit;font-size:13px;cursor:pointer}
+button:hover{border-color:#8b949e}button.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.ok{color:var(--ok)}button.perigo{color:var(--err)}button.mini{padding:3px 8px;font-size:12px}
+.vazio{text-align:center;color:var(--mut);padding:60px 20px;border:1px dashed var(--line);border-radius:12px}
+dialog{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:14px;padding:0;width:min(720px,96vw);max-height:92vh}
+dialog::backdrop{background:#0009}
+.dh{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}.dh h3{margin:0;flex:1;font-size:16px}
+.db{padding:16px 18px;overflow:auto;max-height:calc(92vh - 130px)}
+.df{display:flex;gap:8px;justify-content:flex-end;padding:12px 18px;border-top:1px solid var(--line)}
+fieldset{border:1px solid var(--line);border-radius:10px;margin:0 0 14px;padding:10px 12px 12px}
+legend{color:var(--mut);font-size:12px;padding:0 6px;text-transform:uppercase;letter-spacing:.05em}
+.campos{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)}
+label.chk{flex-direction:row;align-items:center;gap:6px;color:var(--txt);font-size:13px}
+input,select{background:var(--in);color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:7px 8px;font:inherit;font-size:13px;width:100%}
+input[type=checkbox]{width:auto}input:focus,select:focus{outline:2px solid var(--acc);outline-offset:-1px}
+.saida{border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px;background:#11161d}
+.saida .sh{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-weight:600;font-size:13px}.saida .sh span{flex:1}
+pre.log{background:var(--in);border:1px solid var(--line);border-radius:8px;padding:10px;font-size:12px;
+max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#3d1214;border:1px solid var(--err);
+color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
+.toast.bom{background:#0f2e17;border-color:var(--ok);color:#c9f5d1}
+@media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>asi2srt</h1><span class="v">v__VERSAO__</span><span class="sp"></span>
+<div class="resumo" id="resumo"></div><button class="pri" id="novo">+ Novo canal</button></header>
+<main><div id="avisos"></div><div class="grid" id="grid"></div></main>
+
+<dialog id="dlg"><form method="dialog" id="frm">
+<div class="dh"><h3 id="dtit">Canal</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db" id="dcorpo"></div>
+<div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar e aplicar</button></div>
+</form></dialog>
+
+<dialog id="dlglog"><div class="dh"><h3 id="ltit">Log</h3><button class="mini" data-fechar>✕</button></div>
+<div class="db"><pre class="log" id="logtxt"></pre></div></dialog>
+
+<script>
+const H={'Content-Type':'application/json','X-Asi2srt':'1'};
+const $=s=>document.querySelector(s);
+async function api(m,u,b){const r=await fetch(u,{method:m,headers:H,body:b?JSON.stringify(b):undefined});
+ const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.erro||r.statusText);return j}
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function toast(t,bom){const d=document.createElement('div');d.className='toast'+(bom?' bom':'');d.textContent=t;
+ document.body.appendChild(d);setTimeout(()=>d.remove(),bom?2500:6000)}
+const mb=b=>(b/1e6).toFixed(2);
+function dur(s){if(!s)return'—';const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h${String(m).padStart(2,'0')}`:m?`${m}m${s%60}s`:`${s}s`}
+
+const CE={
+ dektec:[['dispositivo','Placa','number',0],['canal','Porta','number',0],['timeout_ms','Timeout sem sinal (ms)','number',5000]],
+ linuxasi:[['dispositivo','Dispositivo','text','/dev/asirx0']],
+ udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface_local','IP da interface (multicast)','text','']],
+ srt:[['modo','Modo','sel:listener,caller','listener'],['endereco','Endereço (porta ou host:porta)','text','9000'],
+      ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text','']],
+ arquivo:[['caminho','Arquivo .ts','text',''],['loop','Repetir em loop','chk',true]]};
+const CS={
+ srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
+      ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
+      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25]],
+ udp:[['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']]};
+const NOMES_E={dektec:'DekTec ASI',linuxasi:'Linux ASI (DVEO)',udp:'UDP / Multicast',srt:'SRT',arquivo:'Arquivo .ts'};
+
+function resE(e){switch(e.tipo){case'dektec':return`DekTec ${e.dispositivo??0}:${e.canal??0}`;case'linuxasi':return`ASI ${e.dispositivo}`;
+ case'udp':return`UDP ${e.endereco}`;case'srt':return`SRT ${e.modo} ${e.endereco}${e.senha?' 🔒':''}`;case'arquivo':return`Arquivo ${(e.caminho||'').split('/').pop()}`}return e.tipo}
+const resS=s=>s.tipo==='udp'?`UDP ${s.endereco}`:`SRT ${s.modo} ${s.endereco}${s.senha?' 🔒':''}`;
+
+function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=Math.max(...h)*1.15||1,w=100,hh=38;
+ const p=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(2)},${(hh-v/mx*hh).toFixed(2)}`).join(' ');
+ return`<svg class="spark" viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none"><polygon class="area" points="0,${hh} ${p} ${w},${hh}"/><polyline points="${p}"/></svg>`}
+
+let dados=[],editando=null,logId=null;
+function card(c){const s=c.status||{},ativo=s.estado!=='parado';
+ return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
+ <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
+ <div><span class="l">Saídas</span>${c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join('')}</div></div>
+ ${spark(s.historico)}
+ <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
+ <div><small>Erros CC</small><b style="color:${s.erros_cc?'var(--err)':''}">${s.erros_cc||0}</b></div>
+ <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>
+ <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
+ <div class="acoes">${ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻ Reiniciar</button>`
+  :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>`}
+ <button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
+ <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
+
+function render(){$('#grid').innerHTML=dados.length?dados.map(card).join(''):
+ '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
+ const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.bitrate_bps||0),0);
+ $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
+
+async function atualizar(){try{dados=await api('GET','/api/canais');render()}catch(e){}}
+
+// ---------- formulário ----------
+function campo(pref,[k,rot,t,pad],obj){const v=obj[k]??pad,n=`${pref}${k}`;
+ if(t==='chk')return`<label class="chk"><input type="checkbox" name="${n}" ${v?'checked':''}> ${rot}</label>`;
+ if(t.startsWith('sel:'))return`<label>${rot}<select name="${n}">${t.slice(4).split(',').map(o=>`<option ${String(v)===o?'selected':''}>${o}</option>`).join('')}</select></label>`;
+ return`<label>${rot}<input type="${t}" name="${n}" value="${esc(v)}" ${t==='password'?'autocomplete="new-password"':''}></label>`}
+
+function desenhar(){const c=editando,e=c.entrada,p=c.processamento||{};
+ $('#dcorpo').innerHTML=`
+ <fieldset><legend>Canal</legend><div class="campos"><label style="grid-column:span 2">Nome<input name="nome" value="${esc(c.nome)}" required></label>
+ <label class="chk"><input type="checkbox" name="ativo" ${c.ativo!==false?'checked':''}> Ativo (inicia automaticamente)</label></div></fieldset>
+ <fieldset><legend>Entrada</legend><div class="campos"><label>Tipo<select name="e_tipo" id="etipo">
+ ${Object.entries(NOMES_E).map(([k,n])=>`<option value="${k}" ${e.tipo===k?'selected':''}>${n}</option>`).join('')}</select></label>
+ ${CE[e.tipo].map(f=>campo('e.',f,e)).join('')}</div></fieldset>
+ <fieldset><legend>Processamento</legend><div class="campos">
+ <label class="chk"><input type="checkbox" name="p.remover_nulos" ${p.remover_nulos!==false?'checked':''}> Remover pacotes nulos</label>
+ <label>PIDs a remover (ex.: 0x12, 0x14)<input name="p.remover_pids" value="${esc((p.remover_pids||[]).join(', '))}"></label>
+ <label>Alarme bitrate mín. (Mb/s)<input type="number" step="0.1" name="p.bitrate_min" value="${(p.bitrate_min||0)/1e6}"></label>
+ <label>Alarme bitrate máx. (Mb/s)<input type="number" step="0.1" name="p.bitrate_max" value="${(p.bitrate_max||0)/1e6}"></label></div></fieldset>
+ <fieldset><legend>Saídas</legend>
+ ${c.saidas.map((s,i)=>`<div class="saida"><div class="sh"><span>${i===0?'Principal':'Cópia '+i} — ${s.tipo.toUpperCase()}</span>
+  <button type="button" class="mini perigo" data-rm="${i}">Remover</button></div>
+  <input type="hidden" name="s.${i}.tipo" value="${s.tipo}"><div class="campos">${CS[s.tipo].map(f=>campo(`s.${i}.`,f,s)).join('')}</div></div>`).join('')}
+ <button type="button" data-add="srt">+ Saída SRT</button> <button type="button" data-add="udp">+ Saída UDP</button></fieldset>`;
+ $('#etipo').onchange=()=>{coletar();editando.entrada.tipo=$('#etipo').value;desenhar()};
+ $('#dcorpo').querySelectorAll('[data-rm]').forEach(b=>b.onclick=()=>{coletar();editando.saidas.splice(+b.dataset.rm,1);desenhar()});
+ $('#dcorpo').querySelectorAll('[data-add]').forEach(b=>b.onclick=()=>{coletar();editando.saidas.push({tipo:b.dataset.add});desenhar()})}
+
+function val(el,t){if(!el)return undefined;if(el.type==='checkbox')return el.checked;if(el.type==='number'||t==='number')return el.value===''?0:Number(el.value);return el.value.trim()}
+function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
+ c.nome=g('nome').value.trim();c.ativo=g('ativo').checked;
+ const tipo=g('e_tipo').value,ent={...c.entrada,tipo};
+ CE[tipo].forEach(([k,,t])=>{const v=val(g('e.'+k),t);if(v!==undefined)ent[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});c.entrada=ent;
+ c.processamento={...(c.processamento||{}),remover_nulos:g('p.remover_nulos').checked,
+  remover_pids:g('p.remover_pids').value.split(/[,\s]+/).filter(Boolean),
+  bitrate_min:Math.round(Number(g('p.bitrate_min').value||0)*1e6),bitrate_max:Math.round(Number(g('p.bitrate_max').value||0)*1e6)};
+ c.saidas=c.saidas.map((s,i)=>{const o={tipo:s.tipo};CS[s.tipo].forEach(([k,,t])=>{const v=val(g(`s.${i}.${k}`),t);
+  if(v!==undefined)o[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});return o})}
+
+function abrir(id){const c=id?dados.find(x=>x.id===id):null;
+ editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'dektec'},
+  processamento:{remover_nulos:true,intervalo_relatorio_s:5},saidas:[{tipo:'srt'}]};
+ delete editando.status;$('#dtit').textContent=c?'Editar canal':'Novo canal';desenhar();$('#dlg').showModal()}
+
+$('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();
+ try{if(editando.id)await api('PUT','/api/canais/'+editando.id,editando);else await api('POST','/api/canais',editando);
+  $('#dlg').close();toast('Canal salvo e aplicado',1);atualizar()}catch(e){toast(e.message)}};
+
+// ---------- log ----------
+async function carregarLog(){if(!logId)return;try{const l=await api('GET',`/api/canais/${logId}/log`),p=$('#logtxt'),
+ fim=p.scrollTop+p.clientHeight>=p.scrollHeight-20;p.textContent=l.join('\n')||'(sem mensagens — canal parado ou recém-iniciado)';if(fim)p.scrollTop=p.scrollHeight}catch(e){}}
+
+document.addEventListener('click',async ev=>{const b=ev.target.closest('button');if(!b)return;
+ if(b.hasAttribute('data-fechar')){b.closest('dialog').close();return}
+ const a=b.dataset.a,id=b.dataset.id;if(!a)return;const c=dados.find(x=>x.id===id);
+ try{if(a==='editar')return abrir(id);
+  if(a==='log'){logId=id;$('#ltit').textContent='Log — '+c.nome;$('#logtxt').textContent='';$('#dlglog').showModal();return carregarLog()}
+  if(a==='excluir'){if(!confirm(`Excluir o canal "${c.nome}"?`))return;await api('DELETE','/api/canais/'+id)}
+  else{b.disabled=true;await api('POST',`/api/canais/${id}/${a}`)}
+  atualizar()}catch(e){toast(e.message);b.disabled=false}});
+$('#dlglog').addEventListener('close',()=>logId=null);
+$('#novo').onclick=()=>abrir();
+
+api('GET','/api/info').then(i=>{if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
+atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);
+</script></body></html>
+"""
+
+
+# ======================================================================
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="asi2srt",
-        description="Gateway DVB-ASI -> SRT (motor TSDuck).",
+        description="Gateway ASI/UDP/SRT -> SRT/UDP com painel web (motor TSDuck).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Entradas: dektec:PLACA:CANAL | linuxasi:/dev/asirxN | udp:IP:PORTA[@IP_LOCAL] | arquivo:X.ts\n"
-               "Saída:    srt://HOST:PORTA?mode=caller|listener&latency=MS&passphrase=SENHA&streamid=ID")
+        epilog="Entradas: dektec:PLACA:CANAL | linuxasi:/dev/asirxN | udp://IP:PORTA[?local=IP]\n"
+               "          srt://:PORTA?mode=listener | srt://HOST:PORTA | arquivo:X.ts\n"
+               "Saídas:   srt://HOST:PORTA?mode=caller|listener&latency=MS&passphrase=SENHA&streamid=ID\n"
+               "          udp://IP:PORTA?ttl=N&local=IP    (repita -s para várias saídas)")
     ap.add_argument("--versao", action="version", version=f"asi2srt {__version__}")
     ap.add_argument("-v", "--verbose", action="store_true", help="log detalhado")
     sub = ap.add_subparsers(dest="cmd", metavar="subcomando")
 
     def opcoes_canal(p):
-        p.add_argument("-c", "--config", help="arquivo YAML/JSON (padrão: procura asi2srt.yaml, /etc/asi2srt/config.yaml)")
+        p.add_argument("-c", "--config", help="arquivo YAML/JSON (padrão: asi2srt.yaml ou /etc/asi2srt/config.yaml)")
         p.add_argument("-e", "--entrada", help="atalho sem config, ex.: dektec:0:0")
-        p.add_argument("-s", "--saida", help='atalho sem config, ex.: "srt://host:9000?latency=200"')
+        p.add_argument("-s", "--saida", action="append", help='atalho sem config (repetível), ex.: "srt://host:9000"')
         p.add_argument("--nome", default="ASI-1")
         p.add_argument("--manter-nulos", action="store_true", help="não remover pacotes nulos")
         p.add_argument("--bitrate-min", type=int, default=0, help="alarme de bitrate mínimo (bit/s)")
         p.add_argument("--status", default="0.0.0.0:8088", help="endereço do painel ('' desativa)")
+        p.add_argument("--usuario", default="admin", help="usuário do painel")
+        p.add_argument("--senha-painel", default="", help="senha do painel (padrão: gerada)")
         p.add_argument("--tsp", default="tsp", help="caminho do tsp")
 
-    p = sub.add_parser("rodar", help="executa o gateway")
+    p = sub.add_parser("rodar", help="executa o gateway e o painel web")
     opcoes_canal(p)
     p.set_defaults(func=cmd_rodar)
 
@@ -676,7 +1149,7 @@ def main(argv=None):
     p.add_argument("-c", "--config", default="/etc/asi2srt/config.yaml")
     p.set_defaults(func=cmd_instalar_servico)
 
-    p = sub.add_parser("teste", help="teste sem hardware (ffmpeg -> SRT local)")
+    p = sub.add_parser("teste", help="teste sem hardware (ffmpeg -> SRT + UDP local)")
     p.add_argument("--porta", type=int, default=9000)
     p.add_argument("--sem-player", action="store_true", help="não abrir o ffplay")
     p.add_argument("--tsp", default="tsp")
