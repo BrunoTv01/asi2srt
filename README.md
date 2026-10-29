@@ -131,6 +131,21 @@ Pelo painel você:
 
 Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive a reinícios.
 
+## Rotas e saúde do SRT
+
+A tela principal mostra cada canal como uma **rota** — origem → destinos — com o estado de cada
+conexão SRT atualizado a cada segundo (dá para alternar para a visão em **Cards** no topo):
+
+![Rotas](docs/rotas.png)
+
+Para cada conexão SRT (entrada e saídas): estado (conectado / aguardando / conectando), endereço do
+outro lado, tempo conectado, **RTT**, **perda** de pacotes, **retransmissões**, taxa, **banda estimada do
+link**, **buffer** e latência negociada. Na tela de análise, o painel **Conexões SRT** traz também os
+totais da sessão (pacotes, perdidos, retransmitidos, descartados, RTT médio/máximo) e o gráfico de
+taxa, RTT e perda. Esses dados entram no relatório salvo ao parar o canal.
+
+As estatísticas vêm do próprio TSDuck (`--statistics-interval 1000 --json-line`), sem custo extra.
+
 ## Análise do TS (estilo analisador profissional)
 
 Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro. No card aparecem as
@@ -274,7 +289,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.6.0 && git push origin v2.6.0
+git tag v2.7.0 && git push origin v2.7.0
 ```
 
 ## Licença

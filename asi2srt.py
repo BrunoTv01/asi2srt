@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -252,7 +252,7 @@ def _pid(valor):
     return valor if isinstance(valor, int) else int(str(valor).strip(), 0)
 
 
-def _args_srt(s: dict, entrada: bool) -> list:
+def _args_srt(s: dict, entrada: bool, prefixo=None) -> list:
     modo = s.get("modo", "listener" if entrada else "caller")
     if modo not in ("caller", "listener"):
         raise ValueError(f"modo SRT inválido: {modo}")
@@ -273,13 +273,15 @@ def _args_srt(s: dict, entrada: bool) -> list:
         a += ["--passphrase", s["senha"], "--pbkeylen", str(int(s.get("tamanho_chave") or 16))]
     if s.get("stream_id"):
         a += ["--streamid", s["stream_id"]]
+    if prefixo:  # estatísticas do link SRT a cada 1 s, em JSON, identificadas pelo prefixo
+        a += ["--statistics-interval", "1000", f"--json-line={prefixo}:"]
     return a
 
 
-def _args_saida(s: dict) -> list:
+def _args_saida(s: dict, prefixo=None) -> list:
     tipo = s.get("tipo", "srt")
     if tipo == "srt":
-        return ["srt"] + _args_srt(s, entrada=False)
+        return ["srt"] + _args_srt(s, entrada=False, prefixo=prefixo)
     if tipo == "udp":
         if not re.match(r"^[\w.\-]*:\d+$|^\d+$", str(s.get("endereco", "")).strip()):
             raise ValueError("saída UDP precisa de ip:porta")
@@ -318,7 +320,8 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
             cmd += ["--local-address", ent["interface_local"]]
         cmd += ["--receive-timeout", "5000"]
     elif tipo == "srt":
-        cmd += ["-I", "srt"] + _args_srt(ent, entrada=True)
+        cmd[1:1] = ["--verbose"]  # mostra o endereço do outro lado ("connected from ...")
+        cmd += ["-I", "srt"] + _args_srt(ent, entrada=True, prefixo="SRTIN")
     elif tipo == "arquivo":
         if not ent.get("caminho"):
             raise ValueError("entrada de arquivo precisa do caminho")
@@ -350,11 +353,11 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None) -> lis
         cmd += ["--max", str(int(proc["bitrate_max"]))]
 
     # saídas extras: cada uma recebe uma cópia do TS por um tsp filho (plugin fork)
-    for s in saidas[1:]:
-        filho = [tsp_bin, "--realtime", "-O"] + _args_saida(s)
+    for i, s in enumerate(saidas[1:], start=1):
+        filho = [tsp_bin, "--realtime", "-O"] + _args_saida(s, prefixo=f"SRTOUT{i}")
         cmd += ["-P", "fork", "--nowait", " ".join(shlex.quote(a) for a in filho)]
 
-    cmd += ["-O", "drop"] if so_analise else ["-O"] + _args_saida(saidas[0])
+    cmd += ["-O", "drop"] if so_analise else ["-O"] + _args_saida(saidas[0], prefixo="SRTOUT0")
     return cmd
 
 
@@ -1054,6 +1057,74 @@ class AnalisadorTS:
 
 
 # ======================================================================
+# Estatísticas de conexões SRT (lidas do JSON que o TSDuck imprime a cada 1 s)
+# ======================================================================
+RE_SRT_ESTAT = re.compile(r"(SRTIN|SRTOUT\d+):(\{.*\})\s*$")
+RE_SRT_PEER = re.compile(r"srt: connected from (\S+)")
+
+
+class EstatSRT:
+    TIMEOUT = 3.0   # sem estatística por mais que isso = desconectado
+
+    def __init__(self, papel, cfg, rotulo):
+        self.papel = papel                 # "entrada" ou "saida"
+        self.rotulo = rotulo
+        self.modo = cfg.get("modo", "listener" if papel == "entrada" else "caller")
+        self.endereco = str(cfg.get("endereco", ""))
+        self.peer = None
+        self.ultimo = None
+        self.atual = {}
+        self.hist = collections.deque(maxlen=120)   # [taxa Mb/s, perda %, RTT ms]
+        self.tot = {"pacotes": 0, "perdidos": 0, "retransmitidos": 0, "descartados": 0}
+        self.conexoes = 0
+        self.conectado_desde = None
+        self.rtt = [0.0, 0, 0.0]                    # soma, n, máx
+
+    def atualizar(self, j, agora):
+        rx = self.papel == "entrada"
+        bloco = j.get("receive" if rx else "send", {})
+        iv, ins = bloco.get("interval", {}), bloco.get("instant", {})
+        n = lambda d, k: float(d.get(k) or 0)  # noqa: E731
+        taxa = n(iv, "rate-mbps" if rx else "send-rate-mbps")
+        pac, perd = n(iv, "packets"), n(iv, "lost-packets")
+        retr = n(iv, "retransmitted-packets" if rx else "retransmit-packets")
+        desc = n(iv, "dropped-packets")
+        rtt = n(j.get("global", {}).get("instant", {}), "rtt-ms")
+        if self.ultimo is None or agora - self.ultimo > self.TIMEOUT:
+            self.conexoes += 1
+            self.conectado_desde = agora
+        self.ultimo = agora
+        perda_pct = 100.0 * perd / (pac + perd) if pac + perd else 0.0
+        for k, v in (("pacotes", pac), ("perdidos", perd), ("retransmitidos", retr), ("descartados", desc)):
+            self.tot[k] += int(v)
+        if rtt > 0:
+            self.rtt[0] += rtt
+            self.rtt[1] += 1
+            self.rtt[2] = max(self.rtt[2], rtt)
+        self.atual = {
+            "taxa_mbps": round(taxa, 3), "perda_pct": round(perda_pct, 3), "perdidos": int(perd),
+            "retransmitidos": int(retr), "descartados": int(desc), "rtt_ms": round(rtt, 2),
+            "buffer_ms": int(n(ins, "buffer-ack-ms" if rx else "snd-buffer-ms")),
+            "latencia_ms": int(n(ins, "delivery-delay-ms")),
+            "banda_mbps": round(n(j.get("send", {}).get("instant", {}), "estimated-link-bandwidth-mbps"), 1),
+        }
+        self.hist.append([round(taxa, 3), round(perda_pct, 3), round(rtt, 1)])
+
+    def status(self, agora=None, rodando=True):
+        agora = time.monotonic() if agora is None else agora
+        conectado = self.ultimo is not None and agora - self.ultimo <= self.TIMEOUT
+        estado = "conectado" if conectado else ("aguardando" if rodando else "parado")
+        return {
+            "rotulo": self.rotulo, "papel": self.papel, "modo": self.modo, "endereco": self.endereco,
+            "peer": self.peer if conectado else None, "estado": estado,
+            "conectado_s": int(agora - self.conectado_desde) if conectado and self.conectado_desde else 0,
+            "conexoes": self.conexoes, **(self.atual if conectado else {}), "totais": dict(self.tot),
+            "rtt_medio_ms": round(self.rtt[0] / self.rtt[1], 2) if self.rtt[1] else 0,
+            "rtt_max_ms": round(self.rtt[2], 2), "hist": list(self.hist),
+        }
+
+
+# ======================================================================
 # Supervisor de um canal
 # ======================================================================
 RE_BITRATE = re.compile(r"bitrate_monitor:.*?([\d,.]+)\s*b(?:its)?/s", re.I)
@@ -1078,6 +1149,18 @@ class Canal(threading.Thread):
         self.st = {"estado": "iniciando", "bitrate_bps": 0,
                    "alarmes_bitrate": 0, "reinicios": 0, "inicio_execucao": None,
                    "ultimo_bitrate_em": None, "ultima_msg": ""}
+        c = normalizar_canal(cfg)
+        self.srt = {}
+        if c["entrada"].get("tipo") == "srt":
+            self.srt["SRTIN"] = EstatSRT("entrada", c["entrada"], "Entrada")
+        for i, s in enumerate(c["saidas"]):
+            if s.get("tipo") == "srt":
+                self.srt[f"SRTOUT{i}"] = EstatSRT("saida", s, f"Saída {i + 1}")
+
+    def srt_status(self):
+        rodando = not self.parar.is_set()
+        with self.lock:
+            return {k: v.status(rodando=rodando) for k, v in self.srt.items()}
 
     def _set(self, **kw):
         with self.lock:
@@ -1099,6 +1182,7 @@ class Canal(threading.Thread):
             s["estado"] = "sem_dados"
         s["tr101290"] = self.analisador.status()
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
+        s["srt"] = self.srt_status()
         return s
 
     def relatorio(self, motivo):
@@ -1109,7 +1193,7 @@ class Canal(threading.Thread):
         totais = {f"p{p}": sum(v for k, v in cont.items() if prio[k] == p) for p in (1, 2, 3)}
         return {"inicio": self.inicio_sessao, "fim": agora_w, "duracao_s": int(agora_w - self.inicio_sessao),
                 "motivo": motivo, "reinicios": self.st.get("reinicios", 0),
-                "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a}
+                "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a, "srt": self.srt_status()}
 
     def zerar_contadores(self):
         with self.analisador.lock:
@@ -1123,6 +1207,20 @@ class Canal(threading.Thread):
             linha = linha.rstrip()
             if not linha:
                 continue
+            ms = RE_SRT_ESTAT.search(linha)
+            if ms:
+                est = self.srt.get(ms.group(1))
+                if est:
+                    try:
+                        dados = json.loads(ms.group(2))
+                        with self.lock:
+                            est.atualizar(dados, time.monotonic())
+                    except ValueError:
+                        pass
+                continue
+            mp = RE_SRT_PEER.search(linha)
+            if mp and "SRTIN" in self.srt:
+                self.srt["SRTIN"].peer = mp.group(1)
             m = None if RE_ALARME.search(linha) else RE_BITRATE.search(linha)
             if m:
                 bps = int(float(m.group(1).replace(",", "")))
@@ -1260,7 +1358,7 @@ class Gerenciador:
         rel = lista[idx]
         return {**rel["analise"], "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
-                "taxa_sessao": rel["taxa"], "totais": rel["totais"]}
+                "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {}}
 
     # --- persistência ------------------------------------------------
     def persistir(self):
@@ -1476,7 +1574,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                     return self._resp(409, {"erro": "canal parado e sem análise salva"})
                             else:
                                 agora_w = time.time()
-                                dados = {**t.analisador.analise(), "estado": t.status()["estado"],
+                                dados = {**t.analisador.analise(), "estado": t.status()["estado"], "srt": t.srt_status(),
                                          "salvo": False, "periodo": {"inicio": t.inicio_sessao,
                                                                      "duracao_s": int(agora_w - t.inicio_sessao)}}
                             if q.get("baixar"):
@@ -2078,10 +2176,47 @@ max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0
 color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .toast.bom{background:#0f2e17;border-color:var(--ok);color:#c9f5d1}
 @media(max-width:420px){.lamps{grid-template-columns:repeat(2,1fr)}}
+.vis{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}.vis button{border:0;border-radius:0;padding:6px 10px}
+.vis button.on{background:#30363d;color:#fff}
+.rotas{display:flex;flex-direction:column;gap:10px}
+.rota{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.rota.e-rodando{border-left:3px solid var(--ok)}.rota.e-reiniciando,.rota.e-conectando,.rota.e-iniciando{border-left:3px solid var(--warn)}
+.rota.e-erro,.rota.e-sem_dados{border-left:3px solid var(--err)}.rota.e-parado{border-left:3px solid #484f58}
+.rh{display:flex;align-items:center;gap:10px;padding:10px 14px;flex-wrap:wrap;border-bottom:1px solid #20262f}
+.rh .rn{font-size:15px;font-weight:650;cursor:pointer}.rh .rn:hover{color:var(--acc)}
+.rh .rb{font-variant-numeric:tabular-nums;font-weight:600;font-size:15px;min-width:92px;text-align:right}
+.rh .rb small{color:var(--mut);font-weight:400;font-size:11px}
+.dots{display:flex;gap:4px;align-items:center}.dots i{width:9px;height:9px;border-radius:50%;background:var(--ok)}
+.dots i.w{background:var(--warn)}.dots i.e{background:var(--err);box-shadow:0 0 6px var(--err)}.dots i.x{background:#484f58}
+.dots small{color:var(--mut);font-size:11px;margin-left:4px}
+.rh .acs{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}.rh .acs button{padding:4px 9px;font-size:12.5px}
+.rl{padding:6px 14px 10px}
+.no{display:grid;grid-template-columns:86px minmax(170px,280px) 1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #20262f;font-size:13px}
+.no:last-child{border-bottom:0}.no .pp{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
+.no .ed{display:flex;align-items:center;gap:7px;min-width:0}.no .ed code{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.no .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
+.no .tp.udp{background:#22301f;color:#a6e3a1}.no .tp.asi{background:#3a2a1f;color:#f5c48a}
+.st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}.st i{width:8px;height:8px;border-radius:50%;background:#484f58}
+.st.conectado i,.st.ativo i{background:var(--ok);box-shadow:0 0 5px var(--ok)}.st.aguardando i{background:var(--warn)}
+.st.conectado{color:#a6e3a1}.st.aguardando{color:#f2cc60}.st.parado{color:var(--mut)}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chip{font-size:11.5px;background:var(--in);border:1px solid var(--line);border-radius:6px;padding:2px 7px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.chip small{color:var(--mut);margin-right:4px}.chip.w{border-color:#5c4a12;color:#f2cc60}.chip.e{border-color:#5c1f22;color:#ff8f8a}
+.mspark{width:90px;height:22px;display:block}.mspark polyline{fill:none;stroke:var(--acc);stroke-width:1.4;vector-effect:non-scaling-stroke}
+.mspark .lp{stroke:var(--err)}
+.rrel{font-size:12px;color:var(--mut);padding:2px 0 4px}.rrel b{color:var(--txt);font-weight:500}
+@media(max-width:760px){.no{grid-template-columns:1fr;gap:4px}.rh .acs{margin-left:0;width:100%}}
+.srtl{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
+.srtl .sh{display:flex;gap:8px;align-items:center;padding:8px 11px;background:#11161d;flex-wrap:wrap;font-size:13px}
+.srtl .sh code{font-family:ui-monospace,monospace}.srtl .sk{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:6px;padding:9px 11px}
+.srtl .sk div{background:var(--in);border-radius:7px;padding:6px 8px}.srtl .sk small{display:block;color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.04em}
+.srtl .sk b{font-variant-numeric:tabular-nums;font-size:14px}.srtl .sk b.w{color:var(--warn)}.srtl .sk b.e{color:var(--err)}
+.srtl .g{padding:0 11px 10px}.srtl .g svg{width:100%;height:90px;display:block}.srtl .g .leg{font-size:11px;color:var(--mut);display:flex;gap:12px;margin-bottom:3px}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>asi2srt</h1><span class="v">v__VERSAO__</span><span class="sp"></span>
-<div class="resumo" id="resumo"></div><button class="pri" id="novo">+ Novo canal</button></header>
+<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
+<button class="pri" id="novo">+ Novo canal</button></header>
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
@@ -2090,7 +2225,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
  <div class="aban" id="aban" hidden></div>
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
-  <div class="acol"><div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
+  <div class="acol"><div class="painel" id="psrt" hidden><h3>Conexões SRT<span id="asrtn"></span></h3><div id="asrt"></div></div>
+  <div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
   <div class="painel"><h3>Serviços<span id="anserv"></span></h3><div id="aserv"></div></div></div></div>
  <div class="painel"><h3>PIDs<span id="anpid"></span></h3><div class="tabw"><table class="t" id="apids"></table></div></div>
 </section>
@@ -2179,7 +2315,41 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  ${ativo?`<button data-a="analise" data-id="${c.id}">Análise</button>`:c.ultimo_relatorio?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
 
-function render(){if(anaId)return;$('#grid').innerHTML=dados.length?dados.map(card).join(''):
+let VIS='rotas';try{VIS=localStorage.getItem('asi2srt.vis')||'rotas'}catch(e){}
+const TIPO_TXT={srt:'SRT',udp:'UDP',dektec:'ASI',linuxasi:'ASI',arquivo:'ARQ'};
+function endTxt(x){return x.tipo==='srt'?`${x.modo==='listener'?'listener :':'caller → '}${x.endereco}`:x.tipo==='udp'?x.endereco:x.tipo==='dektec'?`placa ${x.dispositivo??0} · porta ${x.canal??0}`:x.tipo==='linuxasi'?x.dispositivo:(x.caminho||'').split('/').pop()}
+function mspark(h){if(!h||h.length<2)return'<svg class="mspark"></svg>';const v=h.map(x=>x[0]),mx=Math.max(...v)*1.2||1,mxp=Math.max(...h.map(x=>x[1]),1),W=90,H=22;
+ const p=v.map((y,i)=>`${(i/(v.length-1)*W).toFixed(1)},${(H-y/mx*H).toFixed(1)}`).join(' ');
+ const lp=h.some(x=>x[1]>0)?`<polyline class="lp" points="${h.map((x,i)=>`${(i/(h.length-1)*W).toFixed(1)},${(H-x[1]/mxp*H*.9).toFixed(1)}`).join(' ')}"/>`:'';
+ return`<svg class="mspark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline points="${p}"/>${lp}</svg>`}
+function chipsSRT(e){if(e.estado!=='conectado')return'';const lat=e.latencia_ms||0;
+ const cp=e.perda_pct>1?'e':e.perda_pct>0?'w':'',cr=lat&&e.rtt_ms>lat/4?'w':'';
+ return`<span class="chip ${cr}"><small>RTT</small>${e.rtt_ms} ms</span><span class="chip ${cp}"><small>Perda</small>${(e.perda_pct||0).toFixed(2)}%</span>
+ <span class="chip ${e.retransmitidos?'w':''}"><small>Retrans</small>${e.retransmitidos}/s</span><span class="chip"><small>Taxa</small>${(e.taxa_mbps||0).toFixed(2)} Mb/s</span>
+ ${e.banda_mbps?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
+function no(rot,x,e,ativo){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+ let st;if(e){const tx={conectado:'conectado',aguardando:x.modo==='listener'?'aguardando conexão':'conectando…',parado:'parado'}[e.estado];
+  st=`<span class="st ${e.estado}"><i></i>${tx}${e.peer?` · <code>${esc(e.peer)}</code>`:''}${e.estado==='conectado'&&e.conectado_s?` · ${dur(e.conectado_s)}`:''}</span>`}
+ else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
+ return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
+ <span class="chips">${st}${e?chipsSRT(e):''}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
+function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
+ const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
+  <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
+  :r?`<span class="dots">${TR.map(([k,n])=>`<i class="${(r.contadores[k]||0)?'w':''}" title="${esc(n)}: ${r.contadores[k]||0}"></i>`).join('')}<small>última sessão</small></span>`:'';
+ const acs=(ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻</button><button data-a="analise" data-id="${c.id}">Análise</button>`
+  :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
+  +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
+ const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
+ return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
+ ${dots}<span class="rb">${ativo?`${mb(s.bitrate_bps||0)} <small>Mb/s</small>`:r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
+ <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}${destinos}
+ ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
+ ${ativo&&s.estado!=='rodando'&&s.ultima_msg?`<div class="rrel" style="color:var(--warn)">${esc(s.ultima_msg)}</div>`:''}</div></div>`}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-vis]');if(!b)return;VIS=b.dataset.vis;try{localStorage.setItem('asi2srt.vis',VIS)}catch(x){}render()});
+function render(){if(anaId)return;document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
+ $('#grid').className=VIS==='rotas'?'rotas':'grid';
+ $('#grid').innerHTML=dados.length?dados.map(VIS==='rotas'?linha:card).join(''):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.bitrate_bps||0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
@@ -2275,6 +2445,23 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   const rot=fs.map(f=>`<span style="top:${((1-f*(H-14)/H)*100).toFixed(1)}%">${(mx*f/1e6).toFixed(1)} Mb/s</span>`).join('');
   $('#agraf').innerHTML=`<div class="gw"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}<polygon points="0,${H} ${pts} ${W},${H}"/><polyline points="${pts}"/></svg>${rot}</div>`}
  else $('#agraf').innerHTML='<div class="msg">aguardando dados…</div>';
+ // conexões SRT
+ const ls=Object.values(a.srt||{});$('#psrt').hidden=!ls.length;$('#asrtn').textContent=ls.length?ls.length+' conexão(ões)':'';
+ $('#asrt').innerHTML=ls.map(e=>{const c=e.estado==='conectado',tt=e.totais||{},W=600,H=90,h=e.hist||[];
+  let g='';if(h.length>1){const mx=Math.max(...h.map(x=>x[0]))*1.2||1,mr=Math.max(...h.map(x=>x[2]))*1.2||1,X=i=>(i/(h.length-1)*W).toFixed(1);
+   g=`<div class="leg"><span style="color:var(--acc)">— taxa (máx ${(mx/1.2).toFixed(2)} Mb/s)</span><span style="color:#d2a8ff">— RTT (máx ${(mr/1.2).toFixed(0)} ms)</span><span style="color:var(--err)">▮ perda</span></div>
+   <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${h.map((x,i)=>x[1]>0?`<rect x="${X(i)}" y="${H-Math.min(H,x[1]*20+4)}" width="3" height="${Math.min(H,x[1]*20+4)}" fill="var(--err)"/>`:'').join('')}
+   <polyline points="${h.map((x,i)=>`${X(i)},${(H-x[0]/mx*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke"/>
+   <polyline points="${h.map((x,i)=>`${X(i)},${(H-x[2]/mr*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:#d2a8ff;stroke-width:1.2;vector-effect:non-scaling-stroke;opacity:.8"/></svg>`}
+  const K=(r,v,cl)=>`<div><small>${r}</small><b class="${cl||''}">${v}</b></div>`;
+  return`<div class="srtl"><div class="sh"><b>${esc(e.rotulo)}</b><span class="tp">SRT ${esc(e.modo)}</span><code>${esc(e.endereco)}</code>
+  <span class="st ${a.salvo?'parado':e.estado}"><i></i>${a.salvo?'encerrada':e.estado}${e.peer?` · <code>${esc(e.peer)}</code>`:''}</span>
+  <span style="margin-left:auto;color:var(--mut);font-size:12px">${e.conexoes} conexão(ões)${c&&!a.salvo?' · há '+dur(e.conectado_s):''}</span></div>
+  <div class="sk">${c&&!a.salvo?K('Taxa',(e.taxa_mbps||0).toFixed(2)+' Mb/s')+K('RTT',e.rtt_ms+' ms')+K('Perda agora',(e.perda_pct||0).toFixed(2)+'%',e.perda_pct>1?'e':e.perda_pct>0?'w':'')
+   +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps?K('Banda do link',e.banda_mbps+' Mb/s'):''):''}
+   ${K('RTT médio / máx',e.rtt_medio_ms+' / '+e.rtt_max_ms+' ms')}${K('Pacotes',(tt.pacotes||0).toLocaleString('pt-BR'))}
+   ${K('Perdidos',(tt.perdidos||0).toLocaleString('pt-BR'),tt.perdidos?'w':'')}${K('Retransmitidos',(tt.retransmitidos||0).toLocaleString('pt-BR'))}
+   ${K('Descartados',(tt.descartados||0).toLocaleString('pt-BR'),tt.descartados?'e':'')}</div>${g?`<div class="g">${g}</div>`:''}</div>`}).join('');
  // serviços
  $('#anserv').textContent=a.servicos.length+' serviço(s)';
  $('#aserv').innerHTML=a.servicos.map(s=>`<div class="serv"><div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>

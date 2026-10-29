@@ -209,9 +209,9 @@ def test_painel_html(gateway):
 # tsUDPReceiverArgs.cpp, tsForkPacketPlugin.cpp, tsBitrateMonitorPlugin.cpp, tsTSProcessorArgs.cpp,
 # tsDektecInputPlugin.cpp, tsTSFileInputArgs.cpp). Garante que nenhuma opção inventada chegue ao tsp.
 OPCOES_TSDUCK = {
-    "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets"},
+    "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets", "--verbose"},
     "srt": {"--caller", "--listener", "--transtype", "--latency", "--ohead-bw", "--passphrase",
-            "--pbkeylen", "--streamid"},
+            "--pbkeylen", "--streamid", "--statistics-interval", "--json-line"},
     "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout"},
     "dektec": {"--device", "--channel", "--receive-timeout"},
     "file": {"--infinite"},
@@ -232,7 +232,8 @@ def _verificar_opcoes(cmd):
             plugin = arg
             continue
         if arg.startswith("--"):
-            assert arg in OPCOES_TSDUCK[plugin], f"opção {arg} não existe no plugin {plugin}"
+            nome = arg.split("=", 1)[0]
+            assert nome in OPCOES_TSDUCK[plugin], f"opção {nome} não existe no plugin {plugin}"
         if plugin == "fork" and arg.startswith(("/", "tsp")) or " -O " in arg:
             _verificar_opcoes(shlex.split(arg))
 
@@ -445,3 +446,48 @@ def test_procurar_sdk_dektec_pega_o_mais_recente():
     open(os.path.join(d1, "outro.tar.gz"), "w").close()
     assert a.procurar_sdk_dektec([d1, d2]) == novo
     assert a.procurar_sdk_dektec([tempfile.mkdtemp()]) is None
+
+
+# ---------------- estatísticas SRT (formato do TSDuck: tsSRTSocket.cpp, --json-line) ----------------
+def _linha_srt(prefixo, rx=True, taxa=12.0, pac=1100, perd=0, retr=0, rtt=14.5):
+    j = {"global": {"instant": {"rtt-ms": rtt}}}
+    if rx:
+        j["receive"] = {"interval": {"rate-mbps": taxa, "packets": pac, "lost-packets": perd, "dropped-packets": 0,
+                                     "retransmitted-packets": retr},
+                        "instant": {"buffer-ack-ms": 1980, "delivery-delay-ms": 2000}}
+        j["send"] = {"instant": {"estimated-link-bandwidth-mbps": 0}}
+    else:
+        j["send"] = {"interval": {"send-rate-mbps": taxa, "packets": pac, "lost-packets": perd, "dropped-packets": 0,
+                                  "retransmit-packets": retr},
+                     "instant": {"snd-buffer-ms": 120, "delivery-delay-ms": 200,
+                                 "estimated-link-bandwidth-mbps": 87.4}}
+    return f"* srt: {prefixo}:" + json.dumps(j)
+
+
+def test_estatisticas_srt_entrada_e_saida():
+    canal = {"nome": "x", "entrada": a.entrada_de_texto("srt://187.60.226.82:6001?latency=2000"),
+             "saidas": [a.saida_de_url("udp://127.0.0.1:5000"), a.saida_de_url("srt://:9000?mode=listener")]}
+    c = a.Canal(canal, {"tsp": "tsp"})
+    try:
+        assert set(c.srt) == {"SRTIN", "SRTOUT1"}
+        assert "--json-line=SRTIN:" in c.cmd and any("--json-line=SRTOUT1:" in x for x in c.cmd)
+        linhas = ["* srt: connected from 187.60.226.82:6001 (local: 172.20.15.119:40122)",
+                  _linha_srt("SRTIN", perd=11, pac=1089, retr=5),
+                  _linha_srt("SRTOUT1", rx=False, taxa=11.8, retr=2),
+                  "* bitrate_monitor: 2026/10/29 15:00:00, TS bitrate: 12,000,000 bits/s"]
+        import io
+        c._ler_saida(io.StringIO("\n".join(linhas) + "\n"))
+        st = c.srt_status()
+        e = st["SRTIN"]
+        assert e["estado"] == "conectado" and e["peer"] == "187.60.226.82:6001"
+        assert e["rtt_ms"] == 14.5 and e["taxa_mbps"] == 12.0 and e["perda_pct"] == 1.0
+        assert e["retransmitidos"] == 5 and e["latencia_ms"] == 2000 and e["totais"]["perdidos"] == 11
+        s = st["SRTOUT1"]
+        assert s["papel"] == "saida" and s["banda_mbps"] == 87.4 and s["retransmitidos"] == 2
+        assert c.status()["bitrate_bps"] == 12_000_000          # outras linhas continuam sendo lidas
+        assert not any("SRTIN:{" in l for l in c.log)            # estatísticas não poluem o log
+        # sem novas estatísticas por mais de 3 s: aguardando
+        est = c.srt["SRTIN"]
+        assert est.status(agora=est.ultimo + 5)["estado"] == "aguardando"
+    finally:
+        c.analisador.fechar()
