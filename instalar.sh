@@ -3,9 +3,14 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh | sudo bash
 #
+# Faz tudo: dependências, asi2srt, TSDuck, driver da placa DekTec (se houver placa) e serviço.
+#
 # Variáveis opcionais:
+#   DEKTEC_SDK=/caminho/LinuxSDK_vXXXX.tar.gz   SDK da DekTec (se não estiver em Downloads ou /tmp)
 #   COMPILAR=1   compila o TSDuck do código-fonte se não houver pacote pronto (demora no Raspberry)
 #   PORTA=8088   porta do painel web
+#
+# Ex.: curl -fsSL .../instalar.sh | sudo DEKTEC_SDK=/home/user/Downloads/LinuxSDK_v2025.01.0.tar.gz bash
 set -euo pipefail
 
 URL="https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/asi2srt.py"
@@ -45,6 +50,12 @@ else
   echo "TSDuck já instalado: $(tsp --version 2>&1 | head -1)"
 fi
 
+echo "==> Placa DekTec"
+DEKTEC_PENDENTE=0
+if ! asi2srt instalar-dektec --se-houver-placa; then
+  DEKTEC_PENDENTE=1
+fi
+
 echo "==> Serviço"
 asi2srt instalar-servico -c "$CONFIG" >/dev/null
 if [ -n "${PORTA:-}" ]; then
@@ -67,3 +78,12 @@ Pronto! asi2srt instalado e rodando.
   Atualizar: rode este mesmo comando de novo
 
 EOF
+if [ "$DEKTEC_PENDENTE" = "1" ]; then
+  cat <<AVISO
+ATENÇÃO: há placa DekTec neste servidor, mas o driver ainda não foi instalado.
+  1. Baixe o 'LinuxSDK' em https://www.dektec.com/downloads/SDK/
+  2. Rode:  sudo asi2srt instalar-dektec --sdk /caminho/LinuxSDK_vXXXX.tar.gz
+  3. Reinicie se for pedido e confira com:  asi2srt verificar
+
+AVISO
+fi

@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -1626,9 +1626,16 @@ def cmd_verificar(args):
         if nome == "dektec" and not DEKTEC_DISPONIVEL:
             continue
         ok &= tem or not obrig
+    placas = detectar_dektec()
+    if placas or DEKTEC_DISPONIVEL:
+        print(f"\nPlacas DekTec no barramento: {len(placas)}"
+              + "".join(f"\n  {p['barramento']} {p['endereco']} (produto 0x{p['produto']})" for p in placas))
+        if placas:
+            print("Driver DekTec: " + ("carregado ✓" if driver_dektec_carregado()
+                                       else "NÃO carregado ✗  ->  sudo asi2srt instalar-dektec"))
     if shutil.which("tsdektec"):
         r = subprocess.run(["tsdektec", "-a"], capture_output=True, text=True)
-        print("\nPlacas DekTec:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma encontrada"))
+        print("Placas vistas pelo TSDuck:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma encontrada"))
     asi = sorted(f for f in os.listdir("/dev") if f.startswith("asirx")) if os.path.isdir("/dev") else []
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
     print("PyYAML: " + ("instalado" if yaml else "ausente (configuração será salva em JSON)"))
@@ -1748,6 +1755,143 @@ def cmd_instalar_tsduck(args):
         raise SystemExit(f"não há pacote pronto do TSDuck para {distro} {versao} ({arq}).\n"
                          "Compile a partir do código-fonte com:  sudo asi2srt instalar-tsduck --compilar")
     print("TSDuck instalado. Confira com: asi2srt verificar")
+
+
+# ----------------------------------------------------------------------
+# Driver DekTec (DTA PCIe / DTU USB)
+# ----------------------------------------------------------------------
+DEKTEC_VENDOR = "1a0e"          # ID de fabricante da DekTec (PCI e USB)
+DEKTEC_MODULOS = ("DtPcie", "Dta", "Dtu")
+
+
+def detectar_dektec(raiz="/sys/bus"):
+    """Lista placas DekTec presentes (lendo o sysfs, sem depender de lspci/lsusb)."""
+    achados = []
+    for barramento, arq_vend, arq_prod in (("pci", "vendor", "device"), ("usb", "idVendor", "idProduct")):
+        base = os.path.join(raiz, barramento, "devices")
+        try:
+            nomes = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for n in nomes:
+            try:
+                with open(os.path.join(base, n, arq_vend)) as f:
+                    vend = f.read().strip().lower()
+            except OSError:
+                continue
+            if vend.replace("0x", "") != DEKTEC_VENDOR:
+                continue
+            try:
+                with open(os.path.join(base, n, arq_prod)) as f:
+                    prod = f.read().strip().lower().replace("0x", "")
+            except OSError:
+                prod = "?"
+            achados.append({"barramento": barramento.upper(), "endereco": n, "produto": prod})
+    return achados
+
+
+def driver_dektec_carregado(modulos="/proc/modules"):
+    try:
+        with open(modulos) as f:
+            texto = f.read()
+    except OSError:
+        return False
+    return any(re.search(rf"^{m}\s", texto, re.M) for m in DEKTEC_MODULOS)
+
+
+def procurar_sdk_dektec(pastas=None):
+    """Procura o LinuxSDK_v*.tar.gz baixado do site da DekTec; devolve o mais recente."""
+    import glob
+    if pastas is None:
+        pastas = [os.getcwd(), os.path.expanduser("~"), "/root", "/tmp", "/opt", "/usr/local/src"]
+        for casa in glob.glob("/home/*"):
+            pastas += [casa, os.path.join(casa, "Downloads"), os.path.join(casa, "Transferências")]
+    achados = []
+    for d in pastas:
+        achados += glob.glob(os.path.join(d, "LinuxSDK*.tar.gz")) + glob.glob(os.path.join(d, "LinuxSDK*.tgz"))
+    return max(set(achados), key=os.path.getmtime) if achados else None
+
+
+def cmd_instalar_dektec(args):
+    if os.geteuid() != 0:
+        raise SystemExit("rode como root: sudo asi2srt instalar-dektec")
+    if not DEKTEC_DISPONIVEL:
+        print(f"placas DekTec não são suportadas em {platform.machine()} (o driver só existe para PC Intel/AMD).")
+        return 0 if args.se_houver_placa else 1
+    placas = detectar_dektec()
+    if placas:
+        for p in placas:
+            print(f"placa DekTec encontrada: {p['barramento']} {p['endereco']} (produto 0x{p['produto']})")
+    elif args.se_houver_placa:
+        print("nenhuma placa DekTec detectada - etapa ignorada")
+        return 0
+    else:
+        print("aviso: nenhuma placa DekTec detectada; instalando o driver mesmo assim")
+    if driver_dektec_carregado() and not args.forcar:
+        print("driver DekTec já está carregado (use --forcar para reinstalar)")
+        return 0
+
+    sdk = args.sdk or os.environ.get("DEKTEC_SDK") or procurar_sdk_dektec()
+    if not sdk:
+        print("\nPara instalar o driver é preciso o Linux SDK da DekTec (a DekTec não oferece link fixo):\n"
+              "  1. baixe 'LinuxSDK' em https://www.dektec.com/downloads/SDK/  (arquivo LinuxSDK_v*.tar.gz)\n"
+              "  2. deixe o arquivo na pasta Downloads (ou em /tmp) e rode de novo, ou indique o caminho:\n"
+              "       sudo asi2srt instalar-dektec --sdk /caminho/LinuxSDK_vXXXX.tar.gz")
+        return 2
+    if sdk.startswith(("http://", "https://")):
+        destino = os.path.join(tempfile.gettempdir(), os.path.basename(urlparse(sdk).path) or "LinuxSDK.tar.gz")
+        print(f"baixando {sdk}...")
+        urllib.request.urlretrieve(sdk, destino)
+        sdk = destino
+    print(f"usando o SDK: {sdk}")
+
+    kernel = platform.release()
+    print("instalando ferramentas de compilação, DKMS e headers do kernel...")
+    if shutil.which("apt-get"):
+        subprocess.run(["apt-get", "update", "-qq"], check=False)
+        subprocess.run(["apt-get", "install", "-y", "dkms", "build-essential", f"linux-headers-{kernel}"], check=False)
+    elif shutil.which("dnf"):
+        subprocess.run(["dnf", "install", "-y", "dkms", "gcc", "make", "elfutils-libelf-devel",
+                        f"kernel-devel-{kernel}"], check=False)
+
+    pasta = tempfile.mkdtemp(prefix="dektec-")
+    subprocess.run(["tar", "xzf", sdk, "-C", pasta], check=True)
+    raizes = [os.path.join(r, d) for r, ds, _ in os.walk(pasta) for d in ds if d == "Drivers"]
+    if not raizes:
+        raise SystemExit("o arquivo não parece ser o LinuxSDK da DekTec (pasta Drivers não encontrada)")
+    drivers = min(raizes, key=len)
+    instalador = os.path.join(drivers, "Install")
+    if os.path.isfile(instalador):
+        print("instalando o driver via DKMS (recompila sozinho quando o kernel for atualizado)...")
+        subprocess.run(["bash", instalador], cwd=drivers, check=True)
+    else:  # SDK anterior a 2024.06: compila cada driver manualmente
+        print("SDK antigo (sem instalador DKMS): compilando os drivers...")
+        feito = False
+        for m in DEKTEC_MODULOS:
+            src = os.path.join(drivers, m, "Source", "Linux")
+            if os.path.isdir(src):
+                subprocess.run(["make"], cwd=src, check=True)
+                subprocess.run(["make", "install"], cwd=src, check=True)
+                feito = True
+        if not feito:
+            raise SystemExit("nenhum driver encontrado dentro do SDK")
+    subprocess.run(["depmod", "-a"], check=False)
+    for m in DEKTEC_MODULOS:
+        subprocess.run(["modprobe", m], capture_output=True)
+
+    if driver_dektec_carregado():
+        print("driver DekTec carregado.")
+    else:
+        sb = subprocess.run(["mokutil", "--sb-state"], capture_output=True, text=True) if shutil.which("mokutil") else None
+        if sb and "enabled" in (sb.stdout or "").lower():
+            print("o driver foi instalado, mas o Secure Boot está ATIVO e bloqueia drivers não assinados.\n"
+                  "Desative o Secure Boot na BIOS/UEFI (ou registre a chave do DKMS com mokutil) e reinicie.")
+        else:
+            print("o driver foi instalado; reinicie o servidor (sudo reboot) para carregá-lo.")
+    if shutil.which("tsdektec"):
+        r = subprocess.run(["tsdektec", "-a"], capture_output=True, text=True)
+        print("\nPlacas vistas pelo TSDuck:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma (reinicie e rode: tsdektec -a)"))
+    return 0
 
 
 UNIDADE_SYSTEMD = """\
@@ -2224,6 +2368,12 @@ def main(argv=None):
     p.add_argument("--forcar", action="store_true")
     p.add_argument("--compilar", action="store_true", help="compila do código-fonte (sem pacote pronto)")
     p.set_defaults(func=cmd_instalar_tsduck)
+
+    p = sub.add_parser("instalar-dektec", help="instala o driver da placa DekTec (root)")
+    p.add_argument("--sdk", help="caminho ou URL do LinuxSDK_v*.tar.gz da DekTec")
+    p.add_argument("--se-houver-placa", action="store_true", help="só instala se detectar placa DekTec")
+    p.add_argument("--forcar", action="store_true", help="reinstala mesmo com o driver carregado")
+    p.set_defaults(func=cmd_instalar_dektec)
 
     p = sub.add_parser("instalar-servico", help="instala serviço systemd (root)")
     p.add_argument("-c", "--config", default="/etc/asi2srt/config.yaml")

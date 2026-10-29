@@ -403,3 +403,45 @@ PACOTES = [
 ])
 def test_escolher_pacote_tsduck(info, arq, deb, esperado):
     assert a.escolher_pacote_tsduck(PACOTES, info, arq, deb) == esperado
+
+
+# ---------------- DekTec: detecção de placa e driver ----------------
+def _sysfs(raiz, barramento, nome, arquivos):
+    d = os.path.join(raiz, barramento, "devices", nome)
+    os.makedirs(d)
+    for k, v in arquivos.items():
+        with open(os.path.join(d, k), "w") as f:
+            f.write(v + "\n")
+
+
+def test_detectar_dektec_pci_e_usb():
+    raiz = tempfile.mkdtemp()
+    _sysfs(raiz, "pci", "0000:03:00.0", {"vendor": "0x1a0e", "device": "0x0891"})      # DekTec PCIe
+    _sysfs(raiz, "pci", "0000:00:02.0", {"vendor": "0x8086", "device": "0x3e92"})      # Intel (ignorar)
+    _sysfs(raiz, "usb", "2-1", {"idVendor": "1a0e", "idProduct": "00f5"})              # DekTec USB
+    _sysfs(raiz, "usb", "1-1", {"idVendor": "046d", "idProduct": "c52b"})              # mouse (ignorar)
+    achados = a.detectar_dektec(raiz)
+    assert [(p["barramento"], p["produto"]) for p in achados] == [("PCI", "0891"), ("USB", "00f5")]
+    assert a.detectar_dektec(tempfile.mkdtemp()) == []
+
+
+def test_driver_dektec_carregado():
+    d = tempfile.mkdtemp()
+    m = os.path.join(d, "modules")
+    with open(m, "w") as f:
+        f.write("snd_hda_intel 61440 3 - Live 0x0\nDtPcie 1871872 0 - Live 0x0\n")
+    assert a.driver_dektec_carregado(m)
+    with open(m, "w") as f:
+        f.write("snd_hda_intel 61440 3 - Live 0x0\nDtPcieX 1 0 - Live 0x0\n")
+    assert not a.driver_dektec_carregado(m)
+
+
+def test_procurar_sdk_dektec_pega_o_mais_recente():
+    d1, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+    velho, novo = os.path.join(d1, "LinuxSDK_v2024.06.0.tar.gz"), os.path.join(d2, "LinuxSDK_v2025.03.0.tar.gz")
+    for arq, t in ((velho, 1000), (novo, 2000)):
+        open(arq, "w").close()
+        os.utime(arq, (t, t))
+    open(os.path.join(d1, "outro.tar.gz"), "w").close()
+    assert a.procurar_sdk_dektec([d1, d2]) == novo
+    assert a.procurar_sdk_dektec([tempfile.mkdtemp()]) is None

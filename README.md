@@ -26,6 +26,32 @@ curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh 
 Instala as dependências, o asi2srt, o TSDuck e o serviço (inicia no boot), e mostra o endereço do
 painel (login `admin` / `admin`). Para atualizar, rode o mesmo comando de novo.
 
+## Servidor com placa DekTec (tudo junto)
+
+Num servidor PC (Intel/AMD) com placa DekTec PCIe (DTA) ou USB (DTU), o mesmo comando instala
+também o **driver da DekTec** — ele detecta a placa sozinho:
+
+1. Baixe o **Linux SDK** da DekTec em <https://www.dektec.com/downloads/SDK/> (arquivo `LinuxSDK_v*.tar.gz`;
+   a DekTec não oferece link fixo) e deixe na pasta **Downloads** (ou em `/tmp`).
+2. Rode:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh | sudo bash
+# ou indicando o SDK:
+curl -fsSL https://raw.githubusercontent.com/BrunoTv01/asi2srt/main/instalar.sh | sudo DEKTEC_SDK=/caminho/LinuxSDK_v2025.03.0.tar.gz bash
+```
+
+O instalador detecta a placa (PCI/USB), instala DKMS, compilador e headers do kernel, instala o driver
+pelo instalador DKMS do próprio SDK (recompila sozinho a cada atualização de kernel) e carrega o módulo.
+Se pedir, reinicie (`sudo reboot`). Com **Secure Boot** ativo, drivers não assinados não carregam:
+desative-o na BIOS/UEFI ou registre a chave do DKMS.
+
+Depois, no painel, crie o canal com **Entrada = ASI — placa DekTec** (Placa `0`, Porta `0` = primeira
+entrada). Portas bidirecionais (ex.: DTA-2145) podem precisar ser postas em entrada: `tsdektec --input 1 0`.
+Uma porta só pode ser usada por um programa por vez (feche o StreamXpert se ele estiver usando a porta).
+
+Só o driver: `sudo asi2srt instalar-dektec [--sdk arquivo.tar.gz]` · Conferir: `asi2srt verificar` e `tsdektec -a -v`.
+
 ## Raspberry Pi
 
 | | |
@@ -248,7 +274,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.5.0 && git push origin v2.5.0
+git tag v2.6.0 && git push origin v2.6.0
 ```
 
 ## Licença
