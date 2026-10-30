@@ -535,7 +535,7 @@ TSP_SAIDA_FALHA = r"""#!/bin/sh
 case "$*" in
   *"-I ip 127.0.0.1:"*) echo "* Error: ip: address 127.0.0.1 is not multicast"; exit 1;;
   *"-O srt"*) echo "* Error: srt: error during srt_connect: Connection setup failure: connection timed out"; exit 1;;
-  *"--local-address 127.0.0.1"*) sleep 30;;
+  *"--local-address 127.0.0.1"*) while true; do echo "* bitrate_monitor: TS bitrate: 9,000,000 bits/s"; sleep 0.5; done;;
   *) while true; do echo "* bitrate_monitor: TS bitrate: 9,000,000 bits/s"; sleep 0.5; done;;
 esac
 """
@@ -559,6 +559,8 @@ def test_saida_com_falha_nao_derruba_a_entrada():
         assert srt_out["reinicios"] >= 1 and srt_out["estado"] in ("reiniciando", "conectando")
         assert "connection timed out" in srt_out["ultima_msg"]
         assert udp_out["estado"] == "rodando" and udp_out["reinicios"] == 0
+        assert udp_out["info"]["taxa_kbps"] == 9000 and udp_out["enviado_bytes"] > 0 and udp_out["conexoes"] == 1
+        assert srt_out["conexoes"] == 0 and srt_out["enviado_bytes"] == 0
         assert st["srt"]["SRTOUT0"]["estado"] == "aguardando"
     finally:
         c.encerrar()
@@ -678,3 +680,29 @@ def test_processo_de_saida_aceito_pelo_tsduck():
     for i, s in enumerate([a.saida_de_url("srt://172.22.130.200:9090"), a.saida_de_url("udp://10.0.0.9:5000"),
                            a.saida_de_url("rtp://239.2.2.2:5004")]):
         _verificar_opcoes(a.montar_saida(s, i, porta_entrada=43000 + i))
+
+
+
+def test_metricas_de_envio_da_saida():
+    canal = a.Canal({"nome": "x", "entrada": {"tipo": "udp", "endereco": "1234"},
+                     "saidas": [a.saida_de_url("udp://10.0.0.9:5000")]}, {"tsp": "tsp"})
+    try:
+        ps = canal.procs_saida[0]
+        assert "bitrate_monitor" in ps.cmd and ps.cmd.index("bitrate_monitor") < ps.cmd.index("-O")
+        ps._taxa(8000, agora=100.0)
+        ps._no_ar()
+        ps._taxa(8000, agora=102.0)              # 2 s a 8 Mb/s = 2 MB
+        st = ps.status()
+        assert st["estado"] == "rodando" and st["conexoes"] == 1
+        assert st["enviado_bytes"] == 2_000_000 and st["hist"] == [8000, 8000]
+        ps._fora_do_ar("reiniciando")
+        ps._no_ar()
+        assert ps.status()["conexoes"] == 2 and ps.status()["enviado_conexao_bytes"] == 0
+    finally:
+        canal.analisador.fechar()
+
+
+def test_saidas_publicas_sem_segredos():
+    s = a.saidas_publicas([{"tipo": "rtmp", "url": "rtmp://s/live/chave123", "chave": "xyz"},
+                           {"tipo": "srt", "modo": "caller", "endereco": "h:1", "senha": "segredo1234"}])
+    assert "chave" not in s[0] and "chave123" not in s[0]["url"] and "senha" not in s[1]

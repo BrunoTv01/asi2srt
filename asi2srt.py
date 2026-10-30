@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.9.1"
+__version__ = "2.10.0"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -450,8 +450,20 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
     cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", "4000000",
+            "-P", "bitrate_monitor", "--periodic-bitrate", "2",   # taxa real enviada por esta saída
             "-O"] + _args_saida(s, prefixo=f"SRTOUT{indice}")
     return cmd
+
+
+def saidas_publicas(saidas):
+    """Configuração das saídas sem senhas nem chaves RTMP (para relatórios e telas)."""
+    out = []
+    for s in saidas:
+        s = {k: v for k, v in s.items() if k not in ("senha", "chave")}
+        if s.get("url"):
+            s["url"] = mascarar(str(s["url"]))
+        out.append(s)
+    return out
 
 
 def mascarar(txt: str) -> str:
@@ -1258,12 +1270,48 @@ class ProcSaida(threading.Thread):
         self.parar = threading.Event()
         self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None, "info": {}}
         self._prog = {}
+        self.hist = collections.deque(maxlen=150)      # taxa de saída (kb/s), um ponto a cada ~2 s
+        self.enviado = 0                                # bytes enviados na sessão (todas as conexões)
+        self._enviado_conexao = 0                       # bytes da conexão atual
+        self._ultima_taxa = None
+        self.conexoes = 0
+        self.tempo_no_ar = 0.0                          # soma do tempo no ar de todas as conexões
+
+    def _no_ar(self):
+        """Marca a saída como no ar (conta uma conexão nova se estava fora)."""
+        if self.st["estado"] != "rodando":
+            self.conexoes += 1
+            self._enviado_conexao = 0
+            self.st.update(estado="rodando", desde=time.time())
+
+    def _fora_do_ar(self, estado):
+        if self.st["estado"] == "rodando" and self.st["desde"]:
+            self.tempo_no_ar += time.time() - self.st["desde"]
+        self.st.update(estado=estado, desde=None)
+        self._ultima_taxa = None
+
+    def _taxa(self, kbps, agora=None):
+        agora = time.monotonic() if agora is None else agora
+        if self._ultima_taxa is not None:
+            dt = min(agora - self._ultima_taxa[0], 10.0)
+            b = (self._ultima_taxa[1] + kbps) / 2 * 1000 / 8 * dt
+            self.enviado += b
+            self._enviado_conexao += b
+        self._ultima_taxa = (agora, kbps)
+        self.st["info"] = {**(self.st.get("info") or {}), "taxa_kbps": round(kbps, 1)}
+        self.hist.append(round(kbps, 1))
 
     def status(self):
         s = dict(self.st)
         s["info"] = dict(self.st.get("info") or {})
-        if s["desde"] and s["estado"] == "rodando":
+        no_ar = s["estado"] == "rodando" and s["desde"]
+        if no_ar:
             s["uptime_s"] = int(time.time() - s["desde"])
+        s["enviado_bytes"] = int(self.enviado)
+        s["enviado_conexao_bytes"] = int(self._enviado_conexao)
+        s["conexoes"] = self.conexoes
+        s["tempo_no_ar_s"] = int(self.tempo_no_ar + (time.time() - s["desde"] if no_ar else 0))
+        s["hist"] = list(self.hist)
         return s
 
     def _ler(self, stream):
@@ -1279,27 +1327,35 @@ class ProcSaida(threading.Thread):
                         dados = json.loads(ms.group(2))
                         with self.canal.lock:
                             est.atualizar(dados, time.monotonic())
-                        self.st["estado"] = "rodando"
-                        self.st["desde"] = self.st["desde"] or time.time()
+                        self._no_ar()
                     except ValueError:
                         pass
+                continue
+            mb = None if RE_ALARME.search(linha) else RE_BITRATE.search(linha)
+            if mb:   # bitrate_monitor deste processo: taxa realmente entregue à rede
+                self._taxa(float(mb.group(1).replace(",", "")) / 1000)
+                if self.cfg.get("tipo") in ("udp", "rtp"):
+                    self._no_ar()
                 continue
             if self.cfg.get("tipo") == "rtmp" and re.match(r"^[a-z_0-9]+=", linha):
                 k, _, v = linha.partition("=")   # progresso do ffmpeg (-progress pipe:1)
                 self._prog[k] = v.strip()
                 if k == "progress":
                     br = re.match(r"([\d.]+)kbits/s", self._prog.get("bitrate", ""))
+                    total = int(self._prog.get("total_size", 0) or 0) if str(self._prog.get("total_size", "")).isdigit() else 0
+                    self._no_ar()
+                    if total:   # o ffmpeg informa o total exato da conexão atual
+                        self.enviado += max(0, total - self._enviado_conexao)
+                        self._enviado_conexao = total
                     self.st["info"] = {"taxa_kbps": float(br.group(1)) if br else 0,
-                                       "velocidade": self._prog.get("speed", "").strip(),
-                                       "quadros": int(self._prog.get("frame", 0) or 0),
-                                       "fps": float(self._prog.get("fps", 0) or 0)}
-                    if self.st["estado"] != "rodando":
-                        self.st.update(estado="rodando", desde=time.time())
+                                       "velocidade": self._prog.get("speed", "").strip()}
+                    if br:
+                        self.hist.append(round(float(br.group(1)), 1))
                 continue
             mp = RE_SRT_PEER_SAIDA.search(linha)
             if mp and est:
                 est.peer = mp.group(1)
-                self.st.update(estado="rodando", desde=time.time())
+                self._no_ar()
             linha = mascarar(linha)
             if RE_FFMPEG_AVISO_NORMAL.search(linha):
                 log.debug("[%s] [saída %d] %s", self.canal.name, self.indice + 1, linha)
@@ -1322,9 +1378,8 @@ class ProcSaida(threading.Thread):
                                + (" (sudo apt install ffmpeg)" if self.cmd[0] == "ffmpeg" else ""))
                 self.parar.wait(espera_max)
                 continue
-            # UDP não tem "conexão": está no ar assim que o processo sobe
-            udp = self.cfg.get("tipo") in ("udp", "rtp")
-            self.st.update(estado="rodando" if udp else "conectando", desde=t0 if udp else None, info={})
+            # UDP/RTP não têm "conexão": ficam no ar quando a primeira taxa é medida
+            self.st.update(estado="conectando", desde=None, info={})
             self._ler(self.proc.stdout)
             rc = self.proc.wait()
             if self.parar.is_set():
@@ -1332,12 +1387,12 @@ class ProcSaida(threading.Thread):
             if time.time() - t0 > 60:
                 espera = espera_min
             self.st["reinicios"] += 1
-            self.st.update(estado="reiniciando", desde=None)
+            self._fora_do_ar("reiniciando")
             self.canal._registrar(logging.ERROR, f"[saída {self.indice + 1}] {os.path.basename(self.cmd[0])} saiu (código {rc}). "
                                   f"Tentando de novo em {espera}s.")
             self.parar.wait(espera)
             espera = min(espera * 2, espera_max)
-        self.st.update(estado="parado", desde=None)
+        self._fora_do_ar("parado")
 
     def encerrar(self):
         self.parar.set()
@@ -1463,7 +1518,9 @@ class Canal(threading.Thread):
         totais = {f"p{p}": sum(v for k, v in cont.items() if prio[k] == p) for p in (1, 2, 3)}
         return {"inicio": self.inicio_sessao, "fim": agora_w, "duracao_s": int(agora_w - self.inicio_sessao),
                 "motivo": motivo, "reinicios": self.st.get("reinicios", 0),
-                "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a, "srt": self.srt_status()}
+                "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a, "srt": self.srt_status(),
+                "saidas": [p.status() for p in self.procs_saida],
+                "saidas_cfg": saidas_publicas(normalizar_canal(self.cfg)["saidas"])}
 
     def zerar_contadores(self):
         with self.analisador.lock:
@@ -1637,7 +1694,8 @@ class Gerenciador:
         rel = lista[idx]
         return {**rel["analise"], "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
-                "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {}}
+                "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {},
+                "saidas": rel.get("saidas") or [], "saidas_cfg": rel.get("saidas_cfg") or []}
 
     # --- persistência ------------------------------------------------
     def persistir(self):
@@ -1854,6 +1912,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                             else:
                                 agora_w = time.time()
                                 dados = {**t.analisador.analise(), "estado": t.status()["estado"], "srt": t.srt_status(),
+                                         "saidas": [p.status() for p in t.procs_saida],
+                                         "saidas_cfg": saidas_publicas(normalizar_canal(ger.defs[cid])["saidas"]),
                                          "salvo": False, "periodo": {"inicio": t.inicio_sessao,
                                                                      "duracao_s": int(agora_w - t.inicio_sessao)}}
                             if q.get("baixar"):
@@ -2517,7 +2577,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
  <div class="aban" id="aban" hidden></div>
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
-  <div class="acol"><div class="painel" id="psrt" hidden><h3>Conexões SRT<span id="asrtn"></span></h3><div id="asrt"></div></div>
+  <div class="acol"><div class="painel" id="psrt" hidden><h3>Saídas e conexões<span id="asrtn"></span></h3><div id="asrt"></div></div>
   <div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
   <div class="painel"><h3>Serviços<span id="anserv"></span></h3><div id="aserv"></div></div></div></div>
  <div class="painel"><h3>PIDs<span id="anpid"></span></h3><div class="tabw"><table class="t" id="apids"></table></div></div>
@@ -2629,10 +2689,10 @@ function no(rot,x,e,ativo,ps){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp
  const falha=ativo&&ps&&ps.estado!=='rodando'&&ps.ultima_msg&&(!e||e.estado!=='conectado')?`<span class="chip w" title="${esc(ps.ultima_msg)}">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` · ${ps.reinicios} tentativa(s)`:''}</span>`:'';
  let st;if(e){const tx={conectado:'conectado',aguardando:x.modo==='listener'?'aguardando conexão':'conectando…',parado:'parado'}[e.estado];
   st=`<span class="st ${e.estado}"><i></i>${tx}${e.peer?` · <code>${esc(e.peer)}</code>`:''}${e.estado==='conectado'&&e.conectado_s?` · ${dur(e.conectado_s)}`:''}</span>`}
- else if(ps&&ativo){const ok=ps.estado==='rodando';st=`<span class="st ${ok?'ativo':'aguardando'}"><i></i>${ok?'ativo':ps.estado}</span>`}
+ else if(ps&&ativo){const ok=ps.estado==='rodando';st=`<span class="st ${ok?'conectado':'aguardando'}"><i></i>${ok?'no ar':({conectando:'iniciando…',reiniciando:'tentando de novo'}[ps.estado]||ps.estado)}${ok&&ps.uptime_s?` · ${dur(ps.uptime_s)}`:''}</span>`}
  else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
- <span class="chips">${st}${e?chipsSRT(e):''}${ps&&ps.info&&ps.info.taxa_kbps&&ps.estado==='rodando'?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>${ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):'<span></span>'}</div>`}
+ <span class="chips">${st}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
  const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
@@ -2709,6 +2769,7 @@ $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();
   $('#dlg').close();toast('Canal salvo e aplicado',1);atualizar()}catch(e){toast(e.message)}};
 
 // ---------- análise ----------
+const fmtB=b=>{b=+b||0;return b>=1e9?(b/1e9).toFixed(2)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':(b/1e3).toFixed(0)+' kB'};
 const fmtR=b=>b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(1)+' kb/s';
 const fmtHa=s=>s<60?Math.round(s)+'s':s<3600?Math.round(s/60)+'min':(s/3600).toFixed(1)+'h';
 let sessSel=null;
@@ -2747,25 +2808,46 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   const rot=fs.map(f=>`<span style="top:${((1-f*(H-14)/H)*100).toFixed(1)}%">${(mx*f/1e6).toFixed(1)} Mb/s</span>`).join('');
   $('#agraf').innerHTML=`<div class="gw"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${gl}<polygon points="0,${H} ${pts} ${W},${H}"/><polyline points="${pts}"/></svg>${rot}</div>`}
  else $('#agraf').innerHTML='<div class="msg">aguardando dados…</div>';
- // conexões SRT
- const ch=dados.find(x=>x.id===anaId),pss=(ch&&ch.status&&ch.status.saidas)||[];
- const ls=Object.entries(a.srt||{}).map(([k,v])=>({...v,_ps:k.startsWith('SRTOUT')?pss[+k.slice(6)]:null}));$('#psrt').hidden=!ls.length;$('#asrtn').textContent=ls.length?ls.length+' conexão(ões)':'';
- $('#asrt').innerHTML=ls.map(e=>{const c=e.estado==='conectado',tt=e.totais||{},W=600,H=90,h=e.hist||[];
-  let g='';if(h.length>1){const mx=Math.max(...h.map(x=>x[0]))*1.2||1,mr=Math.max(...h.map(x=>x[2]))*1.2||1,X=i=>(i/(h.length-1)*W).toFixed(1);
+ // saídas e conexões
+ const ch=dados.find(x=>x.id===anaId),cfgS=a.saidas_cfg||((ch&&ch.saidas)||[]),pss=a.saidas||((ch&&ch.status&&ch.status.saidas)||[]);
+ const itens=[];if((a.srt||{}).SRTIN)itens.push({rot:'Entrada',x:(ch&&ch.entrada)||{tipo:'srt',modo:a.srt.SRTIN.modo,endereco:a.srt.SRTIN.endereco},e:a.srt.SRTIN,ps:null});
+ cfgS.forEach((x,i)=>itens.push({rot:'Saída '+(i+1),x,e:(a.srt||{})['SRTOUT'+i]||null,ps:pss[i]||null}));
+ $('#psrt').hidden=!itens.length;$('#asrtn').textContent=itens.length?(()=>{const n=itens.filter(it=>it.ps?it.ps.estado==='rodando':it.e&&it.e.estado==='conectado').length;return a.salvo?itens.length+' item(ns)':`${n} de ${itens.length} no ar`})():'';
+ $('#asrt').innerHTML=itens.map(({rot,x,e,ps})=>{const K=(r,v,cl)=>`<div><small>${r}</small><b class="${cl||''}">${v}</b></div>`,W=600,H=90;
+  const srtOk=e&&e.estado==='conectado'&&!a.salvo,psOk=ps&&ps.estado==='rodando'&&!a.salvo,noAr=srtOk||psOk||(!ps&&srtOk);
+  const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+  const estTxt=a.salvo?'encerrada':noAr?(e?'conectado':'no ar'):ps?({conectando:x.tipo==='srt'&&x.modo==='listener'?'aguardando conexão':'conectando…',reiniciando:'tentando de novo',erro:'erro',parado:'parado',iniciando:'iniciando'}[ps.estado]||ps.estado):(e?e.estado:'');
+  const peer=e&&e.peer&&!a.salvo?` · <code>${esc(e.peer)}</code>`:'';
+  const uptime=psOk&&ps.uptime_s!=null?ps.uptime_s:(srtOk?e.conectado_s:0);
+  const conx=ps?ps.conexoes:(e?e.conexoes:0);
+  // gráfico: SRT (taxa+RTT+perda) ou taxa da saída
+  let g='';const h=e&&e.hist&&e.hist.length>1?e.hist:null,hp=!h&&ps&&ps.hist&&ps.hist.length>1?ps.hist:null;
+  if(h){const mx=Math.max(...h.map(v=>v[0]))*1.2||1,mr=Math.max(...h.map(v=>v[2]))*1.2||1,X=i=>(i/(h.length-1)*W).toFixed(1);
    g=`<div class="leg"><span style="color:var(--acc)">— taxa (máx ${(mx/1.2).toFixed(2)} Mb/s)</span><span style="color:#d2a8ff">— RTT (máx ${(mr/1.2).toFixed(0)} ms)</span><span style="color:var(--err)">▮ perda</span></div>
-   <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${h.map((x,i)=>x[1]>0?`<rect x="${X(i)}" y="${H-Math.min(H,x[1]*20+4)}" width="3" height="${Math.min(H,x[1]*20+4)}" fill="var(--err)"/>`:'').join('')}
-   <polyline points="${h.map((x,i)=>`${X(i)},${(H-x[0]/mx*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke"/>
-   <polyline points="${h.map((x,i)=>`${X(i)},${(H-x[2]/mr*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:#d2a8ff;stroke-width:1.2;vector-effect:non-scaling-stroke;opacity:.8"/></svg>`}
-  const K=(r,v,cl)=>`<div><small>${r}</small><b class="${cl||''}">${v}</b></div>`;
-  return`<div class="srtl"><div class="sh"><b>${esc(e.rotulo)}</b><span class="tp">SRT ${esc(e.modo)}</span><code>${esc(e.endereco)}</code>
-  <span class="st ${a.salvo?'parado':e.estado}"><i></i>${a.salvo?'encerrada':e.estado}${e.peer?` · <code>${esc(e.peer)}</code>`:''}</span>
-  <span style="margin-left:auto;color:var(--mut);font-size:12px">${e.conexoes} conexão(ões)${c&&!a.salvo?' · há '+dur(e.conectado_s):''}</span></div>
-  ${!c&&!a.salvo&&e._ps&&e._ps.ultima_msg?`<div style="padding:7px 11px;color:var(--warn);font-size:12.5px;border-bottom:1px solid var(--line)">⚠ ${esc(msgCurta(e._ps.ultima_msg))}${e._ps.reinicios?` — ${e._ps.reinicios} tentativa(s), tentando de novo sozinho`:''}</div>`:''}
-  <div class="sk">${c&&!a.salvo?K('Taxa',(e.taxa_mbps||0).toFixed(2)+' Mb/s')+K('RTT',e.rtt_ms+' ms')+K('Perda agora',(e.perda_pct||0).toFixed(2)+'%',e.perda_pct>1?'e':e.perda_pct>0?'w':'')
-   +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps?K('Banda do link',e.banda_mbps+' Mb/s'):''):''}
-   ${K('RTT médio / máx',e.rtt_medio_ms+' / '+e.rtt_max_ms+' ms')}${K('Pacotes',(tt.pacotes||0).toLocaleString('pt-BR'))}
-   ${K('Perdidos',(tt.perdidos||0).toLocaleString('pt-BR'),tt.perdidos?'w':'')}${K('Retransmitidos',(tt.retransmitidos||0).toLocaleString('pt-BR'))}
-   ${K('Descartados',(tt.descartados||0).toLocaleString('pt-BR'),tt.descartados?'e':'')}</div>${g?`<div class="g">${g}</div>`:''}</div>`}).join('');
+   <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${h.map((v,i)=>v[1]>0?`<rect x="${X(i)}" y="${H-Math.min(H,v[1]*20+4)}" width="3" height="${Math.min(H,v[1]*20+4)}" fill="var(--err)"/>`:'').join('')}
+   <polyline points="${h.map((v,i)=>`${X(i)},${(H-v[0]/mx*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke"/>
+   <polyline points="${h.map((v,i)=>`${X(i)},${(H-v[2]/mr*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:#d2a8ff;stroke-width:1.2;vector-effect:non-scaling-stroke;opacity:.8"/></svg>`}
+  else if(hp){const mx=Math.max(...hp)*1.2||1,X=i=>(i/(hp.length-1)*W).toFixed(1);
+   g=`<div class="leg"><span style="color:var(--acc)">— taxa de saída (máx ${(mx/1.2/1000).toFixed(2)} Mb/s)</span></div>
+   <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><polyline points="${hp.map((v,i)=>`${X(i)},${(H-v/mx*H).toFixed(1)}`).join(' ')}" style="fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke"/></svg>`}
+  const tt=(e&&e.totais)||{},info=(ps&&ps.info)||{};
+  let k='';
+  if(noAr){const taxa=srtOk?(e.taxa_mbps||0):((info.taxa_kbps||0)/1000);
+   k+=K('Taxa',taxa.toFixed(2)+' Mb/s')+K('No ar há',dur(uptime));
+   if(ps)k+=K('Enviado nesta conexão',fmtB(ps.enviado_conexao_bytes));
+   if(srtOk)k+=K('RTT',e.rtt_ms+' ms')+K('Perda agora',(e.perda_pct||0).toFixed(2)+'%',e.perda_pct>1?'e':e.perda_pct>0?'w':'')
+    +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps?K('Banda do link',e.banda_mbps+' Mb/s'):'');
+   if(info.velocidade)k+=K('Velocidade',esc(info.velocidade),/^0\.|^0x/.test(info.velocidade)?'w':'')}
+  if(ps)k+=K('Enviado na sessão',fmtB(ps.enviado_bytes))+K('Tempo no ar',dur(ps.tempo_no_ar_s))+K('Conexões',conx)+K('Quedas',ps.reinicios,ps.reinicios?'w':'');
+  if(e)k+=K('RTT médio / máx',e.rtt_medio_ms+' / '+e.rtt_max_ms+' ms')+K('Pacotes',(tt.pacotes||0).toLocaleString('pt-BR'))
+   +K('Perdidos',(tt.perdidos||0).toLocaleString('pt-BR'),tt.perdidos?'w':'')+K('Retransmitidos',(tt.retransmitidos||0).toLocaleString('pt-BR'))
+   +K('Descartados',(tt.descartados||0).toLocaleString('pt-BR'),tt.descartados?'e':'');
+  const stc=a.salvo?'parado':noAr?'conectado':(ps&&ps.estado==='parado')?'parado':'aguardando';
+  return`<div class="srtl"><div class="sh"><b>${esc(rot)}</b><span class="tp ${cl}">${tp}</span><code>${esc(endTxt(x))}</code>
+  <span class="st ${stc}"><i></i>${estTxt}${peer}</span>
+  <span style="margin-left:auto;color:var(--mut);font-size:12px">${conx} conexão(ões)${noAr&&uptime?' · há '+dur(uptime):''}</span></div>
+  ${!noAr&&!a.salvo&&ps&&ps.ultima_msg?`<div style="padding:7px 11px;color:var(--warn);font-size:12.5px;border-bottom:1px solid var(--line)">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` — ${ps.reinicios} tentativa(s), tentando de novo sozinho`:''}</div>`:''}
+  <div class="sk">${k}</div>${g?`<div class="g">${g}</div>`:''}</div>`}).join('');
  // serviços
  $('#anserv').textContent=a.servicos.length+' serviço(s)';
  $('#aserv').innerHTML=a.servicos.map(s=>`<div class="serv"><div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>

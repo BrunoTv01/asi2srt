@@ -107,6 +107,12 @@ asi2srt verificar
 | **RTMP / RTMPS** | ffmpeg | YouTube, Facebook, Wowza, nginx-rtmp… Servidor e chave em campos separados (a chave nunca aparece no log). RTMP aceita H.264 + AAC: por padrão **copia o vídeo e converte o áudio para AAC** (ISDB-Tb usa AAC LATM). Para origem MPEG-2/HEVC, escolha vídeo `h264` (usa CPU). Em MPTS, informe o número do programa. |
 
 Cada saída roda em processo próprio: se uma falhar, só ela tenta de novo, sem afetar a entrada e as outras.
+
+Quando a saída está no ar, a rota e o painel **Saídas e conexões** (tela de análise) mostram: taxa
+realmente enviada (medida no próprio processo da saída), há quanto tempo está no ar, total enviado na
+conexão e na sessão, tempo total no ar, número de conexões e de quedas, gráfico da taxa e — nas saídas
+SRT — RTT, perda, retransmissões, banda do link, buffer e o endereço do outro lado; nas RTMP, a
+velocidade do ffmpeg. Esses dados também ficam no relatório salvo ao parar o canal.
 Linha de comando: `-s "rtp://239.2.2.2:5004?ttl=8"` · `-s "rtmp://a.rtmp.youtube.com/live2/SUA-CHAVE"`.
 
 ## Só análise (sem saída)
@@ -306,7 +312,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.9.0 && git push origin v2.9.0
+git tag v2.10.0 && git push origin v2.10.0
 ```
 
 ## Licença
