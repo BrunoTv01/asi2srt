@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.10.0"
+__version__ = "2.10.1"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -2543,6 +2543,14 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .dots small{color:var(--mut);font-size:11px;margin-left:4px}
 .rh .acs{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}.rh .acs button{padding:4px 9px;font-size:12.5px}
 .rl{padding:6px 14px 10px}
+.ind{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 14px;border-bottom:1px solid #20262f;background:#13181f}
+.ic{display:inline-flex;align-items:center;gap:6px;font-size:12px;background:var(--in);border:1px solid var(--line);border-radius:7px;padding:3px 9px;white-space:nowrap}
+.ic i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 5px var(--ok)}
+.ic b{font-variant-numeric:tabular-nums;margin-left:2px}
+.ic.w{border-color:#5c4a12}.ic.w i{background:var(--warn);box-shadow:0 0 5px var(--warn)}.ic.w b{color:#f2cc60}
+.ic.e{border-color:#5c1f22;background:#2a1215}.ic.e i{background:var(--err);box-shadow:0 0 8px var(--err)}.ic.e b{color:#ff8f8a}
+.ic.x{opacity:.5}.ic.x i{background:#484f58;box-shadow:none}
+.ind .sub{color:var(--mut);font-size:11px;margin-left:4px}
 .no{display:grid;grid-template-columns:86px minmax(170px,280px) 1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #20262f;font-size:13px}
 .no:last-child{border-bottom:0}.no .pp{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
 .no .ed{display:flex;align-items:center;gap:7px;min-width:0}.no .ed code{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2693,6 +2701,12 @@ function no(rot,x,e,ativo,ps){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp
  else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
  <span class="chips">${st}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
+const IND=[['sync_loss','TS sync loss'],['cc','Continuity count'],['pcr_rep','PCR repetition'],['pcr_disc','PCR discontinuity'],['pts','PTS error']];
+function indicadores(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont)return'';const rec=t?t.recentes||[]:[];
+ const desc=Object.fromEntries(TRI.map(x=>[x[0],x[2]+' '+x[4]]));
+ return`<div class="ind">${IND.map(([k,n])=>{const v=cont[k]||0,cl=rec.includes(k)?'e':v?'w':(t&&!t.sinal)?'x':'';
+  return`<span class="ic ${cl}" title="${esc(desc[k]||n)}"><i></i>${n}<b>${v.toLocaleString('pt-BR')}</b></span>`}).join('')}
+ <span class="sub">${t?(t.sinal?'sessão atual':'sem sinal'):'última sessão'}</span></div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
  const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
@@ -2703,6 +2717,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i])).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
  ${dots}<span class="rb">${ativo?`${mb(s.bitrate_bps||0)} <small>Mb/s</small>`:r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
+ ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}${destinos}
  ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
  ${ativo&&s.estado!=='rodando'&&s.ultima_msg?`<div class="rrel" style="color:var(--warn)">${esc(s.ultima_msg)}</div>`:''}</div></div>`}
