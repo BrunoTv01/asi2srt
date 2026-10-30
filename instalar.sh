@@ -84,7 +84,8 @@ EOF
 if [ "$DEKTEC_PENDENTE" = "1" ]; then
   cat <<AVISO
 ATENÇÃO: há placa DekTec neste servidor, mas o driver ainda não foi instalado.
-  1. Baixe o 'LinuxSDK' em https://www.dektec.com/downloads/SDK/
+  1. Em https://www.dektec.com/downloads/SDK/ (DekTec SDKs for Linux), baixe o primeiro:
+     "DTAPI - C++ API for all DTA, DTU, DTE devices" e deixe na pasta Downloads
   2. Rode:  sudo asi2srt instalar-dektec --sdk /caminho/LinuxSDK_vXXXX.tar.gz
   3. Reinicie se for pedido e confira com:  asi2srt verificar
 

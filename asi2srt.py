@@ -2256,10 +2256,19 @@ def procurar_sdk_dektec(pastas=None):
         pastas = [os.getcwd(), os.path.expanduser("~"), "/root", "/tmp", "/opt", "/usr/local/src"]
         for casa in glob.glob("/home/*"):
             pastas += [casa, os.path.join(casa, "Downloads"), os.path.join(casa, "Transferências")]
-    achados = []
+    principais, outros = set(), set()
     for d in pastas:
-        achados += glob.glob(os.path.join(d, "LinuxSDK*.tar.gz")) + glob.glob(os.path.join(d, "LinuxSDK*.tgz"))
-    return max(set(achados), key=os.path.getmtime) if achados else None
+        for ext in ("*.tar.gz", "*.tgz"):
+            for arq in glob.glob(os.path.join(d, ext)):
+                nome = os.path.basename(arq).lower()
+                if nome.startswith("linuxsdk"):
+                    principais.add(arq)
+                # pacote "DTAPI - C++ API for all DTA, DTU, DTE devices" (traz os drivers);
+                # ignora DTAPI-TS (só análise) e DTAPI ARM (só DTA-2116)
+                elif "dtapi" in nome and not re.search(r"dtapi[-_ ]?ts|arm", nome):
+                    outros.add(arq)
+    achados = principais or outros
+    return max(achados, key=os.path.getmtime) if achados else None
 
 
 def cmd_instalar_dektec(args):
@@ -2284,7 +2293,8 @@ def cmd_instalar_dektec(args):
     sdk = args.sdk or os.environ.get("DEKTEC_SDK") or procurar_sdk_dektec()
     if not sdk:
         print("\nPara instalar o driver é preciso o Linux SDK da DekTec (a DekTec não oferece link fixo):\n"
-              "  1. baixe 'LinuxSDK' em https://www.dektec.com/downloads/SDK/  (arquivo LinuxSDK_v*.tar.gz)\n"
+              "  1. em https://www.dektec.com/downloads/SDK/ -> 'DekTec SDKs for Linux', baixe o primeiro:\n"
+              "     'DTAPI - C++ API for all DTA, DTU, DTE devices' (traz os drivers; arquivo LinuxSDK_v*.tar.gz)\n"
               "  2. deixe o arquivo na pasta Downloads (ou em /tmp) e rode de novo, ou indique o caminho:\n"
               "       sudo asi2srt instalar-dektec --sdk /caminho/LinuxSDK_vXXXX.tar.gz")
         return 2

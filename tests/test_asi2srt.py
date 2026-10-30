@@ -706,3 +706,13 @@ def test_saidas_publicas_sem_segredos():
     s = a.saidas_publicas([{"tipo": "rtmp", "url": "rtmp://s/live/chave123", "chave": "xyz"},
                            {"tipo": "srt", "modo": "caller", "endereco": "h:1", "senha": "segredo1234"}])
     assert "chave" not in s[0] and "chave123" not in s[0]["url"] and "senha" not in s[1]
+
+
+
+def test_procurar_sdk_dektec_nomes_alternativos():
+    d = tempfile.mkdtemp()
+    for n in ("DTAPI-TS_v1.12.1.tar.gz", "DtapiArm_2026.09.tar.gz", "Dtapi_v2026.09.0.tar.gz"):
+        open(os.path.join(d, n), "w").close()
+    assert a.procurar_sdk_dektec([d]).endswith("Dtapi_v2026.09.0.tar.gz")
+    open(os.path.join(d, "LinuxSDK_v2026.09.0.tar.gz"), "w").close()
+    assert a.procurar_sdk_dektec([d]).endswith("LinuxSDK_v2026.09.0.tar.gz")   # nome oficial tem preferência
