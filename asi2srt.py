@@ -46,7 +46,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.9.0"
+__version__ = "2.9.1"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -350,6 +350,30 @@ def _args_ffmpeg_rtmp(s: dict, porta_entrada) -> list:
     return cmd
 
 
+def _args_ip_entrada(endereco, interface_local="") -> list:
+    """Argumentos da entrada 'ip' do TSDuck. Ela só aceita IP no endereço se for MULTICAST
+    ("address X is not multicast"); para unicast usa-se só a porta + --local-address."""
+    end = str(endereco).strip()
+    host, _, porta = end.rpartition(":")
+    if not porta.isdigit():
+        raise ValueError(f"endereço UDP inválido: {end!r} (use ip:porta ou só a porta)")
+    host = host.strip("[]")
+    multicast = False
+    if host:
+        try:
+            import ipaddress
+            multicast = ipaddress.ip_address(host).is_multicast
+        except ValueError:
+            raise ValueError(f"endereço UDP inválido: {end!r} (use o IP numérico, ex.: 239.1.1.1:1234)")
+    if multicast:
+        a = [f"{host}:{porta}"]
+        if interface_local:
+            a += ["--local-address", interface_local]
+        return a
+    local = interface_local or ("" if host in ("", "0.0.0.0") else host)
+    return [porta] + (["--local-address", local] if local else [])
+
+
 def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
     """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
     canal = normalizar_canal(canal)
@@ -371,9 +395,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     elif tipo == "udp":
         if not ent.get("endereco"):
             raise ValueError("entrada UDP precisa de ip:porta (ou só porta)")
-        cmd += ["-I", "ip", str(ent["endereco"])]
-        if ent.get("interface_local"):
-            cmd += ["--local-address", ent["interface_local"]]
+        cmd += ["-I", "ip"] + _args_ip_entrada(ent["endereco"], ent.get("interface_local", ""))
         cmd += ["--receive-timeout", "5000"]
     elif tipo == "srt":
         cmd[1:1] = ["--verbose"]  # mostra o endereço do outro lado ("connected from ...")
@@ -427,7 +449,7 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     cmd = [tsp_bin, "--realtime"]
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
-    cmd += ["-I", "ip", f"127.0.0.1:{porta_entrada or 'PORTA_SAIDA'}", "--buffer-size", "4000000",
+    cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", "4000000",
             "-O"] + _args_saida(s, prefixo=f"SRTOUT{indice}")
     return cmd
 

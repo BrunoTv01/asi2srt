@@ -59,7 +59,8 @@ def test_comando_dektec_srt():
     assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", "7"]   # entrega ao distribuidor local
     assert "srt" not in cmd                                                # a saída não fica neste processo
     sai = a.montar_saida(canal["saidas"][0], 0, porta_entrada=42000)
-    assert "-I ip 127.0.0.1:42000" in " ".join(sai) and "-O srt --caller h:1" in " ".join(sai)
+    assert "-I ip 42000 --local-address 127.0.0.1" in " ".join(sai) and "-O srt --caller h:1" in " ".join(sai)
+    _verificar_opcoes(sai)
     assert "senhasecreta1" not in a.comando_para_log(sai)
 
 
@@ -228,6 +229,15 @@ OPCOES_TSDUCK = {
 
 
 def _verificar_opcoes(cmd):
+    """Confere opções contra as do TSDuck e aplica a regra da entrada 'ip' (tsUDPReceiverArgs.cpp):
+    se o parâmetro tiver endereço, ele precisa ser multicast."""
+    import ipaddress
+    for i, x in enumerate(cmd[:-2]):
+        if x == "-I" and cmd[i + 1] == "ip":
+            dest = cmd[i + 2]
+            host = dest.rpartition(":")[0].split("@")[-1]
+            assert not host or ipaddress.ip_address(host).is_multicast, \
+                f"TSDuck recusaria: address {dest} is not multicast"
     plugin = "tsp"
     for arg in cmd[1:]:
         if arg in ("-I", "-P", "-O"):
@@ -523,8 +533,9 @@ def test_distribuidor_entrega_copia_a_cada_saida():
 
 TSP_SAIDA_FALHA = r"""#!/bin/sh
 case "$*" in
+  *"-I ip 127.0.0.1:"*) echo "* Error: ip: address 127.0.0.1 is not multicast"; exit 1;;
   *"-O srt"*) echo "* Error: srt: error during srt_connect: Connection setup failure: connection timed out"; exit 1;;
-  *"-I ip 127.0.0.1"*) sleep 30;;
+  *"--local-address 127.0.0.1"*) sleep 30;;
   *) while true; do echo "* bitrate_monitor: TS bitrate: 9,000,000 bits/s"; sleep 0.5; done;;
 esac
 """
@@ -569,7 +580,7 @@ def test_saida_rtmp_comando_e_chave_mascarada():
     s = a.saida_de_url("rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl")
     assert s["video"] == "copiar" and s["audio"] == "aac"
     cmd = a.montar_saida(s, 0, porta_entrada=42000)
-    assert cmd[0] == "ffmpeg" and "udp://127.0.0.1:42000" in cmd[cmd.index("-i") + 1]
+    assert cmd[0] == "ffmpeg" and "udp://127.0.0.1:42000" in cmd[cmd.index("-i") + 1]  # ffmpeg aceita unicast
     assert cmd[cmd.index("-c:v") + 1] == "copy" and cmd[cmd.index("-c:a") + 1] == "aac"
     assert cmd[-3:] == ["-flvflags", "no_duration_filesize", "rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl"]
     erro = "[out#0/flv @ 0x5] Error opening output rtmp://a.rtmp.youtube.com/live2/abcd-efgh-ijkl: Connection timed out"
@@ -638,3 +649,32 @@ def test_rtmp_ponta_a_ponta_com_audio_latm():
     info = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name",
                            "-of", "csv=p=0", flv], capture_output=True, text=True).stdout.split()
     assert info == ["h264", "aac"]
+
+
+
+# ---------------- entrada 'ip' do TSDuck: unicast x multicast ----------------
+@pytest.mark.parametrize("endereco,interface,esperado", [
+    ("239.1.1.1:1234", "", ["239.1.1.1:1234"]),
+    ("239.1.1.1:1234", "10.0.0.5", ["239.1.1.1:1234", "--local-address", "10.0.0.5"]),
+    ("1234", "", ["1234"]),
+    (":1234", "", ["1234"]),
+    ("0.0.0.0:1234", "", ["1234"]),
+    ("192.168.0.10:1234", "", ["1234", "--local-address", "192.168.0.10"]),   # unicast: só porta + IP local
+    ("127.0.0.1:5000", "", ["5000", "--local-address", "127.0.0.1"]),
+])
+def test_args_ip_entrada(endereco, interface, esperado):
+    assert a._args_ip_entrada(endereco, interface) == esperado
+
+
+def test_entrada_udp_unicast_aceita_pelo_tsduck():
+    cmd = a.montar_comando({"entrada": a.entrada_de_texto("udp://192.168.0.10:1234"), "saidas": []})
+    assert "-I ip 1234 --local-address 192.168.0.10" in " ".join(cmd)
+    _verificar_opcoes(cmd)
+    with pytest.raises(ValueError, match="IP numérico"):
+        a.montar_comando({"entrada": {"tipo": "udp", "endereco": "servidor.local:1234"}, "saidas": []})
+
+
+def test_processo_de_saida_aceito_pelo_tsduck():
+    for i, s in enumerate([a.saida_de_url("srt://172.22.130.200:9090"), a.saida_de_url("udp://10.0.0.9:5000"),
+                           a.saida_de_url("rtp://239.2.2.2:5004")]):
+        _verificar_opcoes(a.montar_saida(s, i, porta_entrada=43000 + i))
