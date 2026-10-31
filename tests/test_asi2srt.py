@@ -716,3 +716,29 @@ def test_procurar_sdk_dektec_nomes_alternativos():
     assert a.procurar_sdk_dektec([d]).endswith("Dtapi_v2026.09.0.tar.gz")
     open(os.path.join(d, "LinuxSDK_v2026.09.0.tar.gz"), "w").close()
     assert a.procurar_sdk_dektec([d]).endswith("LinuxSDK_v2026.09.0.tar.gz")   # nome oficial tem preferência
+
+
+# ---------------- aparência: nome e logo ----------------
+def test_aparencia_nome_e_logo(gateway):
+    base, cfg = gateway
+    cod, ap = _req(base, "GET", "/api/aparencia")
+    assert cod == 200 and ap["titulo"] == "Engenharia TV Cultura" and ap["logo"] is False
+    png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+    cod, ap = _req(base, "PUT", "/api/aparencia", {"titulo": "Engenharia TV Cultura - Sumaré",
+                                                  "logo_base64": base64.b64encode(png).decode(), "logo_tipo": "image/png"})
+    assert cod == 200 and ap["logo"] is True and ap["titulo"].endswith("Sumaré")
+    r = urllib.request.Request(base + "/logo", headers={
+        "Authorization": "Basic " + base64.b64encode(b"admin:segredo").decode()})
+    with urllib.request.urlopen(r) as resp:
+        assert resp.read() == png and resp.headers["Content-Type"] == "image/png"
+        assert "default-src 'none'" in resp.headers["Content-Security-Policy"]
+    with urllib.request.urlopen(urllib.request.Request(base + "/", headers=r.headers)) as resp:
+        assert "<title>Engenharia TV Cultura - Sumaré</title>" in resp.read().decode()
+    salvo = json.load(open(cfg))["supervisor"]
+    assert salvo["titulo"].endswith("Sumaré") and salvo["logo"] == "logo-painel.png"
+    assert os.path.exists(os.path.join(os.path.dirname(cfg), "logo-painel.png"))
+    assert _req(base, "PUT", "/api/aparencia", {"logo_base64": "AAAA", "logo_tipo": "text/html"})[0] == 400
+    assert _req(base, "PUT", "/api/aparencia", {"titulo": ""})[0] == 400
+    cod, ap = _req(base, "PUT", "/api/aparencia", {"remover_logo": True})
+    assert ap["logo"] is False and not os.path.exists(os.path.join(os.path.dirname(cfg), "logo-painel.png"))
+    assert _req(base, "GET", "/logo")[0] == 404

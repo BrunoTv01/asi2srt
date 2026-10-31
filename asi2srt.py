@@ -28,6 +28,7 @@ import base64
 import collections
 import copy
 import hmac
+import html
 import json
 import logging
 import os
@@ -46,7 +47,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.10.1"
+__version__ = "2.11.0"
+TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
     import yaml  # opcional: sem PyYAML a configuração é salva em JSON
@@ -131,6 +133,8 @@ supervisor:
   status_http: "0.0.0.0:8088"
   usuario: admin
   senha_painel: admin
+  titulo: "Engenharia TV Cultura"   # nome exibido no painel (também editável pelo botão ⚙)
+  logo: ""                          # arquivo do logo (enviado pelo painel)
   log_arquivo: ""
 """
 
@@ -1697,6 +1701,64 @@ class Gerenciador:
                 "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {},
                 "saidas": rel.get("saidas") or [], "saidas_cfg": rel.get("saidas_cfg") or []}
 
+    # --- aparência (nome e logo do painel) -----------------------------
+    TIPOS_LOGO = {"image/png": ".png", "image/jpeg": ".jpg", "image/svg+xml": ".svg", "image/webp": ".webp"}
+    MAX_LOGO = 2 * 1024 * 1024
+
+    def _pasta_dados(self):
+        return os.path.dirname(os.path.abspath(self.caminho)) if self.caminho else os.getcwd()
+
+    def logo_arquivo(self):
+        nome = self.sup.get("logo") or ""
+        if not nome:
+            return None
+        cam = nome if os.path.isabs(nome) else os.path.join(self._pasta_dados(), nome)
+        return cam if os.path.isfile(cam) else None
+
+    def aparencia(self):
+        cam = self.logo_arquivo()
+        return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
+                "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0}
+
+    def salvar_aparencia(self, dados):
+        titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
+        if not titulo or len(titulo) > 80:
+            raise ValueError("o nome deve ter entre 1 e 80 caracteres")
+        with self.lock:
+            self.sup["titulo"] = titulo
+            if dados.get("remover_logo"):
+                antigo = self.logo_arquivo()
+                self.sup["logo"] = ""
+                if antigo and os.path.basename(antigo).startswith("logo-painel"):
+                    try:
+                        os.remove(antigo)
+                    except OSError:
+                        pass
+            elif dados.get("logo_base64"):
+                ext = self.TIPOS_LOGO.get(str(dados.get("logo_tipo", "")).lower())
+                if not ext:
+                    raise ValueError("logo deve ser PNG, JPG, SVG ou WebP")
+                try:
+                    conteudo = base64.b64decode(dados["logo_base64"], validate=True)
+                except ValueError:
+                    raise ValueError("arquivo de logo inválido")
+                if len(conteudo) > self.MAX_LOGO:
+                    raise ValueError("o logo deve ter no máximo 2 MB")
+                antigo = self.logo_arquivo()
+                nome = "logo-painel" + ext
+                cam = os.path.join(self._pasta_dados(), nome)
+                with open(cam + ".tmp", "wb") as f:
+                    f.write(conteudo)
+                os.replace(cam + ".tmp", cam)
+                if antigo and antigo != cam and os.path.basename(antigo).startswith("logo-painel"):
+                    try:
+                        os.remove(antigo)
+                    except OSError:
+                        pass
+                self.sup["logo"] = nome
+            self.persistir()
+        return self.aparencia()
+
     # --- persistência ------------------------------------------------
     def persistir(self):
         if not self.caminho:
@@ -1855,6 +1917,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
 
         def _corpo(self):
             n = int(self.headers.get("Content-Length") or 0)
+            if n > 4 * 1024 * 1024:
+                raise ValueError("requisição grande demais")
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
         def _rota(self, metodo):
@@ -1869,8 +1933,33 @@ def servidor_web(ger: Gerenciador, endereco: str):
             partes = caminho.strip("/").split("/")
             try:
                 if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
-                    return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__).encode(),
-                                      "text/html; charset=utf-8")
+                    titulo = html.escape(ger.aparencia()["titulo"])
+                    return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__)
+                                      .replace("__TITULO__", titulo).encode(), "text/html; charset=utf-8")
+                if metodo == "GET" and caminho == "/logo":
+                    cam = ger.logo_arquivo()
+                    if not cam:
+                        return self._resp(404, {"erro": "sem logo"})
+                    ext = os.path.splitext(cam)[1].lower()
+                    tipo = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                            ".svg": "image/svg+xml", ".webp": "image/webp"}.get(ext, "application/octet-stream")
+                    with open(cam, "rb") as f:
+                        corpo = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", tipo)
+                    self.send_header("Content-Length", str(len(corpo)))
+                    self.send_header("Cache-Control", "max-age=86400")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    # um SVG aberto direto não pode executar scripts no painel
+                    self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+                    self.end_headers()
+                    self.wfile.write(corpo)
+                    return
+                if caminho == "/api/aparencia":
+                    if metodo == "GET":
+                        return self._resp(200, ger.aparencia())
+                    if metodo == "PUT":
+                        return self._resp(200, ger.salvar_aparencia(self._corpo()))
                 if metodo == "GET" and caminho == "/status.json":
                     return self._resp(200, [{"nome": c["nome"], "id": c["id"],
                                              **{k: v for k, v in c["status"].items() if k != "historico"}}
@@ -1878,7 +1967,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                 if metodo == "GET" and caminho == "/api/info":
                     return self._resp(200, {"versao": __version__, "config": ger.caminho,
                                             "persistente": bool(ger.caminho), "tr101290": TR_ITENS,
-                                            "plataforma": platform.machine(), "dektec": DEKTEC_DISPONIVEL})
+                                            "plataforma": platform.machine(), "dektec": DEKTEC_DISPONIVEL,
+                                            "aparencia": ger.aparencia()})
                 if partes[:2] == ["api", "canais"]:
                     if len(partes) == 2:
                         if metodo == "GET":
@@ -2433,7 +2523,7 @@ def cmd_teste(args):
 PAINEL_HTML = r"""<!doctype html>
 <html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>asi2srt</title>
+<title>__TITULO__</title>
 <style>
 :root{--bg:#0e1116;--card:#161b22;--line:#2a313c;--txt:#e6edf3;--mut:#8b949e;--acc:#2f81f7;
 --ok:#3fb950;--warn:#d29922;--err:#f85149;--in:#0d1117}
@@ -2442,6 +2532,11 @@ font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);
 position:sticky;top:0;background:var(--bg);z-index:5}
 header h1{font-size:17px;margin:0;font-weight:650}header .v{color:var(--mut);font-size:12px}
+.marca{display:flex;align-items:center;gap:11px;min-width:0}.marca img{height:34px;max-width:160px;object-fit:contain;display:block}
+.marca .tx{display:flex;flex-direction:column;line-height:1.15;min-width:0}.marca h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.marca .v{font-size:11.5px}#bap{padding:6px 9px}
+.prev{display:flex;align-items:center;gap:12px;padding:10px;border:1px dashed var(--line);border-radius:10px;min-height:64px;background:var(--in)}
+.prev img{max-height:48px;max-width:220px;object-fit:contain}.prev span{color:var(--mut);font-size:12.5px}
 header .sp{flex:1}
 .resumo{display:flex;gap:18px;color:var(--mut);font-size:13px}.resumo b{color:var(--txt)}
 main{padding:20px;max-width:1400px;margin:auto}
@@ -2475,6 +2570,7 @@ main{padding:20px;max-width:1400px;margin:auto}
 .aban{background:#10233d;border:1px solid #1f4b85;color:#cfe3ff;padding:9px 12px;border-radius:9px;margin-bottom:12px;font-size:13px}
 #asess{width:auto;max-width:330px}a.btn{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:13px;text-decoration:none}
 a.btn:hover{border-color:#8b949e}
+.btnf{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:13px}.btnf:hover{border-color:#8b949e}
 .trp{display:flex;gap:10px;align-items:center;margin-top:7px;font-size:11.5px;color:var(--mut)}
 .trp .e{color:var(--err)}.trp .w{color:var(--warn)}.trp a{margin-left:auto;color:var(--acc);cursor:pointer;text-decoration:none}
 #vana{padding:16px 20px;max-width:1500px;margin:auto}
@@ -2584,9 +2680,17 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .srtl .g{padding:0 11px 10px}.srtl .g svg{width:100%;height:90px;display:block}.srtl .g .leg{font-size:11px;color:var(--mut);display:flex;gap:12px;margin-bottom:3px}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
-<header><h1>asi2srt</h1><span class="v">v__VERSAO__</span><span class="sp"></span>
+<header><div class="marca"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1><span class="v">asi2srt v__VERSAO__</span></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
-<button class="pri" id="novo">+ Novo canal</button></header>
+<button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button></header>
+<dialog id="dlgap"><form method="dialog" id="frmap">
+<div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db"><fieldset><legend>Nome do painel</legend><label>Nome<input name="titulo" maxlength="80" required></label></fieldset>
+<fieldset><legend>Logo</legend><div class="prev" id="apprev"></div>
+<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
+<button type="button" id="aprem" class="perigo">Remover logo</button></div>
+<p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset></div>
+<div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
@@ -2913,7 +3017,19 @@ document.addEventListener('click',async ev=>{const b=ev.target.closest('button')
 $('#dlglog').addEventListener('close',()=>logId=null);
 $('#novo').onclick=()=>abrir();
 
-api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
+function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title=ap.titulo;const im=$('#mlogo');
+ if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
+let apNovo=null,apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';apNovo=null;apRem=false;
+ $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
+$('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
+ const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
+  $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
+$('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim()};
+ if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
+ try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Aparência salva',1)}catch(e){toast(e.message)}};
+api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];marca(i.aparencia);render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
 atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(()=>{if(!(ana&&ana.salvo&&sessSel!=null))carregarAna()},1000);setInterval(carregarSess,10000);rota();
 </script></body></html>
 """
