@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.11.0"
+__version__ = "2.11.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1710,7 +1710,13 @@ class Gerenciador:
 
     def logo_arquivo(self):
         nome = self.sup.get("logo") or ""
-        if not nome:
+        if nome == "-":          # removido de propósito pelo painel
+            return None
+        if not nome:             # padrão: logo-painel.* junto da configuração (o instalador coloca lá)
+            for ext in (".png", ".svg", ".webp", ".jpg"):
+                cam = os.path.join(self._pasta_dados(), "logo-painel" + ext)
+                if os.path.isfile(cam):
+                    return cam
             return None
         cam = nome if os.path.isabs(nome) else os.path.join(self._pasta_dados(), nome)
         return cam if os.path.isfile(cam) else None
@@ -1728,7 +1734,7 @@ class Gerenciador:
             self.sup["titulo"] = titulo
             if dados.get("remover_logo"):
                 antigo = self.logo_arquivo()
-                self.sup["logo"] = ""
+                self.sup["logo"] = "-"
                 if antigo and os.path.basename(antigo).startswith("logo-painel"):
                     try:
                         os.remove(antigo)
@@ -2532,7 +2538,7 @@ font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);
 position:sticky;top:0;background:var(--bg);z-index:5}
 header h1{font-size:17px;margin:0;font-weight:650}header .v{color:var(--mut);font-size:12px}
-.marca{display:flex;align-items:center;gap:11px;min-width:0}.marca img{height:34px;max-width:160px;object-fit:contain;display:block}
+.marca{display:flex;align-items:center;gap:12px;min-width:0}.marca img{height:38px;max-width:160px;object-fit:contain;display:block}
 .marca .tx{display:flex;flex-direction:column;line-height:1.15;min-width:0}.marca h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .marca .v{font-size:11.5px}#bap{padding:6px 9px}
 .prev{display:flex;align-items:center;gap:12px;padding:10px;border:1px dashed var(--line);border-radius:10px;min-height:64px;background:var(--in)}
@@ -2680,7 +2686,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .srtl .g{padding:0 11px 10px}.srtl .g svg{width:100%;height:90px;display:block}.srtl .g .leg{font-size:11px;color:var(--mut);display:flex;gap:12px;margin-bottom:3px}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
-<header><div class="marca"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1><span class="v">asi2srt v__VERSAO__</span></div></div><span class="sp"></span>
+<header><div class="marca" title="asi2srt v__VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
 <button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
@@ -2689,7 +2695,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <fieldset><legend>Logo</legend><div class="prev" id="apprev"></div>
 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
 <button type="button" id="aprem" class="perigo">Remover logo</button></div>
-<p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset></div>
+<p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
+<p class="msg" style="margin:4px 0 0">Sistema: asi2srt v__VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>

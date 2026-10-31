@@ -59,6 +59,17 @@ if ! asi2srt instalar-dektec --se-houver-placa; then
   DEKTEC_PENDENTE=1
 fi
 
+echo "==> Logo do painel"
+mkdir -p /etc/asi2srt
+if ls /etc/asi2srt/logo-painel.* >/dev/null 2>&1; then
+  echo "logo já configurado"
+elif [ -f "$CONFIG" ] && grep -qE "^\s*\"?logo\"?:\s*['\"]?-['\"]?\s*,?\s*$" "$CONFIG"; then
+  echo "logo removido pelo painel - mantido sem logo"
+else
+  curl -fsSL -o /etc/asi2srt/logo-painel.png "${URL%/*}/marca/logo-tv-cultura.png" && echo "logo instalado" \
+    || echo "aviso: não foi possível baixar o logo (pode ser enviado depois pelo botão ⚙ do painel)"
+fi
+
 echo "==> Serviço"
 asi2srt instalar-servico -c "$CONFIG" >/dev/null
 if [ -n "${PORTA:-}" ]; then

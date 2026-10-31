@@ -151,7 +151,8 @@ Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive
 
 **Nome e logo:** o painel se chama **Engenharia TV Cultura** (configurável). No botão **⚙ (Aparência)**
 dá para trocar o nome e enviar o logo (PNG, JPG, SVG ou WebP, até 2 MB). O logo fica salvo no
-servidor junto da configuração (`/etc/asi2srt/logo-painel.*`) e aparece no topo e na aba do navegador.
+servidor junto da configuração (`/etc/asi2srt/logo-painel.*`) e aparece no topo e na aba do navegador. O instalador já
+coloca o logo padrão (`marca/logo-tv-cultura.png`); se ele for removido pelo painel, as atualizações não o recolocam.
 
 ## Rotas e saúde do SRT
 
@@ -316,7 +317,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.11.0 && git push origin v2.11.0
+git tag v2.11.1 && git push origin v2.11.1
 ```
 
 ## Licença

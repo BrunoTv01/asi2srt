@@ -742,3 +742,14 @@ def test_aparencia_nome_e_logo(gateway):
     cod, ap = _req(base, "PUT", "/api/aparencia", {"remover_logo": True})
     assert ap["logo"] is False and not os.path.exists(os.path.join(os.path.dirname(cfg), "logo-painel.png"))
     assert _req(base, "GET", "/logo")[0] == 404
+    assert json.load(open(cfg))["supervisor"]["logo"] == "-"
+
+
+def test_logo_padrao_junto_da_configuracao():
+    d = tempfile.mkdtemp()
+    cfg = os.path.join(d, "config.json")
+    open(os.path.join(d, "logo-painel.png"), "wb").write(b"\x89PNG")
+    g = a.Gerenciador({"canais": [], "supervisor": {}}, cfg)
+    assert g.logo_arquivo().endswith("logo-painel.png") and g.aparencia()["logo"] is True
+    g.sup["logo"] = "-"
+    assert g.logo_arquivo() is None
