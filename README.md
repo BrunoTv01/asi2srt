@@ -317,7 +317,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.11.1 && git push origin v2.11.1
+git tag v2.11.2 && git push origin v2.11.2
 ```
 
 ## Licença

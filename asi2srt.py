@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.11.1"
+__version__ = "2.11.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1917,7 +1917,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
 
         def _negar(self):
             self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="asi2srt"')
+            realm = re.sub(r'[^\w À-ÿ.-]', '', ger.aparencia()["titulo"]) or "Painel"
+            self.send_header("WWW-Authenticate", f'Basic realm="{realm}", charset="UTF-8"')
             self.send_header("Content-Length", "0")
             self.end_headers()
 
@@ -2015,7 +2016,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                             if q.get("baixar"):
                                 nome = re.sub(r"[^\w.-]+", "_", ger.defs[cid]["nome"])
                                 data = time.strftime("%Y%m%d-%H%M", time.localtime(dados["periodo"]["inicio"]))
-                                return self._resp(200, dados, baixar=f"asi2srt-{nome}-{data}.json")
+                                return self._resp(200, dados, baixar=f"relatorio-{nome}-{data}.json")
                             return self._resp(200, dados)
                         if metodo == "GET" and acao == "comando":
                             c = normalizar_canal(ger.defs[cid])
@@ -2686,7 +2687,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .srtl .g{padding:0 11px 10px}.srtl .g svg{width:100%;height:90px;display:block}.srtl .g .leg{font-size:11px;color:var(--mut);display:flex;gap:12px;margin-bottom:3px}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
-<header><div class="marca" title="asi2srt v__VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
+<header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
 <button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
@@ -2696,7 +2697,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
 <button type="button" id="aprem" class="perigo">Remover logo</button></div>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
-<p class="msg" style="margin:4px 0 0">Sistema: asi2srt v__VERSAO__</p></div>
+<p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>
@@ -3036,7 +3037,7 @@ $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o 
 $('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim()};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Aparência salva',1)}catch(e){toast(e.message)}};
-api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];marca(i.aparencia);render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Use <code>asi2srt rodar -c arquivo.yaml</code> para persistir.</div>'}).catch(()=>{});
+api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];marca(i.aparencia);render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Inicie o serviço com um arquivo de configuração para salvar as alterações.</div>'}).catch(()=>{});
 atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(()=>{if(!(ana&&ana.salvo&&sessSel!=null))carregarAna()},1000);setInterval(carregarSess,10000);rota();
 </script></body></html>
 """
