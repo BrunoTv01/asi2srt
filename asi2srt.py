@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.13.0"
+__version__ = "2.13.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1132,7 +1132,26 @@ class AnalisadorTS:
                 "pids_ausentes": [f"0x{p:04X}" for p in ausentes],
                 "pacotes": self.pacotes,
                 "desde": self.desde,
+                "nao_aplicavel": self._nao_aplicavel(agora),
             }
+
+    def _nao_aplicavel(self, agora):
+        """Indicadores que não se aplicam a este TS (mesma regra da análise completa)."""
+        na = set()
+        pcr_pids = {p["pcr_pid"] for p in self.programas.values()}
+        if self.taxa.get(0x1FFF, 0) <= 0 or not pcr_pids:
+            na.add("pcr_acc")
+        if not pcr_pids:
+            na |= {"pcr_rep", "pcr_disc"}
+        if not any(v[2] in ("video", "audio") for v in self.es_pids.values()):
+            na.add("pts")
+        if self.ultimo_scr is None and self.cat_visto is None and not self.cont["cat"]:
+            na.add("cat")
+        for chave in self.LIM_SI:
+            if chave not in self.si_visto and not self.cont[chave]:
+                na.add(chave)
+        recentes = {t for t, q in self.ultimo_erro.items() if agora - q < self.RECENTE_S}
+        return sorted(na - recentes)
 
     def servicos_resumo(self):
         """[{numero, nome, video}] dos serviços presentes na entrada (PAT/PMT/SDT)."""
@@ -2949,7 +2968,11 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .saiem{font-size:12px;color:var(--mut);padding:6px 11px;border-bottom:1px solid var(--line)}.saiem b{color:var(--txt);font-weight:500}
 .servsel{display:flex;flex-wrap:wrap;gap:6px 14px;margin:2px 0 6px}
 @media(max-width:760px){.svs{padding-left:0}.pv{width:calc(50% - 5px)}}
-.ind{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 14px;border-bottom:1px solid #20262f;background:#13181f}
+.ind{display:flex;flex-direction:column;gap:6px;padding:8px 14px;border-bottom:1px solid #20262f;background:#13181f}
+.ig{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.igl{font-size:10.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;width:92px;flex:none}
+.igl.w{color:#f2cc60}.igl.e{color:#ff8f8a}
+.ind .sub{margin-left:0}
 .ic{display:inline-flex;align-items:center;gap:6px;font-size:12px;background:var(--in);border:1px solid var(--line);border-radius:7px;padding:3px 9px;white-space:nowrap}
 .ic i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 5px var(--ok)}
 .ic b{font-variant-numeric:tabular-nums;margin-left:2px}
@@ -3064,7 +3087,7 @@ const TR=[['sync_loss','TS sync loss','1.1 Perda de sincronismo: 2+ sync bytes e
  ['pid','PID','1.6 PID citado na PMT ausente por mais de 5 s']];
 const TR2=[['transport','Transport'],['crc','CRC'],['pcr_rep','PCR repetition'],['pcr_disc','PCR discontinuity'],['pcr_acc','PCR accuracy'],['pts','PTS'],['cat','CAT']];
 const CURTO={};
-function lampada(t,k,n,d){const v=t.contadores[k]||0,c=t.recentes.includes(k)?'e':v?'w':(t.sinal?'':'x');
+function lampada(t,k,n,d){const v=t.contadores[k]||0,na=(t.nao_aplicavel||[]).includes(k)&&!v,c=t.recentes.includes(k)?'e':v?'w':(t.sinal&&!na?'':'x');
  const nome=(TRI.find(x=>x[0]===k)||[])[3]||n;
  return`<div class="lamp ${c}" title="${esc(nome+' — '+(d||''))}"><i></i><small>${n}</small><b>${v.toLocaleString('pt-BR')}</b></div>`}
 function tr(s){const t=s.tr101290;if(!t)return'';
@@ -3121,7 +3144,8 @@ function chipsSRT(e){if(e.estado!=='conectado')return'';const lat=e.latencia_ms|
  const cp=e.perda_pct>1?'e':e.perda_pct>0?'w':'',cr=lat&&e.rtt_ms>lat/4?'w':'';
  return`<span class="chip ${cr}"><small>RTT</small>${e.rtt_ms} ms</span><span class="chip ${cp}"><small>Perda</small>${(e.perda_pct||0).toFixed(2)}%</span>
  <span class="chip ${e.retransmitidos?'w':''}"><small>Retrans</small>${e.retransmitidos}/s</span><span class="chip"><small>Taxa</small>${(e.taxa_mbps||0).toFixed(2)} Mb/s</span>
- ${e.banda_mbps?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
+ ${e.papel==='entrada'?`<span class="chip ${e.descartados?'e':''}" title="pacotes que o SRT não conseguiu recuperar a tempo (viram erros no TS)"><small>Não recup.</small>${e.descartados}/s</span>`:''}
+ ${e.banda_mbps&&e.papel!=='entrada'?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
 const msgCurta=m=>String(m||'').replace(/^\*\s*(Error|Warning):\s*/i,'').replace(/^srt:\s*/,'').replace(/^\[saída \d+\]\s*/,'').slice(0,90);
 function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
  const falha=ativo&&ps&&ps.estado!=='rodando'&&ps.ultima_msg&&(!e||e.estado!=='conectado')?`<span class="chip w" title="${esc(ps.ultima_msg)}">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` · ${ps.reinicios} tentativa(s)`:''}</span>`:'';
@@ -3156,13 +3180,17 @@ function servRotulo(x,lista){const sv=x.servicos||(x.programa?[x.programa]:[]);i
  return sv.map(v=>{const n=(lista||[]).find(s=>String(s.numero)===String(v)||s.nome.toLowerCase().replace(/\s/g,'')===String(v).toLowerCase().replace(/\s/g,''));
   return n?{numero:n.numero,nome:n.nome,video:n.video}:{numero:v,nome:String(v),video:false}})}
 const IND=[['sync_loss','TS sync loss'],['cc','Continuity count'],['pcr_rep','PCR repetition'],['pcr_disc','PCR discontinuity'],['pts','PTS error']];
-function indicadores(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont)return'';const rec=t?t.recentes||[]:[];
- const desc=Object.fromEntries(TRI.map(x=>[x[0],x[2]+' '+x[4]]));
- return`<div class="ind">${IND.map(([k,n])=>{const v=cont[k]||0,cl=rec.includes(k)?'e':v?'w':(t&&!t.sinal)?'x':'';
-  return`<span class="ic ${cl}" title="${esc(desc[k]||n)}"><i></i>${n}<b>${v.toLocaleString('pt-BR')}</b></span>`}).join('')}
- <span class="sub">${t?(t.sinal?'sessão atual':'sem sinal'):'última sessão'}</span></div>`}
+const NOME_IND={sync_loss:'TS sync loss',sync_byte:'Sync byte',pat:'PAT',cc:'Continuity count',pmt:'PMT',pid:'PID',
+ transport:'Transport',crc:'CRC',pcr_rep:'PCR repetition',pcr_disc:'PCR discontinuity',pcr_acc:'PCR accuracy',pts:'PTS',cat:'CAT',
+ nit:'NIT',unref:'PID não referenciado',sdt:'SDT',eit:'EIT',tdt:'TDT'};
+function indicadores(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont||!TRI.length)return'';const rec=t?t.recentes||[]:[],na=t?t.nao_aplicavel||[]:[];
+ const grupo=p=>{const itens=TRI.filter(x=>x[1]===p),soma=itens.reduce((a,x)=>a+(cont[x[0]]||0),0),err=itens.some(x=>rec.includes(x[0]));
+  return`<div class="ig"><span class="igl ${err?'e':soma?'w':''}">Prioridade ${p}</span>${itens.map(([k,,cod,nome,desc])=>{const v=cont[k]||0,
+   cl=rec.includes(k)?'e':v?'w':(t&&!t.sinal)||na.includes(k)?'x':'';
+   return`<span class="ic ${cl}" title="${esc(cod+' '+nome+' — '+desc)}${na.includes(k)&&!v?' (não se aplica a este TS)':''}"><i></i>${esc(NOME_IND[k]||nome)}<b>${na.includes(k)&&!v?'n/a':v.toLocaleString('pt-BR')}</b></span>`}).join('')}</div>`};
+ return`<div class="ind">${grupo(1)}${grupo(2)}${grupo(3)}<span class="sub">${t?(t.sinal?'sessão atual':'sem sinal'):'última sessão'}</span></div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
- const dots=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
+ const dots='';const _dotsAntigo=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
   :r?`<span class="dots">${TR.map(([k,n])=>`<i class="${(r.contadores[k]||0)?'w':''}" title="${esc(n)}: ${r.contadores[k]||0}"></i>`).join('')}<small>última sessão</small></span>`:'';
  const acs=(ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻</button><button data-a="analise" data-id="${c.id}">Análise</button>`
@@ -3333,7 +3361,8 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
    k+=K('Taxa',taxa.toFixed(2)+' Mb/s')+K('No ar há',dur(uptime));
    if(ps)k+=K('Enviado nesta conexão',fmtB(ps.enviado_conexao_bytes));
    if(srtOk)k+=K('RTT',e.rtt_ms+' ms')+K('Perda agora',(e.perda_pct||0).toFixed(2)+'%',e.perda_pct>1?'e':e.perda_pct>0?'w':'')
-    +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps?K('Banda do link',e.banda_mbps+' Mb/s'):'');
+    +K('Retrans/s',e.retransmitidos,e.retransmitidos?'w':'')+K('Buffer',e.buffer_ms+' ms')+K('Latência',e.latencia_ms+' ms')+(e.banda_mbps&&e.papel!=='entrada'?K('Banda do link',e.banda_mbps+' Mb/s'):'')
+    +(e.papel==='entrada'?K('Não recuperados/s',e.descartados,e.descartados?'e':''):'');
    if(info.velocidade)k+=K('Velocidade',esc(info.velocidade),/^0\.|^0x/.test(info.velocidade)?'w':'')}
   if(ps)k+=K('Enviado na sessão',fmtB(ps.enviado_bytes))+K('Tempo no ar',dur(ps.tempo_no_ar_s))+K('Conexões',conx)+K('Quedas',ps.reinicios,ps.reinicios?'w':'');
   if(e)k+=K('RTT médio / máx',e.rtt_medio_ms+' / '+e.rtt_max_ms+' ms')+K('Pacotes',(tt.pacotes||0).toLocaleString('pt-BR'))
