@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.12.0"
+__version__ = "2.12.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1293,6 +1293,9 @@ class EstatSRT:
 # Saídas independentes e distribuidor local
 # ======================================================================
 RE_SRT_PEER_SAIDA = re.compile(r"srt: connected to (\S+)")
+# mensagens informativas do TSDuck que não indicam problema
+RE_TSP_AVISO_NORMAL = re.compile(r"unknown initial input bitrate|srt: connected (from|to)|^\s*\*\s*srt: starting|"
+                                 r"no input bitrate|bitrate is now|user interrupt")
 # avisos normais do ffmpeg ao entrar no meio de um fluxo ao vivo (não são falhas)
 RE_FFMPEG_AVISO_NORMAL = re.compile(r"no frame!|non-existing PPS|decode_slice_header error|"
                                     r"Last message repeated|Packet corrupt|PES packet size mismatch|"
@@ -1737,7 +1740,8 @@ class Canal(threading.Thread):
                 self._registrar(logging.WARNING, linha)
             else:
                 self._registrar(logging.INFO, linha)
-            self._set(ultima_msg=linha[-300:])
+            if not RE_TSP_AVISO_NORMAL.search(linha):
+                self._set(ultima_msg=linha[-300:])
 
     def run(self):
         espera_min = self.sup.get("reinicio_min_s", 2)
@@ -2750,6 +2754,9 @@ main{padding:20px;max-width:1400px;margin:auto}
 .met b{font-size:15px;font-variant-numeric:tabular-nums}.met .big{font-size:22px}
 .spark{width:100%;height:38px;display:block}.spark polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}
 .spark .area{fill:var(--acc);opacity:.12;stroke:none}
+.card .lamps{grid-template-columns:repeat(2,1fr)}.card .lamp{padding:5px 8px}
+.trs{font-size:10.5px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;margin:7px 0 4px}.trh+.trs{margin-top:0}
+.card .svs{padding:0;gap:8px}.card .pv{width:calc(50% - 4px)}
 .tr{border:1px solid var(--line);border-radius:9px;padding:8px;background:#11161d}
 .trh{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--mut);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
 .trh .semsinal{color:var(--err);font-weight:600}
@@ -2970,15 +2977,22 @@ const TR=[['sync_loss','TS sync loss','1.1 Perda de sincronismo: 2+ sync bytes e
  ['cc','Continuity','1.4 Contador de continuidade fora de ordem, perdido ou duplicado'],
  ['pmt','PMT','1.5 PMT ausente por mais de 0,5 s, table_id errado ou embaralhada'],
  ['pid','PID','1.6 PID citado na PMT ausente por mais de 5 s']];
+const TR2=[['transport','Transport'],['crc','CRC'],['pcr_rep','PCR repetition'],['pcr_disc','PCR discontinuity'],['pcr_acc','PCR accuracy'],['pts','PTS'],['cat','CAT']];
+const CURTO={};
+function lampada(t,k,n,d){const v=t.contadores[k]||0,c=t.recentes.includes(k)?'e':v?'w':(t.sinal?'':'x');
+ const nome=(TRI.find(x=>x[0]===k)||[])[3]||n;
+ return`<div class="lamp ${c}" title="${esc(nome+' — '+(d||''))}"><i></i><small>${n}</small><b>${v.toLocaleString('pt-BR')}</b></div>`}
 function tr(s){const t=s.tr101290;if(!t)return'';
  const info=t.sinal?`${t.programas} prog · ${t.pids_referenciados} PIDs`:'<span class="semsinal">sem sinal</span>';
- return`<div class="tr"><div class="trh"><span>TR 101 290 · Prioridade 1</span><span>${info}</span></div><div class="lamps">
- ${TR.map(([k,n,d])=>{const v=t.contadores[k]||0,c=t.recentes.includes(k)?'e':v?'w':(t.sinal?'':'x');
-  return`<div class="lamp ${c}" title="${esc(d)}"><i></i><small>${n}</small><b>${v}</b></div>`}).join('')}</div>
+ const desc=Object.fromEntries(TRI.map(x=>[x[0],x[2]+' '+x[4]]));
+ return`<div class="tr"><div class="trh"><span>TR 101 290</span><span>${info}</span></div>
+ <div class="trs">Prioridade 1</div><div class="lamps">
+ ${TR.map(([k,n,d])=>lampada(t,k,CURTO[k]||n,d)).join('')}</div>
+ <div class="trs">Prioridade 2</div><div class="lamps">${TR2.map(([k,n])=>lampada(t,k,n,desc[k])).join('')}</div>
  ${t.pids_ausentes.length?`<div class="aus">PIDs ausentes: ${t.pids_ausentes.map(esc).join(', ')}</div>`:''}
  ${TRI.length?(()=>{const soma=p=>TRI.filter(x=>x[1]===p).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),
   rec=p=>TRI.some(x=>x[1]===p&&t.recentes.includes(x[0])),cl=p=>rec(p)?'e':soma(p)?'w':'';
-  return`<div class="trp"><span class="${cl(2)}">P2 · ${soma(2)}</span><span class="${cl(3)}">P3 · ${soma(3)}</span><a data-ana="${s._id}">Análise completa →</a></div>`})():''}</div>`}
+  return`<div class="trp"><span class="${cl(3)}">Prioridade 3 · ${soma(3)}</span><a data-ana="${s._id}">Análise completa →</a></div>`})():''}</div>`}
 const fmtDH=s=>new Date(s*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
 const fmtH=s=>new Date(s*1000).toLocaleTimeString('pt-BR');
 const MOTIVO={parado:'parada',encerrado:'serviço desligado',interrompido:'interrompida','em andamento':'em andamento'};
@@ -2994,7 +3008,9 @@ function relCard(c){const r=c.ultimo_relatorio,n=r.contadores;
 function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
- <div><span class="l">Saídas</span>${c.saidas.length?c.saidas.map(x=>`<span class="tag">${esc(resS(x))}</span>`).join(''):'<span class="tag" style="color:var(--mut)">somente análise</span>'}</div></div>
+ <div><span class="l">Saídas</span>${c.saidas.length?c.saidas.map(x=>{const r=servRotulo(x,s.servicos);return`<span class="tag">${esc(resS(x))}${r?' · '+esc(r.map(q=>q.nome).join(', ')):''}</span>`}).join(''):'<span class="tag" style="color:var(--mut)">somente análise</span>'}</div></div>
+ ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
+   return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}
  ${!ativo&&c.ultimo_relatorio?relCard(c):`${spark(s.historico)}
  <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>`}
