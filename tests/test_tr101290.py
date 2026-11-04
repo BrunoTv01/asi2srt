@@ -315,3 +315,73 @@ def test_desempenho_com_pcr_e_psi():
     gasto = time.perf_counter() - t0
     taxa_mbps = n_pacotes * 1504 / gasto / 1e6
     assert taxa_mbps > 60, f"processa só {taxa_mbps:.0f} Mb/s"
+
+
+# ---------------- CBR x VBR ----------------
+def test_classificar_taxa():
+    from asi2srt import classificar_taxa
+    assert classificar_taxa([15_000_000] * 5, 2)["modo"] is None              # poucas amostras: medindo
+    cbr = classificar_taxa([15_000_000 + (i % 3) * 40_000 for i in range(30)], 2)
+    assert cbr["modo"] == "CBR" and cbr["variacao_pct"] < 1
+    vbr = classificar_taxa([5_000_000, 7_500_000, 3_800_000, 6_200_000, 4_100_000] * 6, 2)
+    assert vbr["modo"] == "VBR" and vbr["variacao_pct"] > 20
+    assert classificar_taxa([0] * 20 + [15_000_000] * 10, 2)["modo"] == "CBR"   # ignora segundos sem sinal
+
+
+def _alimentar(an, g, pacotes_por_segundo):
+    """Um 'segundo' por item da lista, com N pacotes de vídeo (além de PAT/PMT)."""
+    for seg, n in enumerate(pacotes_por_segundo):
+        for passo in range(10):
+            t = seg + passo / 10
+            an.processar(g.psi(0, pat()) + g.psi(PMT_PID, pmt()) + b"".join(g.pkt(VIDEO) for _ in range(n // 10))
+                         + g.pkt(AUDIO), t)
+            an.verificar(t)
+
+
+def test_ts_cbr_e_servico_vbr():
+    import random
+    random.seed(1)
+    an, g = AnalisadorTS(), Gerador()
+    _alimentar(an, g, [3000] * 25)                                             # taxa constante
+    assert an.taxas()["modo_ts"]["modo"] == "CBR"
+    an2, g2 = AnalisadorTS(), Gerador()
+    _alimentar(an2, g2, [random.choice([1500, 3000, 4500, 2200]) for _ in range(25)])   # taxa variável
+    assert an2.taxas()["modo_ts"]["modo"] == "VBR"
+    serv = an2.servicos_resumo()[0]
+    assert serv["modo"]["modo"] == "VBR" and serv["modo"]["variacao_pct"] > 5
+    assert an2.analise(25)["resumo"]["modo_taxa"]["modo"] == "VBR"
+
+
+def test_cbr_pelo_pcr_mesmo_com_chegada_irregular():
+    """TS CBR (mesmo número de pacotes entre PCRs) entregue em rajadas irregulares:
+    pelo PCR continua CBR. TS VBR (número de pacotes variando) é VBR."""
+    import random
+    random.seed(3)
+    clk = 27_000_000
+
+    def fluxo(an, g, pacotes):
+        pcr = 0
+        rajada, t = [], 0.0
+        for k, n in enumerate(pacotes):              # um intervalo de PCR de 20 ms por item
+            pcr += clk // 50
+            bloco = [pkt_pcr(g, VIDEO, pcr)] + [g.pkt(VIDEO) for _ in range(n)] + [g.pkt(0x1FFF) for _ in range(5)]
+            if k % 50 == 0:
+                bloco = [g.psi(0, pat()), g.psi(PMT_PID, pmt())] + bloco
+            rajada += bloco
+            if random.random() < 0.3:                # chegada em rajadas em horários irregulares
+                t += random.uniform(0.05, 0.6)
+                an.processar(b"".join(rajada), t)
+                an.verificar(t)
+                rajada = []
+        an.processar(b"".join(rajada), t + 0.1)
+        an.verificar(t + 1.1)
+
+    an, g = AnalisadorTS(), Gerador()
+    fluxo(an, g, [180] * 1500)
+    m = an.taxas()["modo_ts"]
+    assert m["fonte"] == "PCR" and m["modo"] == "CBR", m
+    assert an.servicos_resumo()[0]["modo"]["modo"] == "CBR"
+    an2, g2 = AnalisadorTS(), Gerador()
+    fluxo(an2, g2, [random.choice([60, 120, 180, 260]) for _ in range(1500)])
+    m2 = an2.taxas()["modo_ts"]
+    assert m2["fonte"] == "PCR" and m2["modo"] == "VBR", m2

@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.13.2"
+__version__ = "2.14.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -644,6 +644,19 @@ TIPOS_SERVICO = {
     0x19: "TV HD H.264", 0x1F: "TV HEVC", 0xA1: "TV 1-seg", 0xC0: "Dados ISDB",
 }
 
+def classificar_taxa(valores, limite_cbr_pct, janela=30, minimo=8):
+    """CBR ou VBR a partir das taxas medidas a cada segundo (bit/s).
+    Usa o coeficiente de variação (desvio padrão / média) dos últimos 'janela' segundos com sinal."""
+    v = [x for x in list(valores)[-janela:] if x > 0]
+    if len(v) < minimo:
+        return {"modo": None, "variacao_pct": None, "amostras": len(v)}
+    media = sum(v) / len(v)
+    desvio = (sum((x - media) ** 2 for x in v) / len(v)) ** 0.5
+    cv = 100.0 * desvio / media if media else 0.0
+    return {"modo": "CBR" if cv < limite_cbr_pct else "VBR", "variacao_pct": round(cv, 1),
+            "min": int(min(v)), "max": int(max(v)), "media": int(media), "amostras": len(v)}
+
+
 _INV_BITS = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 
 
@@ -671,6 +684,10 @@ def _texto_dvb(b: bytes) -> str:
     except UnicodeDecodeError:
         s = b.decode("latin-1")
     return "".join(ch for ch in s if ch >= " ").strip()
+
+
+LIMITE_CBR_TS_PCT = 2.0       # TS: taxa total variando menos que isso = CBR
+LIMITE_CBR_SERVICO_PCT = 3.0  # serviço: encoder CBR de verdade fica abaixo de ~3% (janelas de 1 s, pelo PCR)
 
 
 class AnalisadorTS:
@@ -732,6 +749,16 @@ class AnalisadorTS:
         self.taxa = {}
         self.taxa_total = 0
         self.hist_total = collections.deque(maxlen=300)
+        self.hist_serv = {}         # número do programa -> deque das taxas por segundo (por chegada)
+        # taxa medida pelo relógio do próprio fluxo (PCR): não depende de quando os pacotes chegam
+        self.pid_prog = {}          # pid -> número do programa
+        self.pcr_prog = {}          # pid de PCR -> número do programa
+        self.cnt_prog = {}          # número do programa -> pacotes contados
+        self.pcr_cnt = {}           # pid de PCR -> cnt_prog no último PCR
+        self.acc_ts = {}            # pid de PCR -> taxas do TS em cada intervalo de PCR (1 s corrente)
+        self.acc_prog = {}          # programa -> taxas do programa em cada intervalo de PCR
+        self.hist_pcr_ts = collections.deque(maxlen=300)
+        self.hist_serv_pcr = {}
         self.emb = {}               # pid -> último pacote embaralhado?
         self.ultimo_scr = None
         # PCR
@@ -778,6 +805,7 @@ class AnalisadorTS:
         idx0 = self.pacotes
         self.pacotes += n
         npid, visto, cc_est, es_pids, pmt_pids = self.n_pid, self.visto, self.cc, self.es_pids, self.pmt_pids
+        pid_prog, cnt_prog = self.pid_prog, self.cnt_prog
         for k in range(n):
             i = k * 188
             if d[i] != 0x47:
@@ -799,6 +827,9 @@ class AnalisadorTS:
             pid = ((b1 & 0x1F) << 8) | d[i + 2]
             npid[pid] = npid.get(pid, 0) + 1
             visto[pid] = agora
+            pp = pid_prog.get(pid)
+            if pp is not None:
+                cnt_prog[pp] = cnt_prog.get(pp, 0) + 1
             if pid == 0x1FFF:
                 continue
             if b1 & 0x80:
@@ -850,15 +881,26 @@ class AnalisadorTS:
         st = self.pcr.get(pid)
         if st is None or disc:
             self.pcr[pid] = [pcr, idx, pcr, idx, st[4] if st and not disc else None]
+            num = self.pcr_prog.get(pid)
+            self.pcr_cnt[pid] = self.cnt_prog.get(num, 0) if num is not None else None
             return
         ult, uidx, apcr, aidx, taxa = st
         dif = pcr - ult
+        num = self.pcr_prog.get(pid)
+        c_agora = self.cnt_prog.get(num, 0) if num is not None else None
+        c_ant = self.pcr_cnt.get(pid)
+        self.pcr_cnt[pid] = c_agora
         if dif < 0 or dif > self.PCR_DISC:
             self._erro("pcr_disc", agora)
             self.pcr[pid] = [pcr, idx, pcr, idx, None]
             return
         if dif > self.PCR_REP:
             self._erro("pcr_rep", agora)
+        if dif > 0 and idx > uidx:
+            dt = dif / 27_000_000
+            self.acc_ts.setdefault(pid, []).append((idx - uidx) * 1504 / dt)
+            if c_agora is not None and c_ant is not None and c_agora >= c_ant:
+                self.acc_prog.setdefault(num, []).append((c_agora - c_ant) * 1504 / dt)
         if dif > jan[0]:
             jan[0] = dif
         if taxa:
@@ -984,6 +1026,7 @@ class AnalisadorTS:
             self.pmt_pids = novos
             self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] in novos}
             self.programas = {k: v for k, v in self.programas.items() if k in novos}
+            self._mapear_programas()
 
     def _pmt(self, pid, sec, agora):
         if sec[0] != 0x02:
@@ -1018,6 +1061,22 @@ class AnalisadorTS:
         self.es_pids.update(es)
         self.programas[pid] = {"pcr_pid": pcr_pid, "ca": ca}
         self.ca_pids |= ca
+        self._mapear_programas()
+
+    def _mapear_programas(self):
+        pp, pcr = {}, {}
+        for ppid, num in self.pmt_pids.items():
+            pp[ppid] = num
+            c = (self.programas.get(ppid) or {}).get("pcr_pid")
+            if c is not None and c != 0x1FFF:
+                pcr[c] = num
+                pp.setdefault(c, num)
+        for e, v in self.es_pids.items():
+            if v[0] in self.pmt_pids:
+                pp[e] = self.pmt_pids[v[0]]
+        self.pid_prog.clear()
+        self.pid_prog.update(pp)
+        self.pcr_prog = pcr
 
     def _sdt(self, sec):
         if len(sec) < 15:
@@ -1058,6 +1117,20 @@ class AnalisadorTS:
             self.taxa = {p: (n - self.n_ant.get(p, 0)) * 1504 / dt for p, n in self.n_pid.items()}
             self.taxa_total = sum(self.taxa.values())
             self.hist_total.append(int(self.taxa_total))
+            if self.acc_ts:
+                ref = max(self.acc_ts, key=lambda p: len(self.acc_ts[p]))
+                v = self.acc_ts[ref]
+                self.hist_pcr_ts.append(int(sum(v) / len(v)))
+            for num, v in self.acc_prog.items():
+                self.hist_serv_pcr.setdefault(num, collections.deque(maxlen=60)).append(int(sum(v) / len(v)))
+            self.acc_ts, self.acc_prog = {}, {}
+            for ppid, num in self.pmt_pids.items():
+                pids = {ppid} | {e for e, v in self.es_pids.items() if v[0] == ppid}
+                pcr = (self.programas.get(ppid) or {}).get("pcr_pid")
+                if pcr is not None and pcr != 0x1FFF:
+                    pids.add(pcr)
+                self.hist_serv.setdefault(num, collections.deque(maxlen=60)).append(
+                    int(sum(self.taxa.get(p, 0) for p in pids)))
             if self.taxa_total > 0 and self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL:
                 e = self.est_taxa
                 e[0] += 1
@@ -1166,17 +1239,31 @@ class AnalisadorTS:
                     pids.add(pcr)
                 out.append({"numero": num, "nome": sdt[0] if sdt and sdt[0] else f"Programa {num}",
                             "video": any(v[0] == ppid and v[2] == "video" for v in self.es_pids.values()),
-                            "taxa": int(sum(self.taxa.get(p, 0) for p in pids)) if fluindo else 0})
+                            "taxa": int(sum(self.taxa.get(p, 0) for p in pids)) if fluindo else 0,
+                            "modo": self._modo_serv(num)})
             return out
 
+    def _modo_ts(self):
+        if len(self.hist_pcr_ts) >= 8:
+            return {**classificar_taxa(self.hist_pcr_ts, LIMITE_CBR_TS_PCT), "fonte": "PCR"}
+        return {**classificar_taxa(self.hist_total, LIMITE_CBR_TS_PCT), "fonte": "chegada"}
+
+    def _modo_serv(self, num):
+        h = self.hist_serv_pcr.get(num)
+        if h and len(h) >= 8:
+            return {**classificar_taxa(h, LIMITE_CBR_SERVICO_PCT), "fonte": "PCR"}
+        return {**classificar_taxa(self.hist_serv.get(num, ()), LIMITE_CBR_SERVICO_PCT), "fonte": "chegada"}
+
     def taxas(self):
-        """Taxa total do TS e taxa útil (sem pacotes nulos), em bit/s, medidas a cada 1 s."""
+        """Taxa total do TS e taxa útil (sem pacotes nulos), em bit/s, medidas a cada 1 s, e se é CBR ou VBR."""
         with self.lock:
             fluindo = self.ultimo_pacote is not None and time.monotonic() - self.ultimo_pacote < self.LIM_SINAL
+            modo = self._modo_ts()
             if not fluindo:
-                return {"taxa_ts": 0, "taxa_util": 0, "taxa_nulos": 0}
+                return {"taxa_ts": 0, "taxa_util": 0, "taxa_nulos": 0, "modo_ts": modo}
             nulos = int(self.taxa.get(0x1FFF, 0))
-            return {"taxa_ts": int(self.taxa_total), "taxa_util": int(self.taxa_total) - nulos, "taxa_nulos": nulos}
+            return {"taxa_ts": int(self.taxa_total), "taxa_util": int(self.taxa_total) - nulos, "taxa_nulos": nulos,
+                    "modo_ts": modo}
 
     def _desc_pid(self, pid):
         fixos = {0: "PAT", 1: "CAT", 2: "TSDT", 0x10: "NIT", 0x11: "SDT/BAT", 0x12: "EIT",
@@ -1256,6 +1343,7 @@ class AnalisadorTS:
                 if pcr_pid is not None and pcr_pid not in self.es_pids:
                     tx += int(self.taxa.get(pcr_pid, 0)) if fluindo else 0
                 servicos.append({
+                    "modo": self._modo_serv(num),
                     "numero": num, "nome": sdt[0] or f"Programa {num}", "provedor": sdt[1],
                     "tipo": TIPOS_SERVICO.get(sdt[2], f"0x{sdt[2]:02X}" if sdt[2] is not None else ""),
                     "pmt": f"0x{ppid:04X}", "pcr_pid": f"0x{pcr_pid:04X}" if pcr_pid is not None else "",
@@ -1281,7 +1369,8 @@ class AnalisadorTS:
                     "taxa_util": int(total - (self.taxa.get(0x1FFF, 0) if fluindo else 0)),
                     "tsid": self.tsid, "onid": self.onid, "rede": self.rede, "hora_ts": self.hora_ts,
                     "n_pids": len(self.n_pid), "n_servicos": len(self.pmt_pids),
-                    "cbr": self.taxa.get(0x1FFF, 0) > 0, "pacotes": self.pacotes, "desde": self.desde,
+                    "cbr": self.taxa.get(0x1FFF, 0) > 0, "modo_taxa": self._modo_ts(),
+                    "pacotes": self.pacotes, "desde": self.desde,
                 },
                 "tr101290": {
                     "contadores": dict(self.cont),
@@ -2977,9 +3066,13 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
  color:var(--mut);font-size:11px;line-height:1.3}
 .pv [hidden]{display:none!important}
 .pv .pvn{display:flex;gap:6px;align-items:baseline;padding:5px 8px;font-size:12px;background:#11161d;border-top:1px solid var(--line)}
+.modo{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:4px;vertical-align:middle}
+.modo small{font-weight:400;opacity:.8}.modo.cbr{background:#1f2a3a;color:#9ec5ff}.modo.vbr{background:#2d2414;color:#f5c48a}
+.modo.med{background:#1c2128;color:var(--mut);font-weight:400}
 .pv .pvn .pvt{font-size:11.5px;font-variant-numeric:tabular-nums;color:#9ec5ff;white-space:nowrap}
 .rb .ut{display:block;font-size:11px;font-weight:400;color:var(--mut)}.rb .ut b{color:#a6e3a1;font-weight:600}
-.pv .pvn b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}.pv .pvn small{color:var(--mut);font-family:ui-monospace,monospace}
+.pv .pvn{flex-wrap:wrap;row-gap:2px}
+.pv .pvn b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1 1 100%}.pv .pvn small{color:var(--mut);font-family:ui-monospace,monospace}
 .pv.sai{outline:2px solid #2f81f7;outline-offset:-1px}
 .pv.g{width:240px;flex:none}.serv .sh .pv{margin:-2px 4px -2px -4px}
 .svout{display:inline-flex;align-items:center;gap:6px}.svout img{width:48px;height:27px;object-fit:cover;border-radius:4px;border:1px solid var(--line);background:#05070a}
@@ -3138,7 +3231,7 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
    return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}
  ${!ativo&&c.ultimo_relatorio?relCard(c):`${spark(s.historico)}
- <div class="met"><div>${(()=>{const x=taxaTS(s);return`<small>Bitrate do TS</small><b class="big">${mb(x.ts)}<small> Mb/s</small></b>${x.temNulos?`<small style="color:var(--mut)">útil <b style="color:#a6e3a1;font-size:12px">${mb(x.ut)}</b> · nulos ${mb(x.nul)}</small>`:''}`})()}</div>
+ <div class="met"><div>${(()=>{const x=taxaTS(s);return`<small>Bitrate do TS ${seloModo(s.modo_ts,true)}</small><b class="big">${mb(x.ts)}<small> Mb/s</small></b>${x.temNulos?`<small style="color:var(--mut)">útil <b style="color:#a6e3a1;font-size:12px">${mb(x.ut)}</b> · nulos ${mb(x.nul)}</small>`:''}`})()}</div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>`}
  ${tr(s)}
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
@@ -3178,13 +3271,16 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
 const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
+function seloModo(m,curto){if(!m)return'';if(!m.modo)return curto?'':`<span class="modo med" title="medindo a variação da taxa (${m.amostras||0} s)">medindo…</span>`;
+ const tip=`${m.modo==='CBR'?'Taxa constante':'Taxa variável'} — variação ${m.variacao_pct}% nos últimos ${m.amostras} s`+(m.min?` (mín ${mbps(m.min)}, máx ${mbps(m.max)})`:'');
+ return`<span class="modo ${m.modo.toLowerCase()}" title="${esc(tip)}">${m.modo}${curto?'':` <small>±${m.variacao_pct}%</small>`}</span>`}
 function taxaTS(s){const ts=s.taxa_ts||s.bitrate_bps||0,ut=s.taxa_util||0,nul=s.taxa_nulos||0;
  return{ts,ut,nul,temNulos:ts>0&&nul/ts>0.02}}
 function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
  const msg=!s.video?'♪ sem vídeo':p.u?'':esc(p.erro||'carregando imagem…');
  if(s.video)prevAlvos.add(k);
  return`<div class="pv ${cls||''}" title="${esc(s.nome)} · serviço ${s.numero}"><div class="im">${s.video?`<img data-prev="${k}" ${p.u?`src="${p.u}"`:'hidden'} alt="">`:''}
- <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b>${s.taxa?`<span class="pvt" title="taxa deste serviço (vídeo + áudio + dados do programa)">${mbps(s.taxa)}</span>`:''}<small>${s.numero}</small></div></div>`}
+ <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b>${s.taxa?`<span class="pvt" title="taxa deste serviço (vídeo + áudio + dados do programa)">${mbps(s.taxa)}</span>${seloModo(s.modo,true)}`:''}<small>${s.numero}</small></div></div>`}
 let prevOcupado=false;
 async function atualizarPrevias(){if(prevOcupado||document.hidden)return;prevOcupado=true;
  try{for(const k of [...prevAlvos]){const [cid,sid]=k.split(':');
@@ -3219,7 +3315,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
- ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa total do TS (inclui pacotes nulos)">${mb(x.ts)} <small>Mb/s TS</small></span>${x.temNulos?`<span class="ut" title="sem pacotes nulos (enchimento)">útil <b>${mb(x.ut)}</b> · nulos ${mb(x.nul)}</span>`:''}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
+ ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa total do TS (inclui pacotes nulos)">${mb(x.ts)} <small>Mb/s TS</small></span> ${seloModo(s.modo_ts)}${x.temNulos?`<span class="ut" title="sem pacotes nulos (enchimento)">útil <b>${mb(x.ut)}</b> · nulos ${mb(x.nul)}</span>`:''}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
@@ -3338,7 +3434,8 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   +(p.motivo==='em andamento'?' Sessão ainda em andamento: este é o último salvamento automático.':'');
  $('#akpi').innerHTML=(S?kpi('Duração',dur(p.duracao_s))+kpi('Bitrate médio',fmtR(ts.media))+kpi('Bitrate mínimo',fmtR(ts.min))+kpi('Bitrate máximo',fmtR(ts.max))
   :kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')+kpi('Sessão',dur(p.duracao_s)))
-  +kpi('Taxa',r.cbr?'CBR':'VBR','CBR = TS com pacotes nulos (taxa constante)')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'))
+  +kpi('Taxa do TS',r.modo_taxa&&r.modo_taxa.modo?`${r.modo_taxa.modo} <small style="font-size:12px;color:var(--mut)">±${r.modo_taxa.variacao_pct}%</small>`:'medindo…',
+     r.modo_taxa&&r.modo_taxa.modo?`variação da taxa total nos últimos ${r.modo_taxa.amostras} s (mín ${fmtR(r.modo_taxa.min)}, máx ${fmtR(r.modo_taxa.max)}). CBR abaixo de 2%.`:'')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'))
   +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
   +kpi('Pacotes',r.pacotes.toLocaleString('pt-BR'));
  $('#adesde').textContent='desde '+new Date(r.desde*1000).toLocaleTimeString('pt-BR');
@@ -3402,7 +3499,7 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   const dest=cfgA.map((x,i)=>{const r=servRotulo(x,a.servicos.map(q=>({numero:q.numero,nome:q.nome})));return(!r||r.some(q=>String(q.numero)===String(s.numero)))?`<b>Destino ${i+1}</b> (${esc(resS(x))})`:null}).filter(Boolean);
   return`<div class="serv">${!a.salvo&&vid?`<div style="display:flex;gap:12px;padding:10px 11px 0">${prevBox(anaId,{numero:s.numero,nome:s.nome,video:true},'g')}</div>`:''}
   <div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
-  ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}<span class="tx">${fmtR(s.taxa)}</span></div>
+  ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}${seloModo(s.modo)}<span class="tx">${fmtR(s.taxa)}</span></div>
   ${cfgA.length?`<div class="saiem">${dest.length?'Sai em: '+dest.join(' · '):'Não sai em nenhum destino'}</div>`:''}
   <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span><span>PCR <b>${s.pcr_pid||'—'}</b></span>
   ${s.pcr?`<span>Intervalo PCR <b>${s.pcr.intervalo_ms} ms</b></span><span>Jitter PCR <b>${s.pcr.jitter_ns} ns</b></span>`:''}</div>

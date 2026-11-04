@@ -174,6 +174,19 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+## Taxa: total, útil, por serviço, CBR ou VBR
+
+A rota e o card mostram a **taxa total do TS**, a parte **útil** (sem pacotes nulos de enchimento) e
+quanto é **nulos**; cada janela de serviço mostra a **taxa do serviço**. O sistema também classifica:
+
+- **TS CBR ou VBR:** CBR quando a taxa total varia menos de 2% (típico de mux com enchimento);
+- **cada serviço CBR ou VBR:** CBR quando a taxa do serviço varia menos de 3%.
+
+A medição usa o **relógio do próprio fluxo (PCR)**: pacotes entre dois PCRs divididos pelo tempo entre
+eles, como fazem os analisadores profissionais. Por isso não é enganada por atraso de rede nem por
+carga do computador. O selo mostra a variação (ex.: `VBR ±4.7%`) e o mínimo/máximo ao passar o mouse.
+Os primeiros ~8 s aparecem como "medindo…".
+
 ## Placa de rede de entrada e saída
 
 Em computadores com mais de uma placa de rede, cada entrada (UDP, SRT) e cada saída (SRT, UDP, RTP)
@@ -346,7 +359,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.13.0 && git push origin v2.13.0
+git tag v2.14.0 && git push origin v2.14.0
 ```
 
 ## Licença
