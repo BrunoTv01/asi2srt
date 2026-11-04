@@ -268,8 +268,11 @@ ao software, então na prática o "TS sync loss" aparece sobretudo como perda do
 Ao parar um canal (ou desligar o serviço), a análise da sessão é **salva**: o card do canal parado
 mostra o resumo (período, duração, bitrate médio/mín/máx, erros TR 101 290, serviços) e
 **Ver relatório** abre a análise completa como estava no fim da sessão. A tela de análise tem um
-seletor com as **últimas 20 sessões** de cada canal e os botões **Baixar relatório: HTML · TXT · JSON**:
+seletor com as **últimas 20 sessões** de cada canal e os botões **Baixar relatório: PDF · HTML · TXT · JSON**:
 
+- **PDF** – relatório em A4 com o logo, tabela TR 101 290 em cores, serviços, PIDs, SRT e saídas,
+  com número de página. Pronto para enviar por e-mail ou arquivar (usa `python3-reportlab`, que o
+  instalador já coloca).
 - **HTML** – relatório formatado com o logo do painel, tabela TR 101 290 em cores, serviços, PIDs,
   SRT e saídas. Abre no navegador e pode ser impresso ou salvo em PDF (Ctrl+P).
 - **TXT** – o mesmo conteúdo em texto simples, bom para e-mail ou anexar em chamados.
@@ -393,7 +396,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.17.0 && git push origin v2.17.0
+git tag v2.17.1 && git push origin v2.17.1
 ```
 
 ## Licença

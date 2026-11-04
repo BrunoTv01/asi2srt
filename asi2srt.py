@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.17.0"
+__version__ = "2.17.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -2712,6 +2712,205 @@ footer{{margin-top:26px;color:#8a949e;font-size:11px;border-top:1px solid #e3e7e
     return "\n".join(H)
 
 
+def pdf_disponivel():
+    try:
+        import reportlab  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def relatorio_pdf(d, logo=None) -> bytes:
+    """Mesmo conteúdo do relatório HTML, em PDF A4 (precisa do reportlab: apt install python3-reportlab)."""
+    import io
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (Image, KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table,
+                                    TableStyle)
+
+    def tx(v):   # as fontes padrão do PDF só têm o conjunto Windows-1252
+        s = str("" if v is None else v).replace("→", "->").replace("…", "...").replace("⚠", "!")
+        return s.encode("cp1252", "replace").decode("cp1252")
+
+    VERDE, VERM, CINZA = colors.HexColor("#1f9d55"), colors.HexColor("#b3261e"), colors.HexColor("#9aa3ab")
+    LINHA, FUNDO, TXT2 = colors.HexColor("#e3e7eb"), colors.HexColor("#f4f6f8"), colors.HexColor("#5b6570")
+    s_cel = ParagraphStyle("cel", fontName="Helvetica", fontSize=8, leading=10)
+    s_celr = ParagraphStyle("celr", parent=s_cel, alignment=2)
+    s_err = ParagraphStyle("err", parent=s_cel, textColor=VERM)
+    s_errr = ParagraphStyle("errr", parent=s_celr, textColor=VERM)
+    s_h1 = ParagraphStyle("h1", fontName="Helvetica-Bold", fontSize=16, leading=19)
+    s_sub = ParagraphStyle("sub", fontName="Helvetica", fontSize=9.5, leading=12, textColor=TXT2)
+    s_h2 = ParagraphStyle("h2", fontName="Helvetica-Bold", fontSize=10.5, leading=13,
+                          textColor=colors.HexColor("#3a4550"), spaceBefore=10, spaceAfter=4,
+                          keepWithNext=1)
+    s_h3 = ParagraphStyle("h3", fontName="Helvetica-Bold", fontSize=9.5, leading=12)
+    s_meta = ParagraphStyle("meta", parent=s_cel, textColor=TXT2)
+    largura = A4[0] - 30 * mm
+
+    def P(v, st=None):
+        return Paragraph(html.escape(tx(v)), st or s_cel)
+
+    def tabela(cab, linhas, larg, direita=(), estilos=(), vermelhas=()):
+        dados = [[P(c, s_celr if i in direita else s_cel) for i, c in enumerate(cab)]]
+        for n, ln in enumerate(linhas, 1):
+            erro = n in vermelhas
+            dados.append([c if isinstance(c, Paragraph) else
+                          P(c, (s_errr if erro else s_celr) if i in direita else (s_err if erro else s_cel))
+                          for i, c in enumerate(ln)])
+        tb = Table(dados, colWidths=[largura * f for f in larg], repeatRows=1)
+        st = [("BACKGROUND", (0, 0), (-1, 0), FUNDO), ("LINEBELOW", (0, 0), (-1, 0), 1, LINHA),
+              ("LINEBELOW", (0, 1), (-1, -1), 0.4, LINHA), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+              ("TOPPADDING", (0, 0), (-1, -1), 2.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5)]
+        tb.setStyle(TableStyle(st + list(estilos)))
+        return tb
+
+    def cor_txt(v, c, st=None):
+        return Paragraph(f'<font color="{c}">{html.escape(tx(v))}</font>', st or s_cel)
+
+    taxa, m = d["taxa"], d["modo"]
+    total = sum(d["totais"].values())
+    E = []
+    # cabeçalho: logo, título e resultado geral
+    cab = []
+    if logo:
+        try:
+            img = Image(io.BytesIO(logo[1]))
+            r = img.imageWidth / float(img.imageHeight or 1)
+            img.drawHeight = 14 * mm
+            img.drawWidth = min(14 * mm * r, 45 * mm)
+            cab.append(img)
+        except Exception:
+            cab = []
+    res = (f'<font color="#b3261e"><b>TR 101 290: {_f_n(total)} ocorrência(s)</b></font>' if total
+           else '<font color="#17733f"><b>TR 101 290 sem erros</b></font>')
+    bloco = [Paragraph(html.escape(tx(d["titulo"])), s_h1),
+             Paragraph("Relatório de análise · " + html.escape(tx(d["canal"])), s_sub)]
+    larg_cab = ([50 * mm] if cab else []) + [None, 55 * mm]
+    tcab = Table([cab + [bloco, Paragraph(tx(res), ParagraphStyle("res", parent=s_cel, fontSize=9, alignment=2))]],
+                 colWidths=larg_cab)
+    tcab.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LINEBELOW", (0, 0), (-1, 0), 2, VERDE),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 6), ("LEFTPADDING", (0, 0), (0, 0), 0)]))
+    E += [tcab, Spacer(1, 6)]
+    info = [("Canal", d["canal"]), ("Entrada", d["entrada"]),
+            ("Período", f"{_f_dh(d['inicio'])} até {_f_dh(d['fim'])} ({_f_dur(d['duracao'])})"),
+            ("Situação", MOTIVOS_REL.get(d["motivo"], "sessão ao vivo (no momento da geração)")),
+            ("Gerado em", _f_dh(d["gerado"]))]
+    ti = Table([[P(a, s_meta), P(b)] for a, b in info], colWidths=[28 * mm, largura - 28 * mm])
+    ti.setStyle(TableStyle([("TOPPADDING", (0, 0), (-1, -1), 1), ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                            ("LEFTPADDING", (0, 0), (0, -1), 0)]))
+    E.append(ti)
+    # resumo em quadros
+    kpis = []
+    if taxa.get("media"):
+        kpis += [("Bitrate médio (útil)", _f_taxa(taxa["media"])), ("Mínimo (5 s)", _f_taxa(taxa["min"])),
+                 ("Máximo (5 s)", _f_taxa(taxa["max"]))]
+    if not d["salvo"] and taxa.get("atual_util") is not None:
+        kpis.append(("Bitrate útil agora", _f_taxa(taxa["atual_util"])))
+    kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
+             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
+             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—")]
+    if taxa.get("rajadas"):
+        kpis.append(("Rajadas de chegada", f"{taxa['rajadas']} s"))
+    if taxa.get("perda_interna"):
+        kpis.append(("Perda interna (servidor)", _f_n(taxa["perda_interna"])))
+    s_kt = ParagraphStyle("kt", parent=s_cel, fontSize=6.8, textColor=TXT2)
+    s_kv = ParagraphStyle("kv", fontName="Helvetica-Bold", fontSize=10.5, leading=13)
+    cel = [[Paragraph(html.escape(tx(a.upper())), s_kt), Paragraph(html.escape(tx(b)), s_kv)] for a, b in kpis]
+    n_col = 5
+    grade = [cel[i:i + n_col] + [""] * (n_col - len(cel[i:i + n_col])) for i in range(0, len(cel), n_col)]
+    tk = Table(grade, colWidths=[largura / n_col] * n_col)
+    tk.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.5, LINHA), ("INNERGRID", (0, 0), (-1, -1), 0.5, LINHA),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    E += [Paragraph("RESUMO", s_h2), tk]
+    # TR 101 290
+    linhas, estilos = [], []
+    for pr in (1, 2, 3):
+        linhas.append([Paragraph(f"<b>Prioridade {pr} — total {_f_n(d['totais'][pr])}</b>", s_cel), "", "", "", ""])
+        n = len(linhas)
+        estilos += [("SPAN", (0, n), (-1, n)), ("BACKGROUND", (0, n), (-1, n), FUNDO)]
+        for i in (x for x in d["indicadores"] if x["prio"] == pr):
+            c = "#9aa3ab" if i["na"] else ("#b3261e" if i["valor"] else "#1f9d55")
+            ctxt = "#b3261e" if i["valor"] else ("#9aa3ab" if i["na"] else "#1d2329")
+            linhas.append([Paragraph(f'<font color="{c}"><b>•</b></font> ' + html.escape(tx(i["cod"])), s_cel),
+                           cor_txt(i["nome"], ctxt),
+                           cor_txt("n/a" if i["na"] else _f_n(i["valor"]), ctxt, s_celr),
+                           P(_f_dh(i["ultimo"]) if i["ultimo"] and i["valor"] else ""),
+                           cor_txt(i["desc"], "#6b7580")])
+    E += [Paragraph("TR 101 290", s_h2),
+          tabela(["Código", "Indicador", "Ocorrências", "Última ocorrência", "Regra"], linhas,
+                 [.09, .2, .12, .17, .42], direita=(2,), estilos=estilos)]
+    # serviços
+    tit_serv = [Paragraph("SERVIÇOS", s_h2)]     # vai junto com o 1º serviço (não fica sozinho no fim da página)
+    for s in d["servicos"]:
+        pcr = s.get("pcr") or {}
+        md = (s.get("modo") or {}).get("modo")
+        meta = (f'{s.get("provedor") or ""} {s.get("tipo") or ""} · PMT {s.get("pmt") or ""} · '
+                f'PCR {s.get("pcr_pid") or "—"}'
+                + (f' · intervalo PCR {pcr.get("intervalo_ms")} ms · jitter {pcr.get("jitter_ns")} ns' if pcr else ""))
+        titulo = Table([[Paragraph(f'{html.escape(tx(s["nome"]))} <font size="8" color="#2f5fb3">programa {s["numero"]}'
+                                   + (f" · {html.escape(md)}" if md else "") + "</font>", s_h3),
+                         Paragraph(_f_taxa(s.get("taxa")), ParagraphStyle("tr", parent=s_h3, alignment=2))]],
+                       colWidths=[largura * .7, largura * .3])
+        titulo.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+        comp = tabela(["PID", "Componente", "stream_type", "Bitrate"],
+                      [[c["hex"], c["desc"], c["stream_type"], _f_taxa(c["taxa"])] for c in s.get("componentes", [])],
+                      [.14, .46, .2, .2], direita=(3,))
+        E.append(KeepTogether(tit_serv + [titulo, P(meta.strip(), s_meta), Spacer(1, 2), comp, Spacer(1, 7)]))
+        tit_serv = []
+    if not d["servicos"]:
+        E += tit_serv + [P("Nenhum serviço identificado.")]
+    # PIDs
+    linhas = [[p["hex"], str(p["pid"]), p["desc"], p.get("servico") or "", _f_taxa(p["taxa"]),
+               f'{p["pct"]:.1f}', _f_n(p["pacotes"]), str(p["cc"])] for p in d["pids"]]
+    verm = {i for i, p in enumerate(d["pids"], 1) if p["cc"] or p["tipo"] == "desconhecido"}
+    E += [Paragraph("PIDS", s_h2),
+          tabela(["PID", "Dec", "Descrição", "Serviço", "Bitrate", "%", "Pacotes", "Erros CC"], linhas,
+                 [.08, .06, .26, .17, .13, .07, .12, .11], direita=(1, 4, 5, 6, 7), vermelhas=verm)]
+    if d["srt"]:
+        linhas, verm = [], set()
+        for n, s in enumerate(d["srt"], 1):
+            tt = s.get("totais") or {}
+            if tt.get("descartados"):
+                verm.add(n)
+            linhas.append([s.get("rotulo") or "", f'{s.get("modo") or ""} {s.get("endereco") or ""}',
+                           str(s.get("conexoes", 0)), f'{s.get("rtt_medio_ms", 0)} / {s.get("rtt_max_ms", 0)} ms',
+                           _f_n(tt.get("pacotes")), _f_n(tt.get("perdidos")), _f_n(tt.get("retransmitidos")),
+                           _f_n(tt.get("descartados"))])
+        E += [Paragraph("CONEXÕES SRT", s_h2),
+              tabela(["Conexão", "Endereço", "Conexões", "RTT méd./máx.", "Pacotes", "Perdidos", "Retransm.",
+                      "Não recup."], linhas, [.1, .23, .1, .14, .11, .1, .11, .11], direita=(2, 3, 4, 5, 6, 7),
+                     vermelhas=verm)]
+    if d["saidas"]:
+        linhas, verm = [], set()
+        for n, (c, st) in enumerate(d["saidas"], 1):
+            st = st or {}
+            if st.get("reinicios"):
+                verm.add(n)
+            linhas.append([f"Destino {n}", _desc_saida(c), f'{(st.get("enviado_bytes") or 0) / 1e6:.1f} MB',
+                           _f_dur(st.get("tempo_no_ar_s")), str(st.get("conexoes", 0)), str(st.get("reinicios", 0))])
+        E += [Paragraph("SAÍDAS", s_h2),
+              tabela(["Destino", "Configuração", "Enviado", "Tempo no ar", "Conexões", "Quedas"], linhas,
+                     [.11, .45, .12, .12, .1, .1], direita=(2, 3, 4, 5), vermelhas=verm)]
+
+    rodape = tx(f'{d["titulo"]} · {d["canal"]} · gerado em {_f_dh(d["gerado"])} · asi2srt {__version__}')
+
+    def pagina(cv, doc):
+        cv.saveState()
+        cv.setFont("Helvetica", 7)
+        cv.setFillColor(CINZA)
+        cv.drawString(15 * mm, 9 * mm, rodape)
+        cv.drawRightString(A4[0] - 15 * mm, 9 * mm, f"Página {doc.page}")
+        cv.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=13 * mm,
+                            bottomMargin=16 * mm, title=tx(f"Relatório — {d['canal']}"), author=tx(d["titulo"]))
+    doc.build(E, onFirstPage=pagina, onLaterPages=pagina)
+    return buf.getvalue()
+
+
 # ======================================================================
 # Servidor web: painel + API
 # ======================================================================
@@ -2853,7 +3052,10 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                 nome = re.sub(r"[^\w.-]+", "_", ger.defs[cid]["nome"])
                                 data = time.strftime("%Y%m%d-%H%M", time.localtime(dados["periodo"]["inicio"]))
                                 fmt = q.get("formato", "json")
-                                if fmt in ("html", "txt"):
+                                if fmt == "pdf" and not pdf_disponivel():
+                                    return self._resp(503, {"erro": "PDF indisponível: instale com "
+                                                                    "sudo apt install python3-reportlab"})
+                                if fmt in ("html", "txt", "pdf"):
                                     canal = {**normalizar_canal(ger.defs[cid])}
                                     d = dados_relatorio(dados, canal, ger.aparencia()["titulo"])
                                     if fmt == "txt":
@@ -2869,6 +3071,9 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                         if tipo:   # SVG fica de fora do HTML exportado (não executa nada)
                                             with open(cam, "rb") as f:
                                                 logo = (tipo, f.read())
+                                    if fmt == "pdf":
+                                        return self._resp(200, relatorio_pdf(d, logo), "application/pdf",
+                                                          baixar=f"relatorio-{nome}-{data}.pdf")
                                     corpo = relatorio_html(d, logo).encode("utf-8")
                                     return self._resp(200, corpo, "text/html; charset=utf-8",
                                                       baixar=f"relatorio-{nome}-{data}.html")
@@ -3648,7 +3853,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
   <span class="sp" style="flex:1"></span><select id="asess" title="Sessões de análise salvas"></select>
-  <span class="baixar"><span class="bl">Baixar relatório:</span><a class="btn" id="abx_html" href="#" title="relatório formatado, com logo; abre no navegador e pode ser impresso ou salvo em PDF">HTML</a><a class="btn" id="abx_txt" href="#" title="texto simples">TXT</a><a class="btn" id="abx_json" href="#" title="dados completos">JSON</a></span><button id="azerar">Zerar contadores</button></div>
+  <span class="baixar"><span class="bl">Baixar relatório:</span><a class="btn" id="abx_pdf" href="#" title="relatório em PDF (A4), pronto para enviar ou arquivar">PDF</a><a class="btn" id="abx_html" href="#" title="relatório formatado, com logo; abre no navegador">HTML</a><a class="btn" id="abx_txt" href="#" title="texto simples">TXT</a><a class="btn" id="abx_json" href="#" title="dados completos">JSON</a></span><button id="azerar">Zerar contadores</button></div>
  <div class="aban" id="aban" hidden></div>
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
@@ -3957,7 +4162,7 @@ function rota(){const m=location.hash.match(/^#\/analise\/(\w+)/);anaId=m?m[1]:n
  $('#vana').hidden=!anaId;$('#vlista').hidden=!!anaId;window.scrollTo(0,0);
  if(anaId){$('#akpi').innerHTML=$('#atr').innerHTML=$('#aserv').innerHTML=$('#apids').innerHTML='';carregarAna()}else render()}
 async function carregarAna(){if(!anaId)return;const c=dados.find(x=>x.id===anaId);$('#anome').textContent=c?c.nome:'';
- const qs=sessSel==null?'':`?sessao=${sessSel}`;['html','txt','json'].forEach(f=>{$('#abx_'+f).href=`/api/canais/${anaId}/analise?baixar=1&formato=${f}`+(sessSel==null?'':`&sessao=${sessSel}`)});
+ const qs=sessSel==null?'':`?sessao=${sessSel}`;['pdf','html','txt','json'].forEach(f=>{$('#abx_'+f).href=`/api/canais/${anaId}/analise?baixar=1&formato=${f}`+(sessSel==null?'':`&sessao=${sessSel}`)});
  try{ana=await api('GET',`/api/canais/${anaId}/analise${qs}`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
 function kpi(r,v,t){return`<div class="kpi" title="${esc(t||'')}"><small>${r}</small><b>${v}</b></div>`}
 function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts=a.taxa_sessao;

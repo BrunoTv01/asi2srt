@@ -942,13 +942,28 @@ def test_relatorio_txt_e_html():
     assert "RTMP rtmp://a.rtmp.youtube.com/live2/******** — serviços 257" in h and "abc-def" not in h
 
 
+def test_relatorio_pdf():
+    pytest.importorskip("reportlab")
+    canal = {"nome": "Canal <A> & ç", "entrada": {"tipo": "srt", "modo": "caller", "endereco": "187.60.226.82:6001",
+                                                 "senha": "segredo123456"}}
+    d = a.dados_relatorio(_dados_falsos(), canal, "Engenharia TV Cultura")
+    logo = open(os.path.join(os.path.dirname(__file__), "..", "marca", os.listdir(os.path.join(
+        os.path.dirname(__file__), "..", "marca"))[0]), "rb").read() if os.path.isdir(os.path.join(
+        os.path.dirname(__file__), "..", "marca")) else None
+    pdf = a.relatorio_pdf(d, ("image/png", logo) if logo else None)
+    assert pdf.startswith(b"%PDF-") and pdf.rstrip().endswith(b"%%EOF")
+    assert b"segredo123456" not in pdf
+    a.relatorio_pdf(d, ("image/png", b"lixo"))     # logo inválido não impede o PDF
+
+
 def test_api_baixar_relatorio_formatos(gateway):
     base, _ = gateway
     canal = {"nome": "R", "entrada": {"tipo": "udp", "endereco": "1234"}, "saidas": []}
     cid = _req(base, "POST", "/api/canais", canal)[1]["id"]
     time.sleep(2.5)
     hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:segredo").decode()}
-    for fmt, tipo, ext in (("html", "text/html", ".html"), ("txt", "text/plain", ".txt"), ("json", "application/json", ".json")):
+    for fmt, tipo, ext in (("html", "text/html", ".html"), ("txt", "text/plain", ".txt"), ("json", "application/json", ".json"),
+                           ("pdf", "application/pdf", ".pdf")):
         r = urllib.request.Request(f"{base}/api/canais/{cid}/analise?baixar=1&formato={fmt}", headers=hdr)
         with urllib.request.urlopen(r) as resp:
             assert resp.headers["Content-Type"].startswith(tipo)
