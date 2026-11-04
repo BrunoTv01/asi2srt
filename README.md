@@ -197,6 +197,16 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+### Muitos sinais: visão compacta e Lista
+
+- **Rotas** (padrão compacto): os indicadores TR 101 290 ficam numa linha só por canal, mostrando
+  **apenas os que têm ocorrência** (`P2 · PCR repetition 707 · PCR discontinuity 15 · +3 ok`); o resto
+  aparece como "✓ N ok". Imagem e gráfico ficam menores. O botão **▾** de cada canal abre os
+  detalhes completos (todos os indicadores e imagens maiores) e o painel lembra quais estão abertos.
+- **Lista**: uma linha por sinal, com miniatura, estado, taxa útil, CBR/VBR, total de ocorrências
+  P1/P2/P3 (cor = situação; passe o mouse para ver quais), entrada (com RTT e perda do SRT), saídas
+  no ar e botões. Ideal para monitorar dezenas de sinais numa tela só.
+
 ## Taxa: total, útil, por serviço, CBR ou VBR
 
 A rota, o card, o gráfico e os relatórios mostram só a **taxa útil** (o conteúdo, sem os pacotes nulos
@@ -419,7 +429,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.18.1 && git push origin v2.17.1
+git tag v2.19.0 && git push origin v2.17.1
 ```
 
 ## Licença

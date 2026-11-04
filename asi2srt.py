@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.18.1"
+__version__ = "2.19.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4228,6 +4228,35 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .vis{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}.vis button{border:0;border-radius:0;padding:6px 10px}
 .vis button.on{background:#30363d;color:#fff}
 .rotas{display:flex;flex-direction:column;gap:10px}
+/* modo compacto da rota (padrão): TR numa linha só, imagem e gráfico menores */
+.rota.cp .rh{padding:7px 12px;gap:8px}.rota.cp .rl{padding:2px 12px 6px}.rota.cp .no{padding:4px 0}
+.rota.cp .svs{gap:8px;padding:4px 0 2px 96px}.rota.cp .pv{width:124px}.rota.cp .pv .pvn{padding:3px 6px;font-size:11px}
+.rota.cp .pv .pvn .pvt{font-size:10.5px}.rota.cp .gpv{min-width:220px;max-width:460px}.rota.cp .gpv .gv{min-height:46px}
+.rota.cp .gpv .gh,.rota.cp .gpv .gf{padding:3px 8px;font-size:11px}
+.indc{display:flex;gap:6px 14px;flex-wrap:wrap;align-items:center;padding:5px 12px;border-bottom:1px solid #20262f;background:#13181f}
+.cg{display:inline-flex;gap:5px;align-items:center;flex-wrap:wrap}
+.cgl{font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--mut);padding:1px 6px;border-radius:4px;background:#1b2129}
+.cg.e .cgl{background:#3a1416;color:#ff8f8a}.cg.w .cgl{background:#3a2f10;color:#f2cc60}.cg.ok .cgl{background:#14301f;color:#7ee2a8}
+.cok{font-size:11.5px;color:#7ee2a8}.cg.x .cok{color:var(--mut)}
+.indc .ic{padding:1px 7px;font-size:11.5px}.indc .sub{color:var(--mut);font-size:11px}
+.bx{padding:4px 8px!important;font-size:12px!important;min-width:30px}
+/* visão Lista: uma linha por sinal */
+.lista{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:auto}
+.lista table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+.lista th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:8px 10px;
+ border-bottom:1px solid var(--line);background:#13181f;position:sticky;top:0;white-space:nowrap}
+.lista td{padding:6px 10px;border-bottom:1px solid #1c222a;white-space:nowrap;vertical-align:middle}
+.lista tr:last-child td{border-bottom:0}.lista tr:hover td{background:#ffffff05}
+.lista td.n,.lista th.n{text-align:right}.lista .rn{font-weight:650;cursor:pointer}.lista .rn:hover{color:var(--acc)}
+.lista tr td:first-child{border-left:3px solid transparent}.lista tr.e-rodando td:first-child{border-left-color:var(--ok)}
+.lista tr.e-erro td:first-child,.lista tr.e-sem_dados td:first-child{border-left-color:var(--err)}
+.lista tr.e-reiniciando td:first-child,.lista tr.e-conectando td:first-child,.lista tr.e-iniciando td:first-child{border-left-color:var(--warn)}
+.lista .th{width:64px;height:36px;border-radius:4px;background:#05070a;display:block;object-fit:cover}
+.lista .th.v{display:flex;align-items:center;justify-content:center;color:#484f58;font-size:10px}
+.lista code{font-family:ui-monospace,monospace;font-size:12px}.lista .ent{max-width:380px;overflow:hidden;text-overflow:ellipsis}
+.lista .acs{display:flex;gap:5px;justify-content:flex-end}.lista .acs button{padding:3px 8px;font-size:12px}
+.pb{display:inline-block;min-width:34px;text-align:center;padding:1px 7px;border-radius:99px;font-weight:600;font-size:11.5px}
+.pb.ok{background:#14301f;color:#7ee2a8}.pb.w{background:#3a2f10;color:#f2cc60}.pb.e{background:#3a1416;color:#ff8f8a}.pb.x{background:#1b2129;color:var(--mut)}
 .rota{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .rota.e-rodando{border-left:3px solid var(--ok)}.rota.e-reiniciando,.rota.e-conectando,.rota.e-iniciando{border-left:3px solid var(--warn)}
 .rota.e-erro,.rota.e-sem_dados{border-left:3px solid var(--err)}.rota.e-parado{border-left:3px solid #484f58}
@@ -4289,7 +4318,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .no .ed{display:flex;align-items:center;gap:7px;min-width:0}.no .ed code{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .no .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
 .nicb{font-size:10.5px;font-family:ui-monospace,monospace;color:#c9b8ff;background:#251f3a;border-radius:4px;padding:1px 6px;white-space:nowrap;flex:none}
-.no .tp.udp{background:#22301f;color:#a6e3a1}.no .tp.asi{background:#3a2a1f;color:#f5c48a}
+.no .tp.udp,.lista .tp.udp{background:#22301f;color:#a6e3a1}.no .tp.asi,.lista .tp.asi{background:#3a2a1f;color:#f5c48a}
+.lista .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
 .st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}.st i{width:8px;height:8px;border-radius:50%;background:#484f58}
 .st.conectado i,.st.ativo i{background:var(--ok);box-shadow:0 0 5px var(--ok)}.st.aguardando i{background:var(--warn)}
 .st.conectado{color:#a6e3a1}.st.aguardando{color:#f2cc60}.st.parado{color:var(--mut)}
@@ -4309,7 +4339,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
-<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
+<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button></div>
 <button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
@@ -4535,26 +4565,57 @@ function grafRota(s,e){const h=(s.historico||[]).slice(-60),W=300,H=100;
  <div class="gv"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><g class="gg">${grade}</g><polygon class="ar" points="0,${H} ${p} ${W},${H}"/><polyline points="${p}"/>${lp}</svg>
  <span class="gx t">${mbps(mx)}</span><span class="gx b">0</span></div>
  <div class="gf"><span>mín <b>${mbps(mn)}</b></span><span>máx <b>${mbps(mxv)}</b></span>${s.modo_ts&&s.modo_ts.modo?seloModo(s.modo_ts):''}</div></div>`}
-function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
+let ABERTOS=new Set();try{ABERTOS=new Set(JSON.parse(localStorage.getItem('asi2srt.abertos')||'[]'))}catch(e){}
+function indCompacto(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont||!TRI.length)return'';const rec=t?t.recentes||[]:[],na=t?t.nao_aplicavel||[]:[];
+ const g=p=>{const it=TRI.filter(x=>x[1]===p),ruins=it.filter(([k])=>cont[k]||rec.includes(k)),err=ruins.some(([k])=>rec.includes(k)),
+  oks=it.filter(([k])=>!na.includes(k)&&!cont[k]),cls=err?'e':ruins.length?'w':(t&&!t.sinal)?'x':'ok';
+  return`<span class="cg ${cls}"><span class="cgl" title="Prioridade ${p}">P${p}</span>${ruins.map(([k,,cod,nome,desc])=>`<span class="ic ${rec.includes(k)?'e':'w'}" title="${esc(cod+' '+nome+' — '+desc)}"><i></i>${esc(NOME_IND[k]||nome)}<b>${(cont[k]||0).toLocaleString('pt-BR')}</b></span>`).join('')}${oks.length?`<span class="cok" title="sem erros: ${esc(oks.map(([k,,,n])=>NOME_IND[k]||n).join(', '))}">${ruins.length?'+':'✓'} ${oks.length} ok</span>`:''}</span>`};
+ return`<div class="indc">${g(1)}${g(2)}${g(3)}<span class="sub">${t?(t.sinal?'sessão atual':'sem sinal'):'última sessão'}</span></div>`}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-x]');if(!b)return;const id=b.dataset.x;
+ ABERTOS.has(id)?ABERTOS.delete(id):ABERTOS.add(id);try{localStorage.setItem('asi2srt.abertos',JSON.stringify([...ABERTOS]))}catch(x){}render()});
+function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio,ab=ABERTOS.has(c.id);
  const dots='';const _dotsAntigo=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
   :r?`<span class="dots">${TR.map(([k,n])=>`<i class="${(r.contadores[k]||0)?'w':''}" title="${esc(n)}: ${r.contadores[k]||0}"></i>`).join('')}<small>última sessão</small></span>`:'';
  const acs=(ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻</button><button data-a="analise" data-id="${c.id}">Análise</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
-  +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
+  +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`
+  +`<button class="bx" data-x="${c.id}" title="${ab?'recolher detalhes':'ver todos os indicadores e imagens maiores'}">${ab?'▴':'▾'}</button>`;
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
- return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}
+ return`<div class="rota e-${esc(s.estado)}${ab?'':' cp'}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}
  ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa útil: só o conteúdo, sem pacotes nulos de enchimento${x.temNulos?` (o TS chega com ${mb(x.ts)} Mb/s com enchimento)`:''}">${mb(x.ut)} <small>Mb/s</small></span> ${seloModo(s.modo_ts)}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
- ${indicadores(ativo?t:null,ativo?null:r)}
+ ${ab?indicadores(ativo?t:null,ativo?null:r):indCompacto(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
    return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}${grafRota(s,srt.SRTIN)}</div>`:''}${destinos}
  ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
  ${ativo&&s.estado!=='rodando'&&s.ultima_msg?`<div class="rrel" style="color:var(--warn)">${esc(s.ultima_msg)}</div>`:''}</div></div>`}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-vis]');if(!b)return;VIS=b.dataset.vis;try{localStorage.setItem('asi2srt.vis',VIS)}catch(x){}render()});
+function linhaLista(c){const s=c.status||{},ativo=s.estado!=='parado',t=s.tr101290,r=c.ultimo_relatorio,e=(s.srt||{}).SRTIN;
+ const cont=ativo&&t?t.contadores:r?r.contadores:null,rec=ativo&&t?t.recentes||[]:[];
+ const pr=p=>{if(!cont||!TRI.length)return'<td class="n">—</td>';const it=TRI.filter(x=>x[1]===p),soma=it.reduce((a,[k])=>a+(cont[k]||0),0),err=it.some(([k])=>rec.includes(k));
+  const det=it.filter(([k])=>cont[k]).map(([k,,,n])=>`${NOME_IND[k]||n}: ${cont[k].toLocaleString('pt-BR')}`).join('\n');
+  return`<td class="n"><span class="pb ${err?'e':soma?'w':ativo&&t&&!t.sinal?'x':'ok'}" title="${esc(det||'sem erros')}">${soma.toLocaleString('pt-BR')}</span></td>`};
+ const sv=(ativo?s.servicos||[]:[]).find(x=>x.video);let th='<span class="th v">—</span>';
+ if(sv){const k=`${c.id}:${sv.numero}`,pv=PREV[k]||{};prevAlvos.add(k);th=pv.u?`<img class="th" data-prev="${k}" src="${pv.u}" alt="">`:`<span class="th v" data-prevmsg="${k}">…</span>`}
+ const x=taxaTS(s),said=s.saidas||[],noar=said.filter(p=>p.estado==='rodando').length;
+ const tp=TIPO_TXT[c.entrada.tipo]||c.entrada.tipo,cl=c.entrada.tipo==='udp'?'udp':(c.entrada.tipo==='dektec'||c.entrada.tipo==='linuxasi')?'asi':'';
+ const srtTxt=e&&e.estado==='conectado'?` <span class="chip ${e.perda_pct>1?'e':e.perda_pct>0?'w':''}" title="SRT: RTT ${e.rtt_ms} ms, perda ${(e.perda_pct||0).toFixed(2)}%"><small>RTT</small>${e.rtt_ms} · <small>perda</small>${(e.perda_pct||0).toFixed(1)}%</span>`:'';
+ const acs=(ativo?`<button data-a="parar" data-id="${c.id}" title="parar">■</button><button data-a="analise" data-id="${c.id}">Análise</button>`
+  :`<button class="ok" data-a="iniciar" data-id="${c.id}" title="iniciar">▶</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
+  +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>`;
+ return`<tr class="e-${esc(s.estado)}"><td>${th}</td><td><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b> ${pInt(s)}</td>
+ <td><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></td>
+ <td class="n">${ativo?`<b>${mb(x.ut)}</b> <small style="color:var(--mut)">Mb/s</small>`:r?`<small style="color:var(--mut)">méd.</small> ${mb(r.taxa.media)}`:'—'}</td>
+ <td>${ativo?seloModo(s.modo_ts,true):''}</td>${pr(1)}${pr(2)}${pr(3)}
+ <td class="ent" title="${esc(endTxt(c.entrada))}"><span class="tp ${cl}">${tp}</span> <code>${esc(endTxtBase(c.entrada))}</code>${srtTxt}</td>
+ <td>${c.saidas.length?`<span class="pb ${!ativo?'x':noar===c.saidas.length?'ok':noar?'w':'e'}">${ativo?noar:0}/${c.saidas.length}</span> <small style="color:var(--mut)">no ar</small>`:'<small style="color:var(--mut)">só análise</small>'}</td>
+ <td><div class="acs">${acs}</div></td></tr>`}
+function lista(){return`<div class="lista"><table><tr><th></th><th>Canal</th><th>Estado</th><th class="n">Taxa útil</th><th>Tipo</th>
+ <th class="n" title="TR 101 290 prioridade 1">P1</th><th class="n" title="prioridade 2">P2</th><th class="n" title="prioridade 3">P3</th><th>Entrada</th><th>Saídas</th><th></th></tr>${dados.map(linhaLista).join('')}</table></div>`}
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
- $('#grid').className=VIS==='rotas'?'rotas':'grid';
- $('#grid').innerHTML=dados.length?dados.map(VIS==='rotas'?linha:card).join(''):
+ $('#grid').className=VIS==='rotas'?'rotas':VIS==='lista'?'':'grid';
+ $('#grid').innerHTML=dados.length?(VIS==='lista'?lista():dados.map(VIS==='rotas'?linha:card).join('')):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri so-adm" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.estado!=='parado'?taxaTS(c.status).ut:0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
