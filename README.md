@@ -214,6 +214,8 @@ A placa é guardada pelo nome (ex.: `enp2s0`), então continua certa mesmo se o 
 - **Janela de imagem:** a rota mostra uma miniatura ao vivo de cada serviço que entra (contorno azul =
   serviço que está saindo em algum destino) e cada destino mostra o serviço que envia. Na tela de
   análise cada serviço tem sua janela e a lista "Sai em" com os destinos que o levam.
+- **Gráfico ao lado da imagem:** na rota, ao lado das janelas, fica o gráfico da taxa útil do último
+  minuto (azul), com mínimo, máximo e CBR/VBR. Se a entrada for SRT, a linha vermelha mostra a perda.
   As imagens são geradas pelo ffmpeg decodificando **só os quadros-chave** (cerca de 6% de um núcleo
   para dois serviços HD) e só enquanto alguém está com o painel aberto.
 
@@ -368,7 +370,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.15.0 && git push origin v2.15.0
+git tag v2.16.0 && git push origin v2.16.0
 ```
 
 ## Licença

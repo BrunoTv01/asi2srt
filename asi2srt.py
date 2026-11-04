@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.15.0"
+__version__ = "2.16.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -3356,6 +3356,17 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .rh .acs{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}.rh .acs button{padding:4px 9px;font-size:12.5px}
 .rl{padding:6px 14px 10px}
 .svs{display:flex;gap:10px;flex-wrap:wrap;padding:8px 0 4px 96px}
+.gpv{flex:1 1 300px;min-width:260px;max-width:620px;display:flex;flex-direction:column;border:1px solid var(--line);border-radius:8px;background:#0b0f14;overflow:hidden}
+.gpv .gh,.gpv .gf{display:flex;gap:12px;align-items:center;padding:5px 9px;font-size:12px;color:var(--mut);flex-wrap:wrap}
+.gpv .gh{background:#11161d;border-bottom:1px solid var(--line)}.gpv .gf{border-top:1px solid var(--line);font-size:11.5px}
+.gpv b{color:var(--txt,#e6edf3);font-weight:600;font-variant-numeric:tabular-nums}.gpv .gh small{margin-left:auto}
+.gpv .gh .w b{color:var(--warn)}.gpv .gh .e b{color:var(--err)}
+.gpv i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}.gpv i.lb{background:var(--acc)}.gpv i.lr{background:var(--err)}
+.gpv .gv{position:relative;flex:1;min-height:70px}.gpv .gv.gm{display:flex;align-items:center;justify-content:center;color:var(--mut);font-size:12px}
+.gpv svg{position:absolute;inset:6px 0 0 0;width:100%;height:calc(100% - 6px);display:block}
+.gpv polyline{fill:none;stroke:var(--acc);stroke-width:1.6;vector-effect:non-scaling-stroke}.gpv polyline.lp{stroke:var(--err);stroke-width:1.3}
+.gpv .ar{fill:var(--acc);opacity:.13}.gpv .gg line{stroke:#1d242d;stroke-width:1;vector-effect:non-scaling-stroke}
+.gpv .gx{position:absolute;left:6px;font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums;pointer-events:none}.gpv .gx.t{top:4px}.gpv .gx.b{bottom:2px}
 .pv{position:relative;width:176px;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#05070a}
 .pv .im{position:relative;aspect-ratio:16/9;background:#05070a;display:flex;align-items:center;justify-content:center}
 .pv img{width:100%;height:100%;object-fit:contain;display:block}
@@ -3565,7 +3576,7 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  const chipServ=rot.startsWith('Destino')?(sr?`<span class="chip svout" title="serviços enviados por este destino">${sr.length===1&&sr[0].video&&PREV[cid+':'+sr[0].numero]&&PREV[cid+':'+sr[0].numero].u?`<img data-prev="${cid}:${sr[0].numero}" src="${PREV[cid+':'+sr[0].numero].u}">`:''}<small>Serviço</small>${esc(sr.map(s=>s.nome).join(', '))}</span>`
   :`<span class="chip"><small>Serviços</small>todos (TS completo)</span>`):'';
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${x.tipo!=='rtmp'&&(x.interface||x.interface_local)?`<span class="nicb" title="placa de rede usada">${esc(x.interface||x.interface_local)}</span>`:''}</span>
- <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
+ <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${rot==='Origem'?'<span></span>':e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
 const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
 function seloModo(m,curto){if(!m)return'';const ehTS=!curto||true;if(!m.modo)return curto?'':`<span class="modo med" title="medindo a variação da taxa (${m.amostras||0} s)">medindo…</span>`;
@@ -3604,6 +3615,20 @@ function indicadores(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont
    cl=rec.includes(k)?'e':v?'w':(t&&!t.sinal)||na.includes(k)?'x':'';
    return`<span class="ic ${cl}" title="${esc(cod+' '+nome+' — '+desc)}${na.includes(k)&&!v?' (não se aplica a este TS)':''}"><i></i>${esc(NOME_IND[k]||nome)}<b>${na.includes(k)&&!v?'n/a':v.toLocaleString('pt-BR')}</b></span>`}).join('')}</div>`};
  return`<div class="ind">${grupo(1)}${grupo(2)}${grupo(3)}<span class="sub">${t?(t.sinal?'sessão atual':'sem sinal'):'última sessão'}</span></div>`}
+function grafRota(s,e){const h=(s.historico||[]).slice(-60),W=300,H=100;
+ const ep=e&&e.estado==='conectado'&&e.hist&&e.hist.length>1?e.hist.slice(-60).map(x=>x[1]):null;
+ if(h.length<2)return`<div class="gpv"><div class="gh"><b>Taxa útil</b></div><div class="gv gm">aguardando dados…</div></div>`;
+ const mx=Math.max(...h)*1.15||1,xs=(i,n)=>(i/(n-1)*W).toFixed(1),p=h.map((y,i)=>`${xs(i,h.length)},${(H-y/mx*H).toFixed(1)}`).join(' ');
+ const at=h[h.length-1],mn=Math.min(...h),mxv=Math.max(...h);
+ let lp='',pa='';if(ep){const mp=Math.max(...ep,1);
+  lp=`<polyline class="lp" points="${ep.map((y,i)=>`${xs(i,ep.length)},${(H-y/mp*H*.9).toFixed(1)}`).join(' ')}"/>`;
+  const pv=ep[ep.length-1];pa=`<span class="${pv>1?'e':pv>0?'w':''}"><i class="lr"></i>Perda SRT <b>${pv.toFixed(2)}%</b></span>`}
+ const grade=[.25,.5,.75].map(f=>`<line x1="0" x2="${W}" y1="${(H*f).toFixed(1)}" y2="${(H*f).toFixed(1)}"/>`).join('');
+ return`<div class="gpv" title="taxa útil (sem pacotes nulos) nos últimos ${h.length} s${ep?'; vermelho = perda SRT na entrada':''}">
+ <div class="gh"><span><i class="lb"></i>Taxa útil <b>${mbps(at)}</b></span>${pa}<small>${h.length} s</small></div>
+ <div class="gv"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><g class="gg">${grade}</g><polygon class="ar" points="0,${H} ${p} ${W},${H}"/><polyline points="${p}"/>${lp}</svg>
+ <span class="gx t">${mbps(mx)}</span><span class="gx b">0</span></div>
+ <div class="gf"><span>mín <b>${mbps(mn)}</b></span><span>máx <b>${mbps(mxv)}</b></span>${s.modo_ts&&s.modo_ts.modo?seloModo(s.modo_ts):''}</div></div>`}
 function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t=s.tr101290,r=c.ultimo_relatorio;
  const dots='';const _dotsAntigo=t?`<span class="dots" title="TR 101 290 · prioridade 1">${TR.map(([k,n,d])=>{const v=t.contadores[k]||0;return`<i class="${t.recentes.includes(k)?'e':v?'w':t.sinal?'':'x'}" title="${esc(n)}: ${v}"></i>`}).join('')}
   <small>${(()=>{const p2=TRI.filter(x=>x[1]===2).reduce((a,x)=>a+(t.contadores[x[0]]||0),0),p3=TRI.filter(x=>x[1]===3).reduce((a,x)=>a+(t.contadores[x[0]]||0),0);return`P2 ${p2} · P3 ${p3}`})()}</small></span>`
@@ -3617,7 +3642,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
  ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
-   return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}${destinos}
+   return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}${grafRota(s,srt.SRTIN)}</div>`:''}${destinos}
  ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
  ${ativo&&s.estado!=='rodando'&&s.ultima_msg?`<div class="rrel" style="color:var(--warn)">${esc(s.ultima_msg)}</div>`:''}</div></div>`}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-vis]');if(!b)return;VIS=b.dataset.vis;try{localStorage.setItem('asi2srt.vis',VIS)}catch(x){}render()});
