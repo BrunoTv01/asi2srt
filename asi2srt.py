@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.18.0"
+__version__ = "2.18.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -3198,17 +3198,44 @@ LOGIN_HTML = r"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 :root{--bg:#0b0f14;--card:#121821;--line:#232c37;--txt:#e6edf3;--mut:#8b96a3;--acc:#2f81f7;--err:#f85149;--ok:#00a859}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
- display:flex;align-items:center;justify-content:center;padding:16px;
- background-image:radial-gradient(ellipse at 50% -10%,#16301f 0%,transparent 55%),radial-gradient(ellipse at 100% 100%,#101b2c 0%,transparent 50%)}
-.caixa{width:min(400px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px 28px 24px;
- box-shadow:0 20px 60px #0008;border-top:3px solid var(--ok)}
+body{margin:0;background:#060a0f;color:var(--txt);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ display:flex;align-items:center;justify-content:center;padding:16px;overflow:hidden;position:relative}
+/* fundo: brilho da marca, ondas de sinal e grade de estúdio */
+.fundo{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.fundo .luz{position:absolute;border-radius:50%;filter:blur(70px);opacity:.9}
+.fundo .l1{width:55vmax;height:55vmax;left:-12vmax;top:-22vmax;background:radial-gradient(circle,#00a85980,transparent 62%);animation:flut 18s ease-in-out infinite alternate}
+.fundo .l2{width:50vmax;height:50vmax;right:-15vmax;bottom:-20vmax;background:radial-gradient(circle,#1f6feb70,transparent 62%);animation:flut 22s ease-in-out infinite alternate-reverse}
+.fundo .l3{width:30vmax;height:30vmax;right:8vmax;top:6vmax;background:radial-gradient(circle,#00a85922,transparent 70%);animation:flut 26s ease-in-out infinite alternate}
+@keyframes flut{to{transform:translate(4vmax,3vmax) scale(1.08)}}
+.fundo .grade{position:absolute;left:-50%;right:-50%;bottom:0;height:48vh;
+ background-image:linear-gradient(#3fb9806b 1px,transparent 1px),linear-gradient(90deg,#2f81f75c 1px,transparent 1px);
+ background-size:56px 56px;transform:perspective(420px) rotateX(62deg);transform-origin:50% 100%;
+ -webkit-mask-image:linear-gradient(to top,#000 25%,transparent 95%);mask-image:linear-gradient(to top,#000 25%,transparent 95%);
+ animation:anda 9s linear infinite}
+@keyframes anda{to{background-position:0 56px,0 0}}
+.fundo svg{position:absolute;left:0;top:50%;width:100%;height:46vh;transform:translateY(-58%);opacity:.9}
+.fundo path{fill:none;stroke-linecap:round;vector-effect:non-scaling-stroke}
+.fundo .o1{stroke:#00c46a;stroke-width:2;opacity:.75;filter:drop-shadow(0 0 4px #00c46a);stroke-dasharray:6 10;animation:corre 14s linear infinite}
+.fundo .o2{stroke:#4c9bff;stroke-width:1.5;opacity:.6;animation:corre 20s linear infinite reverse;stroke-dasharray:2 7}
+.fundo .o3{stroke:#7ee2a8;stroke-width:1.2;opacity:.35}
+.fundo .o4{stroke:#9ec5ff;stroke-width:1;opacity:.25}
+@keyframes corre{to{stroke-dashoffset:-320}}
+.fundo .scan{position:absolute;inset:0;background:repeating-linear-gradient(0deg,#ffffff05 0 1px,transparent 1px 3px)}
+.fundo .vin{position:absolute;inset:0;background:radial-gradient(ellipse at center,transparent 55%,#060a0f99 100%)}
+@media(prefers-reduced-motion:reduce){.fundo *{animation:none!important}}
+.caixa{position:relative;z-index:1;width:min(400px,100%);background:#121821cc;border:1px solid #2a3440;border-radius:16px;padding:30px 28px 24px;
+ box-shadow:0 30px 80px #000a,0 0 0 1px #ffffff08 inset;border-top:3px solid var(--ok);
+ -webkit-backdrop-filter:blur(14px) saturate(1.2);backdrop-filter:blur(14px) saturate(1.2)}
+.aovivo{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:700;letter-spacing:.12em;color:#7ee2a8;
+ background:#00a8591a;border:1px solid #00a85955;border-radius:99px;padding:3px 10px 3px 8px}
+.aovivo i{width:7px;height:7px;border-radius:50%;background:#00d46a;box-shadow:0 0 0 0 #00d46a88;animation:pul 2s infinite}
+@keyframes pul{70%{box-shadow:0 0 0 7px #00d46a00}100%{box-shadow:0 0 0 0 #00d46a00}}
 .topo{display:flex;flex-direction:column;align-items:center;gap:12px;margin-bottom:22px;text-align:center}
 .topo img{max-height:64px;max-width:200px}
 .topo h1{font-size:19px;margin:0;font-weight:650}
 .topo p{margin:0;color:var(--mut);font-size:13px}
 label{display:block;font-size:12px;color:var(--mut);margin:0 0 14px;text-transform:uppercase;letter-spacing:.04em}
-input{display:block;width:100%;margin-top:6px;padding:11px 12px;font:inherit;font-size:15px;color:var(--txt);background:#0b0f14;
+input{display:block;width:100%;margin-top:6px;padding:11px 12px;font:inherit;font-size:15px;color:var(--txt);background:#0a0e13d9;
  border:1px solid var(--line);border-radius:9px;outline:none;text-transform:none;letter-spacing:0}
 input:focus{border-color:var(--acc);box-shadow:0 0 0 3px #2f81f733}
 .senha{position:relative}.senha input{padding-right:64px}
@@ -3219,8 +3246,10 @@ button.ent:hover{filter:brightness(1.08)}button.ent:disabled{opacity:.6;cursor:d
 .erro{min-height:20px;color:var(--err);font-size:13px;margin:10px 0 0;text-align:center}
 .rod{margin-top:18px;color:var(--mut);font-size:11.5px;text-align:center}
 </style></head><body>
+<div class="fundo" aria-hidden="true"><div class="luz l1"></div><div class="luz l2"></div><div class="luz l3"></div>
+<div class="grade"></div><svg viewBox="0 0 1200 200" preserveAspectRatio="none" aria-hidden="true"><path class="o3" d="M0,157.6 L13,159.7 L27,159.9 L40,158.4 L53,155.4 L67,151.0 L80,145.6 L93,139.3 L107,132.6 L120,125.7 L133,118.9 L147,112.5 L160,106.6 L173,101.4 L187,97.0 L200,93.4 L213,90.6 L227,88.6 L240,87.2 L253,86.4 L267,85.9 L280,85.8 L293,85.8 L307,85.9 L320,86.0 L333,86.2 L347,86.4 L360,86.8 L373,87.3 L387,88.2 L400,89.5 L413,91.3 L427,93.8 L440,97.1 L453,101.1 L467,105.9 L480,111.3 L493,117.3 L507,123.8 L520,130.3 L533,136.8 L547,142.9 L560,148.4 L573,152.8 L587,156.0 L600,157.8 L613,157.8 L627,156.2 L640,152.7 L653,147.5 L667,140.7 L680,132.4 L693,123.0 L707,112.8 L720,102.2 L733,91.5 L747,81.1 L760,71.4 L773,62.8 L787,55.5 L800,49.7 L813,45.7 L827,43.5 L840,43.0 L853,44.1 L867,46.8 L880,50.8 L893,55.9 L907,61.7 L920,68.0 L933,74.4 L947,80.7 L960,86.8 L973,92.3 L987,97.2 L1000,101.3 L1013,104.8 L1027,107.5 L1040,109.5 L1053,111.0 L1067,112.0 L1080,112.7 L1093,113.2 L1107,113.6 L1120,113.9 L1133,114.2 L1147,114.4 L1160,114.6 L1173,114.6 L1187,114.3 L1200,113.7"/><path class="o4" d="M0,106.0 L10,104.7 L20,103.2 L30,101.6 L40,99.9 L50,98.0 L60,96.1 L70,94.2 L80,92.3 L90,90.5 L100,88.9 L110,87.7 L120,87.0 L130,86.8 L140,87.4 L150,88.8 L160,90.9 L170,93.9 L180,97.7 L190,102.0 L200,106.8 L210,111.8 L220,116.7 L230,121.2 L240,125.0 L250,127.9 L260,129.6 L270,129.9 L280,128.6 L290,125.8 L300,121.5 L310,115.8 L320,109.0 L330,101.5 L340,93.5 L350,85.6 L360,78.1 L370,71.5 L380,66.1 L390,62.3 L400,60.3 L410,60.2 L420,62.1 L430,65.7 L440,71.0 L450,77.6 L460,85.1 L470,93.2 L480,101.4 L490,109.3 L500,116.5 L510,122.5 L520,127.2 L530,130.3 L540,131.8 L550,131.7 L560,130.1 L570,127.1 L580,123.1 L590,118.3 L600,113.0 L610,107.6 L620,102.3 L630,97.4 L640,93.2 L650,89.8 L660,87.3 L670,85.7 L680,85.0 L690,85.2 L700,86.0 L710,87.4 L720,89.2 L730,91.2 L740,93.4 L750,95.7 L760,97.8 L770,99.8 L780,101.7 L790,103.3 L800,104.7 L810,106.0 L820,107.0 L830,107.8 L840,108.3 L850,108.6 L860,108.5 L870,108.1 L880,107.2 L890,105.9 L900,104.2 L910,101.9 L920,99.2 L930,96.2 L940,92.9 L950,89.5 L960,86.2 L970,83.2 L980,80.8 L990,79.0 L1000,78.3 L1010,78.6 L1020,80.1 L1030,82.9 L1040,86.8 L1050,91.8 L1060,97.7 L1070,104.2 L1080,111.0 L1090,117.7 L1100,123.9 L1110,129.3 L1120,133.5 L1130,136.2 L1140,137.3 L1150,136.5 L1160,133.9 L1170,129.5 L1180,123.6 L1190,116.5 L1200,108.4"/><path class="o1" d="M0,108.3 L15,114.0 L30,120.1 L45,126.2 L60,132.2 L75,137.9 L90,143.0 L105,147.3 L120,150.8 L135,153.3 L150,154.6 L165,154.8 L180,153.8 L195,151.7 L210,148.6 L225,144.6 L240,139.8 L255,134.5 L270,128.8 L285,122.9 L300,117.1 L315,111.6 L330,106.4 L345,101.7 L360,97.7 L375,94.3 L390,91.7 L405,89.7 L420,88.3 L435,87.6 L450,87.2 L465,87.3 L480,87.5 L495,87.9 L510,88.3 L525,88.7 L540,88.9 L555,89.1 L570,89.1 L585,89.0 L600,88.9 L615,88.9 L630,89.0 L645,89.3 L660,90.1 L675,91.3 L690,93.1 L705,95.5 L720,98.6 L735,102.3 L750,106.6 L765,111.4 L780,116.7 L795,122.2 L810,127.9 L825,133.4 L840,138.7 L855,143.4 L870,147.5 L885,150.8 L900,153.0 L915,154.2 L930,154.2 L945,153.1 L960,150.8 L975,147.5 L990,143.2 L1005,138.2 L1020,132.5 L1035,126.4 L1050,120.1 L1065,113.9 L1080,107.8 L1095,102.2 L1110,97.1 L1125,92.6 L1140,88.9 L1155,86.1 L1170,84.0 L1185,82.6 L1200,82.0"/><path class="o2" d="M0,77.4 L12,74.0 L24,72.0 L36,71.2 L48,71.8 L60,73.7 L72,76.7 L84,80.6 L96,85.1 L108,90.1 L120,95.1 L132,99.9 L144,104.4 L156,108.2 L168,111.2 L180,113.3 L192,114.6 L204,115.0 L216,114.7 L228,113.7 L240,112.1 L252,110.3 L264,108.2 L276,106.0 L288,103.9 L300,102.0 L312,100.3 L324,98.8 L336,97.5 L348,96.4 L360,95.6 L372,94.9 L384,94.4 L396,94.0 L408,93.7 L420,93.7 L432,93.8 L444,94.2 L456,94.9 L468,96.0 L480,97.5 L492,99.3 L504,101.6 L516,104.1 L528,106.9 L540,109.8 L552,112.6 L564,115.1 L576,117.2 L588,118.6 L600,119.2 L612,118.9 L624,117.5 L636,115.1 L648,111.7 L660,107.5 L672,102.5 L684,97.1 L696,91.4 L708,85.9 L720,80.8 L732,76.5 L744,73.1 L756,70.9 L768,70.1 L780,70.6 L792,72.5 L804,75.6 L816,79.8 L828,84.9 L840,90.5 L852,96.4 L864,102.2 L876,107.6 L888,112.3 L900,116.2 L912,119.1 L924,120.9 L936,121.5 L948,121.1 L960,119.7 L972,117.6 L984,114.8 L996,111.7 L1008,108.4 L1020,105.2 L1032,102.1 L1044,99.4 L1056,97.1 L1068,95.3 L1080,94.0 L1092,93.2 L1104,92.8 L1116,92.7 L1128,93.0 L1140,93.4 L1152,94.0 L1164,94.8 L1176,95.6 L1188,96.6 L1200,97.6"/></svg><div class="scan"></div><div class="vin"></div></div>
 <main class="caixa">
- <div class="topo">__LOGO__<h1>__TITULO__</h1><p>Acesso ao sistema de monitoração e distribuição de sinais</p></div>
+ <div class="topo">__LOGO__<h1>__TITULO__</h1><p>Acesso ao sistema de monitoração e distribuição de sinais</p><span class="aovivo"><i></i>SINAL · SRT · ASI · TR 101 290</span></div>
  <form id="f" autocomplete="on">
   <label>Usuário<input name="usuario" id="u" autocomplete="username" autocapitalize="off" spellcheck="false" required autofocus></label>
   <label class="senha">Senha<input name="senha" id="s" type="password" autocomplete="current-password" required>
