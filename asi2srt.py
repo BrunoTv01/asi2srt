@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.16.0"
+__version__ = "2.17.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -95,6 +95,7 @@ canais:
       bitrate_min: 1000000    # alarme abaixo disto (bit/s). 0 = desligado
       bitrate_max: 0          # alarme acima disto (bit/s). 0 = desligado
       intervalo_relatorio_s: 5
+      reiniciar_sem_sinal_s: 20   # reinicia a entrada se ficar muda (0 = desligado)
 
     # Uma ou mais saídas. A primeira é a principal; as demais recebem cópia.
     saidas:
@@ -470,6 +471,26 @@ def _args_ip_entrada(endereco, interface_local="") -> list:
     return [porta] + (["--local-address", local] if local else [])
 
 
+BUFFER_UDP = 16 * 1024 * 1024   # buffer de recepção UDP (o kernel limita a net.core.rmem_max; ver instalar-servico)
+
+
+def udp_descartes():
+    """Datagramas que o kernel descartou em cada porta UDP local (buffer cheio = o processo não deu conta)."""
+    out = {}
+    for arq in ("/proc/net/udp", "/proc/net/udp6"):
+        try:
+            with open(arq) as f:
+                next(f, None)
+                for ln in f:
+                    c = ln.split()
+                    if len(c) >= 13:
+                        porta = int(c[1].rsplit(":", 1)[1], 16)
+                        out[porta] = out.get(porta, 0) + int(c[-1])
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
 def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
     """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
     canal = normalizar_canal(canal)
@@ -492,7 +513,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
         if not ent.get("endereco"):
             raise ValueError("entrada UDP precisa de ip:porta (ou só porta)")
         cmd += ["-I", "ip"] + _args_ip_entrada(ent["endereco"], _ip_local(ent))
-        cmd += ["--receive-timeout", "5000"]
+        cmd += ["--receive-timeout", "5000", "--buffer-size", str(BUFFER_UDP)]
     elif tipo == "srt":
         cmd[1:1] = ["--verbose"]  # mostra o endereço do outro lado ("connected from ...")
         cmd += ["-I", "srt"] + _args_srt(ent, entrada=True, prefixo="SRTIN")
@@ -508,7 +529,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     # cópia do TS bruto (logo após a entrada, antes de filtros) para o analisador TR 101 290
     if porta_analise and proc.get("analise_tr101290", True):
         filho = [tsp_bin, "-O", "ip", f"127.0.0.1:{porta_analise}", "--packet-burst", "7"]
-        cmd += ["-P", "fork", "--nowait", "--buffered-packets", "7",
+        cmd += ["-P", "fork", "--nowait", "--ignore-abort", "--buffered-packets", "7",
                 " ".join(shlex.quote(a) for a in filho)]
 
     pids =[_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
@@ -566,7 +587,7 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     cmd = [tsp_bin, "--realtime"]
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
-    cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", "4000000"]
+    cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", str(BUFFER_UDP)]
     servs = servicos_da_saida(s)
     if servs:  # só os serviços escolhidos: zap refaz PAT/PMT/SDT; --ignore-absent não derruba a saída
         cmd += ["-P", "zap", "--ignore-absent", "--eit"] + servs
@@ -725,6 +746,9 @@ class AnalisadorTS:
     # --- estado -------------------------------------------------------
     def zerar(self):
         self.est_taxa = [0, 0.0, None, None]   # n, soma, mín, máx (taxa ÚTIL por segundo, sem nulos)
+        self._semente = False
+        self.picos = 0              # segundos com rajada de chegada (rede/SRT segurou e soltou de uma vez)
+        self.perda_local = 0        # datagramas descartados pelo sistema antes de chegar ao analisador
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
         self.cc_pid = {}
@@ -1139,12 +1163,27 @@ class AnalisadorTS:
                     int(sum(self.taxa.get(p, 0) for p in pids)))
             util = self.taxa_total - self.taxa.get(0x1FFF, 0)
             self.hist_util.append(int(util))
-            if util > 0 and self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL:
+            fluindo = self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL
+            if util > 0 and fluindo:
                 e = self.est_taxa
                 e[0] += 1
                 e[1] += util
-                e[2] = util if e[2] is None else min(e[2], util)
-                e[3] = util if e[3] is None else max(e[3], util)
+                # Mín./máx. pela média de 5 s, ignorando os 3 s após o sinal voltar: assim uma rajada
+                # (pacotes retidos pela rede e entregues de uma vez) não vira "máximo de 60 Mb/s".
+                jan = list(self.hist_util)[-5:]
+                if len(jan) == 5 and all(jan) and self.inicio_fluxo is not None and agora - self.inicio_fluxo >= 8:
+                    m5 = sum(jan) / 5
+                    if e[2] is None or self._semente:
+                        e[2] = e[3] = m5
+                        self._semente = False
+                    else:
+                        e[2], e[3] = min(e[2], m5), max(e[3], m5)
+                    ant = sorted(list(self.hist_util)[-11:-1])
+                    if len(ant) >= 5 and util > 1e6 and util > 2.5 * ant[len(ant) // 2]:
+                        self.picos += 1
+                elif e[2] is None and self.inicio_fluxo is not None and agora - self.inicio_fluxo >= 3:
+                    e[2] = e[3] = util   # sessão curta: valor provisório até ter a média de 5 s
+                    self._semente = True
             self.pcr_info = {p: {"intervalo_ms": round(j[0] / 27000, 2), "jitter_ns": int(j[1])}
                              for p, j in self.pcr_janela.items()}
             self.pcr_janela = {}
@@ -1293,7 +1332,9 @@ class AnalisadorTS:
     def taxa_sessao(self):
         with self.lock:
             n, soma, mn, mx = self.est_taxa
-        return {"media": int(soma / n) if n else 0, "min": int(mn or 0), "max": int(mx or 0), "segundos_com_sinal": n}
+            picos, perda = self.picos, self.perda_local
+        return {"media": int(soma / n) if n else 0, "min": int(mn or 0), "max": int(mx or 0), "segundos_com_sinal": n,
+                "rajadas": picos, "perda_interna": perda}
 
     def relatorio(self, agora_mono=None, agora_wall=None):
         """Análise congelada para guardar: horários absolutos no lugar de 'há N s'."""
@@ -1304,11 +1345,12 @@ class AnalisadorTS:
         with self.lock:
             tr["ultimo_em"] = {k: agora_wall - (agora_mono - v) for k, v in self.ultimo_erro.items()}
             n, soma, mn, mx = self.est_taxa
+            picos, perda = self.picos, self.perda_local
         tr.pop("ha_s", None)
         tr["recentes"] = []
         a["resumo"]["sinal"] = False
         a["taxa_sessao"] = {"media": int(soma / n) if n else 0, "min": int(mn or 0), "max": int(mx or 0),
-                            "segundos_com_sinal": n}
+                            "segundos_com_sinal": n, "rajadas": picos, "perda_interna": perda}
         return a
 
     def analise(self, agora=None):
@@ -1403,9 +1445,12 @@ class AnalisadorTS:
         import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_RCVBUFFORCE", socket.SO_RCVBUF), BUFFER_UDP)
         except OSError:
-            pass
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_UDP)
+            except OSError:
+                pass
         s.bind(("127.0.0.1", 0))
         s.settimeout(0.25)
         self._sock = s
@@ -1415,7 +1460,9 @@ class AnalisadorTS:
 
     def _loop(self):
         ultima = 0.0
+        falhas = 0
         while not self._parar.is_set():
+            agora = time.monotonic()
             try:
                 dados = self._sock.recv(65536)
                 agora = time.monotonic()
@@ -1423,10 +1470,17 @@ class AnalisadorTS:
                     self.processar(dados, agora)
             except OSError:
                 agora = time.monotonic()
+            except Exception:   # pacote/tabela malformada nunca pode parar a análise
+                falhas += 1
+                if falhas <= 5 or falhas % 1000 == 0:
+                    log.exception("analisador: erro ao processar pacote (%d)", falhas)
             if agora - ultima >= 0.25:
                 ultima = agora
-                with self.lock:
-                    self.verificar(agora)
+                try:
+                    with self.lock:
+                        self.verificar(agora)
+                except Exception:
+                    log.exception("analisador: erro na verificação periódica")
 
     def fechar(self):
         self._parar.set()
@@ -1539,6 +1593,7 @@ class ProcSaida(threading.Thread):
         self.proc = None
         self.parar = threading.Event()
         self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None, "info": {}}
+        self.atividade = time.monotonic()
         self._prog = {}
         self.hist = collections.deque(maxlen=150)      # taxa de saída (kb/s), um ponto a cada ~2 s
         self.enviado = 0                                # bytes enviados na sessão (todas as conexões)
@@ -1587,6 +1642,7 @@ class ProcSaida(threading.Thread):
     def _ler(self, stream):
         est = self.canal.srt.get(self.chave)
         for linha in iter(stream.readline, ""):
+            self.atividade = time.monotonic()
             linha = linha.rstrip()
             if not linha:
                 continue
@@ -1649,6 +1705,7 @@ class ProcSaida(threading.Thread):
                 self.parar.wait(espera_max)
                 continue
             # UDP/RTP não têm "conexão": ficam no ar quando a primeira taxa é medida
+            self.atividade = time.monotonic()
             self.st.update(estado="conectando", desde=None, info={})
             self._ler(self.proc.stdout)
             rc = self.proc.wait()
@@ -1676,6 +1733,14 @@ class ProcSaida(threading.Thread):
 
 
 _FFMPEG_RECURSOS = None
+
+
+def _prioridade_baixa():
+    """A janela de imagem é acessória: roda com prioridade baixa para nunca atrasar o fluxo."""
+    try:
+        os.nice(15)
+    except OSError:
+        pass
 
 
 def recursos_ffmpeg():
@@ -1760,8 +1825,8 @@ class Previa(threading.Thread):
             if vivo and servs == self.servs:
                 continue
             if self.proc is not None and not vivo:   # caiu: espera um pouco antes de tentar de novo
-                err = (self.proc.stderr.read() if self.proc.stderr else "") or ""
-                self.motivo = mascarar(err.strip().splitlines()[-1][:200]) if err.strip() else "ffmpeg encerrou"
+                err = [x for x in getattr(self, "_err", ()) if x.strip()]
+                self.motivo = mascarar(err[-1][:200]) if err else "ffmpeg encerrou"
                 self.proc = None
                 self._proxima = agora + 5
             if agora < self._proxima:
@@ -1770,13 +1835,24 @@ class Previa(threading.Thread):
             self.servs = servs
             try:
                 self.proc = subprocess.Popen(self.comando(servs), stdin=subprocess.DEVNULL,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                             preexec_fn=_prioridade_baixa)
+                self._err = collections.deque(maxlen=5)
+                threading.Thread(target=self._ler_err, args=(self.proc, self._err), daemon=True).start()
                 self.motivo = "gerando imagem…"
             except OSError as e:
                 self.motivo = str(e)
                 self._proxima = agora + 30
         self._parar_ffmpeg()
         shutil.rmtree(self.pasta, ignore_errors=True)
+
+    @staticmethod
+    def _ler_err(proc, fila):
+        try:
+            for ln in iter(proc.stderr.readline, ""):
+                fila.append(ln.rstrip())
+        except (OSError, ValueError):
+            pass
 
     def imagem(self, sid):
         cam = os.path.join(self.pasta, f"{int(sid)}.jpg")
@@ -1800,9 +1876,12 @@ class Distribuidor:
         import socket
         self._s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            self._s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            self._s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_RCVBUFFORCE", socket.SO_RCVBUF), BUFFER_UDP)
         except OSError:
-            pass
+            try:
+                self._s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUFFER_UDP)
+            except OSError:
+                pass
         self._s.bind(("127.0.0.1", 0))
         self._s.settimeout(0.5)
         self.porta = self._s.getsockname()[1]
@@ -1824,7 +1903,7 @@ class Distribuidor:
             for dst in self.destinos:
                 try:
                     self._s.sendto(d, dst)
-                except OSError:
+                except Exception:
                     pass  # saída reiniciando: o datagrama é simplesmente descartado
 
     def fechar(self):
@@ -1869,6 +1948,11 @@ class Canal(threading.Thread):
                 self.srt[f"SRTOUT{i}"] = EstatSRT("saida", s, f"Saída {i + 1}")
         self.procs_saida = [ProcSaida(self, i, s) for i, s in enumerate(c["saidas"])]
         self.previa = Previa(self)
+        self.t_proc = time.monotonic()
+        self.perda = {"analise": 0, "distribuidor": 0, "saidas": [0] * len(self.procs_saida)}
+        self.perda_ate = 0.0
+        self._aviso_perda = 0.0
+        self.reinicios_vigia = 0
 
     def srt_status(self):
         rodando = not self.parar.is_set()
@@ -1896,6 +1980,7 @@ class Canal(threading.Thread):
         s["tr101290"] = self.analisador.status()
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         s["srt"] = self.srt_status()
+        s["perda_interna"] = self.perda_status()
         s["saidas"] = [p.status() for p in self.procs_saida]
         s["servicos"] = self.analisador.servicos_resumo()
         s.update(self.analisador.taxas())
@@ -1904,6 +1989,88 @@ class Canal(threading.Thread):
         if any(hu):
             s["historico"] = hu
         return s
+
+    # --- vigia: sinal parado, saída travada e perda dentro do próprio servidor -----------
+    def _vigia(self):
+        base = {}
+        ult_dist, t_dist = -1, time.monotonic()
+        while not self.parar.wait(2):
+            try:
+                ult_dist, t_dist = self._vigiar(base, ult_dist, t_dist)
+            except Exception:
+                log.exception("[%s] vigia", self.name)
+
+    def _vigiar(self, base, ult_dist, t_dist):
+        agora = time.monotonic()
+        proc_cfg = self.cfg.get("processamento") or {}
+        # 1) perda interna (kernel descartou datagramas porque o processo não leu a tempo)
+        drops = udp_descartes()
+        alvos = [("analise", self.analisador.porta, None), ("distribuidor", self.distribuidor.porta, None)]
+        alvos += [("saidas", ps.porta, i) for i, ps in enumerate(self.procs_saida)]
+        novas = 0
+        for nome, porta, i in alvos:
+            d = drops.get(porta)
+            if d is None:
+                continue
+            ant = base.get(porta, 0)
+            if d < ant:          # processo da saída reiniciou: socket novo, contador do zero
+                ant = 0
+            delta, base[porta] = d - ant, d
+            if delta <= 0:
+                continue
+            novas += delta
+            if i is None:
+                self.perda[nome] += delta
+            else:
+                self.perda["saidas"][i] += delta
+            if nome == "analise":
+                with self.analisador.lock:
+                    self.analisador.perda_local += delta
+        if novas:
+            self.perda_ate = agora + 15
+            if agora - self._aviso_perda > 60:
+                self._aviso_perda = agora
+                self._registrar(logging.WARNING,
+                                f"o servidor descartou {novas} datagrama(s) internamente (CPU sobrecarregada ou "
+                                "buffer UDP pequeno). Erros de CC neste momento podem não estar no sinal.")
+        # 2) entrada parada: conectada, mas sem pacotes (ex.: SRT ativo e o encoder parou de enviar)
+        dist = self.distribuidor.pacotes
+        if dist != ult_dist:
+            ult_dist, t_dist = dist, agora
+        with self.analisador.lock:
+            up = self.analisador.ultimo_pacote
+        ultimo = max(x for x in (up, t_dist if ult_dist > 0 else None, 0.0) if x is not None)
+        limite = float(proc_cfg.get("reiniciar_sem_sinal_s", 20) or 0)
+        p = self.proc
+        if limite > 0 and p is not None and p.poll() is None:
+            tipo = normalizar_canal(self.cfg)["entrada"].get("tipo")
+            teve_dados = ultimo > self.t_proc
+            parado = agora - max(ultimo, self.t_proc)
+            if (teve_dados and parado > limite) or (not teve_dados and tipo == "linuxasi" and parado > max(limite, 30)):
+                self.reinicios_vigia += 1
+                self._registrar(logging.WARNING, f"entrada sem sinal há {int(parado)} s — reiniciando a entrada")
+                self._set(ultima_msg=f"sem sinal há {int(parado)} s: entrada reiniciada")
+                try:
+                    p.terminate()
+                except OSError:
+                    pass
+        # 3) saída travada: estava no ar, a entrada está chegando, mas o processo parou de responder
+        entrada_ok = agora - ultimo < 3
+        for i, ps in enumerate(self.procs_saida):
+            pp = ps.proc
+            if entrada_ok and pp is not None and pp.poll() is None and ps.st.get("estado") == "rodando" \
+                    and agora - ps.atividade > 30:
+                self._registrar(logging.WARNING, f"[saída {i + 1}] sem atividade há {int(agora - ps.atividade)} s "
+                                "com a entrada no ar — reiniciando a saída")
+                ps.atividade = agora
+                try:
+                    pp.terminate()
+                except OSError:
+                    pass
+        return ult_dist, t_dist
+
+    def perda_status(self):
+        return {**self.perda, "recente": time.monotonic() < self.perda_ate}
 
     def relatorio(self, motivo):
         agora_w = time.time()
@@ -1915,7 +2082,8 @@ class Canal(threading.Thread):
                 "motivo": motivo, "reinicios": self.st.get("reinicios", 0),
                 "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a, "srt": self.srt_status(),
                 "saidas": [p.status() for p in self.procs_saida],
-                "saidas_cfg": saidas_publicas(normalizar_canal(self.cfg)["saidas"])}
+                "saidas_cfg": saidas_publicas(normalizar_canal(self.cfg)["saidas"]),
+                "perda_interna": self.perda_status(), "reinicios_sem_sinal": self.reinicios_vigia}
 
     def zerar_contadores(self):
         with self.analisador.lock:
@@ -1970,11 +2138,13 @@ class Canal(threading.Thread):
             for p in self.procs_saida:
                 p.start()
             self.previa.start()
+        threading.Thread(target=self._vigia, daemon=True, name=f"{self.name}-vigia").start()
         while not self.parar.is_set():
             self._registrar(logging.INFO, "iniciando: " + comando_para_log(self.cmd))
             with self.analisador.lock:
                 self.analisador.reiniciar_estado()
             t0 = time.time()
+            self.t_proc = time.monotonic()
             try:
                 self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE,
                                              stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -2349,7 +2519,8 @@ def dados_relatorio(dados, canal, titulo):
         "inicio": per.get("inicio"), "fim": per.get("fim") or agora, "duracao": per.get("duracao_s", 0),
         "entrada": _desc_entrada(canal.get("entrada", {})),
         "taxa": {"media": ts.get("media"), "min": ts.get("min"), "max": ts.get("max"),
-                 "atual_util": r.get("taxa_util"), "atual_ts": r.get("taxa_total")},
+                 "atual_util": r.get("taxa_util"), "atual_ts": r.get("taxa_total"),
+                 "rajadas": ts.get("rajadas") or 0, "perda_interna": ts.get("perda_interna") or 0},
         "modo": modo, "tsid": r.get("tsid"), "rede": r.get("rede"), "hora_ts": r.get("hora_ts"),
         "n_pids": r.get("n_pids"), "pacotes": r.get("pacotes"),
         "indicadores": indicadores,
@@ -2377,7 +2548,13 @@ def relatorio_txt(d) -> str:
     tx = d["taxa"]
     L += ["TAXA (útil, sem pacotes nulos)", "-" * 78]
     if tx.get("media"):
-        L += [f"  Média {_f_taxa(tx['media'])}   ·   mínima {_f_taxa(tx['min'])}   ·   máxima {_f_taxa(tx['max'])}"]
+        L += [f"  Média {_f_taxa(tx['media'])}   ·   mínima {_f_taxa(tx['min'])}   ·   máxima {_f_taxa(tx['max'])}"
+              "   (mín./máx. = médias de 5 s)"]
+    if tx.get("rajadas"):
+        L += [f"  Rajadas de chegada: {tx['rajadas']} s (pacotes retidos pela rede/SRT e entregues de uma vez)"]
+    if tx.get("perda_interna"):
+        L += [f"  ATENÇÃO: o servidor descartou {_f_n(tx['perda_interna'])} datagramas internamente "
+              "(CPU/buffer); erros de CC nesses momentos podem não estar no sinal"]
     if not d["salvo"] and tx.get("atual_util") is not None:
         L += [f"  Agora {_f_taxa(tx['atual_util'])} úteis   (TS total com nulos: {_f_taxa(tx['atual_ts'])})"]
     m = d["modo"]
@@ -2445,6 +2622,10 @@ def relatorio_html(d, logo=None) -> str:
     kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
              ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
              ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—")]
+    if tx.get("rajadas"):
+        kpis.append(("Rajadas de chegada", f"{tx['rajadas']} s"))
+    if tx.get("perda_interna"):
+        kpis.append(("Perda interna (servidor)", _f_n(tx["perda_interna"])))
     total_erros = sum(d["totais"].values())
     H = [f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Relatório — {e(d['canal'])}</title>
@@ -3151,20 +3332,46 @@ UNIDADE_SYSTEMD = """\
 Description=Gateway ASI/UDP/SRT -> SRT/UDP (asi2srt)
 After=network-online.target
 Wants=network-online.target
+# nunca desistir de religar (o padrão do systemd desiste após 5 falhas em 10 s)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart={exe} rodar -c {config}
 Restart=always
 RestartSec=3
+TimeoutStopSec=20
+# prioridade alta, mas sem tempo real (SCHED_FIFO podia travar a máquina com o ffmpeg da janela de imagem)
 Nice=-10
-CPUSchedulingPolicy=fifo
-CPUSchedulingPriority=50
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+LimitNOFILE=65536
 LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
+SYSCTL_ASI2SRT = """\
+# asi2srt: buffers UDP grandes para não perder pacotes em rajadas (TS de até ~200 Mb/s)
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.core.rmem_default = 4194304
+net.core.netdev_max_backlog = 10000
+"""
+
+
+def ajustar_rede():
+    """Grava e aplica /etc/sysctl.d/90-asi2srt.conf (sem isso o kernel corta o buffer UDP em ~200 KB)."""
+    try:
+        with open("/etc/sysctl.d/90-asi2srt.conf", "w") as f:
+            f.write(SYSCTL_ASI2SRT)
+        subprocess.run(["sysctl", "-q", "-p", "/etc/sysctl.d/90-asi2srt.conf"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("buffers de rede ajustados (/etc/sysctl.d/90-asi2srt.conf)")
+    except OSError as e:
+        print(f"aviso: não consegui ajustar os buffers de rede: {e}")
 
 
 def cmd_instalar_servico(args):
@@ -3185,6 +3392,7 @@ def cmd_instalar_servico(args):
     with open("/etc/systemd/system/asi2srt.service", "w") as f:
         f.write(UNIDADE_SYSTEMD.format(exe=exe, config=args.config))
     subprocess.run(["systemctl", "daemon-reload"], check=False)
+    ajustar_rede()
     print("serviço instalado.\n"
           "  1. sudo systemctl enable --now asi2srt\n"
           "  2. login do painel: admin / admin  (troque em senha_painel no arquivo de configuração)\n"
@@ -3246,6 +3454,7 @@ main{padding:20px;max-width:1400px;margin:auto}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
 .top{display:flex;align-items:center;gap:8px}.top h2{font-size:15px;margin:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill.pint{color:var(--warn)}
 .pill{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid currentColor;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
 .rodando{color:var(--ok)}.conectando,.reiniciando,.iniciando{color:var(--warn)}.erro,.sem_dados{color:var(--err)}.parado{color:var(--mut)}
 .fluxo{display:flex;flex-direction:column;gap:3px;font-size:12.5px}
@@ -3532,8 +3741,9 @@ function relCard(c){const r=c.ultimo_relatorio,n=r.contadores;
  <div class="trp"><span class="${r.totais.p2?'w':''}">P2 · ${r.totais.p2}</span><span class="${r.totais.p3?'w':''}">P3 · ${r.totais.p3}</span>
  <span>${r.n_servicos} serv · ${r.n_pids} PIDs</span><a data-ana="${c.id}">Ver relatório →</a></div>
  ${r.servicos.length?`<div class="msg" style="margin-top:4px" title="${esc(r.servicos.join(', '))}">${esc(r.servicos.join(' · '))}</div>`:''}</div>`}
+function pInt(s){const p=s&&s.perda_interna;return p&&p.recente?`<span class="pill pint" title="O próprio servidor descartou pacotes agora (CPU sobrecarregada ou buffer UDP pequeno). Erros de CC neste momento podem não estar no sinal. Total: análise ${p.analise}, distribuidor ${p.distribuidor}${p.saidas.some(x=>x)?', saídas '+p.saidas.join('/'):''}">⚠ perda interna</span>`:''}
 function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
- return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></div>
+ return`<div class="card"><div class="top"><h2 title="${esc(c.nome)}">${esc(c.nome)}</h2><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}</div>
  <div class="fluxo"><div><span class="l">Entrada</span><span class="tag">${esc(resE(c.entrada))}</span></div>
  <div><span class="l">Saídas</span>${c.saidas.length?c.saidas.map(x=>{const r=servRotulo(x,s.servicos);return`<span class="tag">${esc(resS(x))}${r?' · '+esc(r.map(q=>q.nome).join(', ')):''}</span>`}).join(''):'<span class="tag" style="color:var(--mut)">somente análise</span>'}</div></div>
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
@@ -3637,7 +3847,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
- return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
+ return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}
  ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa útil: só o conteúdo, sem pacotes nulos de enchimento${x.temNulos?` (o TS chega com ${mb(x.ts)} Mb/s com enchimento)`:''}">${mb(x.ut)} <small>Mb/s</small></span> ${seloModo(s.modo_ts)}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
@@ -3755,10 +3965,12 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
  $('#azerar').hidden=!!S;$('#aban').hidden=!S;
  if(S)$('#aban').innerHTML=`Análise ${esc(MOTIVO_L[p.motivo]||p.motivo)} — resumo salvo de <b>${fmtDH(p.inicio)}</b> até <b>${fmtDH(p.fim)}</b> (${dur(p.duracao_s)}).`
   +(p.motivo==='em andamento'?' Sessão ainda em andamento: este é o último salvamento automático.':'');
- $('#akpi').innerHTML=(S?kpi('Duração',dur(p.duracao_s))+kpi('Bitrate médio',fmtR(ts.media))+kpi('Bitrate mínimo',fmtR(ts.min))+kpi('Bitrate máximo',fmtR(ts.max))
+ $('#akpi').innerHTML=(S?kpi('Duração',dur(p.duracao_s))+kpi('Bitrate médio',fmtR(ts.media))+kpi('Bitrate mínimo',fmtR(ts.min),'menor média de 5 s da sessão')+kpi('Bitrate máximo',fmtR(ts.max),'maior média de 5 s da sessão (rajadas isoladas não contam)')
   :kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')+kpi('Sessão',dur(p.duracao_s)))
   +kpi('Taxa do TS',r.modo_taxa&&r.modo_taxa.modo?`${r.modo_taxa.modo} <small style="font-size:12px;color:var(--mut)">±${r.modo_taxa.variacao_pct}%</small>`:'medindo…',
-     r.modo_taxa&&r.modo_taxa.modo?`variação da taxa total nos últimos ${r.modo_taxa.amostras} s (mín ${fmtR(r.modo_taxa.min)}, máx ${fmtR(r.modo_taxa.max)}). CBR abaixo de 2%.`:'')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'))
+     r.modo_taxa&&r.modo_taxa.modo?`variação da taxa total nos últimos ${r.modo_taxa.amostras} s (mín ${fmtR(r.modo_taxa.min)}, máx ${fmtR(r.modo_taxa.max)}). CBR abaixo de 2%.`:'')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'),'Nome da rede na tabela NIT: '+(r.rede||'este sinal não envia NIT (comum em sinal por IP)'))
+  +(ts&&ts.rajadas?kpi('Rajadas',ts.rajadas,'segundos em que os pacotes chegaram acumulados (a rede ou o SRT segurou e soltou de uma vez). Costumam vir junto com perda/retransmissão.'):'')
+  +(ts&&ts.perda_interna?kpi('Perda interna',`<span style="color:var(--warn)">${ts.perda_interna.toLocaleString('pt-BR')}</span>`,'datagramas descartados pelo próprio servidor antes da análise (CPU sobrecarregada ou buffer pequeno). Nesses momentos os erros de CC podem não estar no sinal.'):'')
   +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
   +kpi('Pacotes',r.pacotes.toLocaleString('pt-BR'));
  $('#adesde').textContent='desde '+new Date(r.desde*1000).toLocaleTimeString('pt-BR');

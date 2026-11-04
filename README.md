@@ -358,6 +358,29 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## Estabilidade e robustez
+
+O sistema se protege sozinho dos problemas mais comuns de campo:
+
+- **Entrada muda:** se a entrada para de mandar pacotes mas continua "conectada" (ex.: SRT ativo com
+  o encoder parado, driver ASI travado), o canal reinicia a entrada depois de **20 s** sem sinal.
+  Ajuste em `processamento.reiniciar_sem_sinal_s` (0 desliga).
+- **Saída travada:** uma saída que estava no ar e para de responder por 30 s (com a entrada chegando) é
+  reiniciada sozinha, sem mexer nas outras saídas nem na análise.
+- **Analisador isolado:** se a cópia para análise falhar, o TSDuck segue com a entrada e as saídas
+  (`fork --ignore-abort`); um pacote ou tabela malformada não para a análise.
+- **Perda interna:** o sistema compara o que o kernel descartou em cada etapa (análise, distribuidor e
+  saídas). Se o próprio servidor perder pacotes (CPU no limite, buffer pequeno), a rota mostra
+  **⚠ PERDA INTERNA**. Assim dá para separar erro do sinal de erro do servidor. O total também vai
+  para o relatório.
+- **Buffers de rede:** o `instalar-servico` grava `/etc/sysctl.d/90-asi2srt.conf` (buffers UDP de 32 MB)
+  e cada entrada UDP pede 16 MB. Sem isso o Linux corta o buffer em ~200 KB e rajadas viram perda.
+- **Bitrate mínimo/máximo** usam a média de 5 s e ignoram os primeiros segundos depois que o sinal
+  volta: uma rajada (rede/SRT segurou e soltou de uma vez) não aparece como "máximo de 60 Mb/s".
+  As rajadas são contadas à parte (KPI **Rajadas**).
+- **Serviço:** o systemd nunca desiste de religar (`StartLimitIntervalSec=0`). Prioridade alta sem
+  tempo real, e a janela de imagem (ffmpeg) roda com prioridade baixa: ela nunca atrasa o fluxo.
+
 ## Dicas
 
 - **Latência SRT:** 3–4× o RTT. Internet pública: 500–2000 ms. LAN/MPLS: 120–200 ms.
@@ -370,7 +393,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.16.0 && git push origin v2.16.0
+git tag v2.17.0 && git push origin v2.17.0
 ```
 
 ## Licença

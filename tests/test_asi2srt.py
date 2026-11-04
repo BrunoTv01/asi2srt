@@ -70,7 +70,7 @@ def test_comando_com_analise():
     cmd = a.montar_comando(canal, porta_analise=40000)
     i = cmd.index("fork")
     assert cmd.index("fork") < cmd.index("filter")          # analisa o TS bruto, antes do filtro
-    assert "-O ip 127.0.0.1:40000" in cmd[i + 4]
+    assert any("-O ip 127.0.0.1:40000" in x for x in cmd[i:i + 6])
     canal["processamento"] = {"analise_tr101290": False}
     assert "fork" not in a.montar_comando(canal, porta_analise=40000)
 
@@ -222,7 +222,7 @@ OPCOES_TSDUCK = {
            "--rtp", "--payload-type", "--ssrc-identifier"},
     "dektec": {"--device", "--channel", "--receive-timeout"},
     "file": {"--infinite"},
-    "fork": {"--nowait", "--buffered-packets"},
+    "fork": {"--nowait", "--ignore-abort", "--buffered-packets"},
     "drop": set(),
     "filter": {"--negate", "--pid"},
     "bitrate_monitor": {"--periodic-bitrate", "--time-interval", "--min", "--max"},
@@ -954,3 +954,121 @@ def test_api_baixar_relatorio_formatos(gateway):
             assert resp.headers["Content-Type"].startswith(tipo)
             assert resp.headers["Content-Disposition"].endswith(ext + '"')
             assert len(resp.read()) > 200
+
+
+# ---------------- robustez (2.17) ----------------
+def test_fork_do_analisador_nao_derruba_o_canal():
+    canal = {"entrada": a.entrada_de_texto("udp://239.1.1.1:1234"), "saidas": [a.saida_de_url("udp://1.2.3.4:5")]}
+    cmd = a.montar_comando(canal, porta_analise=40000, porta_dist=40001)
+    i = cmd.index("fork")
+    assert "--ignore-abort" in cmd[i:i + 5]
+    j = cmd.index("ip")
+    assert cmd[cmd.index("--buffer-size", j) + 1] == str(a.BUFFER_UDP)
+    _verificar_opcoes(cmd)
+    _verificar_opcoes(a.montar_saida(canal["saidas"][0], 0, porta_entrada=40002))
+
+
+def test_udp_descartes_ve_perda_no_kernel():
+    import socket
+    r = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    r.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    r.bind(("127.0.0.1", 0))
+    porta = r.getsockname()[1]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for _ in range(400):
+        s.sendto(b"\x47" * 1316, ("127.0.0.1", porta))
+    time.sleep(0.2)
+    assert a.udp_descartes().get(porta, 0) > 0
+    r.close(); s.close()
+
+
+def _alimentar(an, taxas_bps):
+    """Simula segundos com a taxa útil dada (pacotes com PID 0x100)."""
+    pkt = bytes([0x47, 0x01, 0x00, 0x10]) + bytes(184)
+    ag = 100.0
+    an.verificar(ag)
+    for bps in taxas_bps:
+        n = int(bps / 1504)
+        for k in range(0, n, 7):
+            an.processar(pkt * min(7, n - k), ag + 0.05 + 0.9 * k / max(n, 1))
+        ag += 1.0
+        an.verificar(ag)
+
+
+def test_rajada_nao_vira_bitrate_maximo():
+    an = a.AnalisadorTS()
+    seq = [5e6] * 20 + [0.2e6, 40e6] + [5e6] * 20     # rede segurou e soltou de uma vez
+    _alimentar(an, seq)
+    ts = an.taxa_sessao()
+    assert 4.5e6 < ts["media"] < 6.5e6
+    assert ts["max"] < 15e6, ts            # sem o filtro daria ~40 Mb/s
+    assert ts["min"] > 1e6, ts
+    assert ts["rajadas"] >= 1
+
+
+def test_analisador_sobrevive_a_excecao(monkeypatch):
+    import socket
+    an = a.AnalisadorTS()
+    porta = an.abrir()
+    original = an.processar
+    chamadas = {"n": 0}
+
+    def falha_uma_vez(d, agora):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            raise IndexError("seção malformada")
+        return original(d, agora)
+    an.processar = falha_uma_vez
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    pkt = bytes([0x47, 0x01, 0x00, 0x10]) + bytes(184)
+    for _ in range(50):
+        s.sendto(pkt * 7, ("127.0.0.1", porta))
+        time.sleep(0.005)
+    time.sleep(0.3)
+    assert chamadas["n"] > 1 and an.pacotes > 0     # a thread continuou depois do erro
+    an.fechar(); s.close()
+
+
+TSP_PARA_DE_ENVIAR = """#!/usr/bin/env python3
+import sys, re, socket, time
+arg = " ".join(sys.argv)
+if "--local-address 127.0.0.1" in arg:      # processo de saída: só fica vivo
+    while True: time.sleep(1)
+portas = [int(p) for p in re.findall(r"127\\.0\\.0\\.1:(\\d+)", arg)]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+pkt = bytes([0x47, 0x00, 0x00, 0x10]) + bytes(184)
+t0 = time.time()
+while time.time() - t0 < 2:                  # envia 2 s e depois fica mudo, mas vivo (como um SRT sem dados)
+    for p in portas: s.sendto(pkt * 7, ("127.0.0.1", p))
+    time.sleep(0.01)
+print("* bitrate_monitor: TS bitrate: 1,000,000 bits/s", flush=True)
+while True: time.sleep(1)
+"""
+
+
+def test_vigia_reinicia_entrada_muda():
+    d = tempfile.mkdtemp()
+    tsp = os.path.join(d, "tsp")
+    with open(tsp, "w") as f:
+        f.write(TSP_PARA_DE_ENVIAR)
+    os.chmod(tsp, 0o755)
+    canal = {"nome": "mudo", "entrada": a.entrada_de_texto("udp://239.1.1.1:1234"), "saidas": [],
+             "processamento": {"reiniciar_sem_sinal_s": 3}}
+    c = a.Canal(canal, {"tsp": tsp, "reinicio_min_s": 1, "reinicio_max_s": 1})
+    c.start()
+    try:
+        fim = time.time() + 20
+        while time.time() < fim and c.reinicios_vigia < 1:
+            time.sleep(0.5)
+        assert c.reinicios_vigia >= 1
+        time.sleep(2.5)
+        assert c.status()["reinicios"] >= 1
+        assert any("sem sinal" in x for x in c.log)
+    finally:
+        c.encerrar()
+
+
+def test_unidade_systemd_sem_tempo_real():
+    u = a.UNIDADE_SYSTEMD
+    assert "CPUSchedulingPolicy=fifo" not in u and "StartLimitIntervalSec=0" in u and "Restart=always" in u
+    assert "net.core.rmem_max" in a.SYSCTL_ASI2SRT
