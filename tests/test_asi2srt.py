@@ -217,7 +217,7 @@ def test_painel_html(gateway):
 OPCOES_TSDUCK = {
     "tsp": {"--realtime", "--buffer-size-mb", "--max-flushed-packets", "--verbose"},
     "srt": {"--caller", "--listener", "--transtype", "--latency", "--ohead-bw", "--passphrase",
-            "--pbkeylen", "--streamid", "--statistics-interval", "--json-line"},
+            "--pbkeylen", "--streamid", "--statistics-interval", "--json-line", "--local-interface"},
     "ip": {"--packet-burst", "--ttl", "--local-address", "--receive-timeout", "--buffer-size",
            "--rtp", "--payload-type", "--ssrc-identifier"},
     "dektec": {"--device", "--channel", "--receive-timeout"},
@@ -849,3 +849,57 @@ def test_previa_gera_miniatura_por_servico():
         parar.set()
         pv.encerrar()
         pv.join(10)
+
+
+
+# ---------------- placa de rede de entrada e saída ----------------
+@pytest.fixture
+def placas(monkeypatch):
+    lista = [{"nome": "enp1s0", "ips": ["10.10.0.5"], "estado": "up", "mac": "", "velocidade_mbps": 1000, "virtual": False},
+             {"nome": "enp2s0", "ips": ["172.20.15.119"], "estado": "up", "mac": "", "velocidade_mbps": 1000, "virtual": False},
+             {"nome": "enp3s0", "ips": [], "estado": "down", "mac": "", "velocidade_mbps": None, "virtual": False}]
+    monkeypatch.setattr(a, "listar_interfaces", lambda: lista)
+    return lista
+
+
+def test_interface_nas_entradas(placas):
+    udp = a.montar_comando({"entrada": {"tipo": "udp", "endereco": "239.1.1.1:1234", "interface": "enp1s0"}, "saidas": []})
+    assert "-I ip 239.1.1.1:1234 --local-address 10.10.0.5" in " ".join(udp)
+    srt = a.montar_comando({"entrada": a.entrada_de_texto("srt://187.60.226.82:6001?interface=enp2s0"), "saidas": []})
+    assert "--caller 187.60.226.82:6001" in " ".join(srt) and "--local-interface 172.20.15.119" in " ".join(srt)
+    lst = a.montar_comando({"entrada": {"tipo": "srt", "modo": "listener", "endereco": "9000", "interface": "enp1s0"},
+                            "saidas": []})
+    assert "--listener 10.10.0.5:9000" in " ".join(lst) and "--local-interface" not in lst
+    for cmd in (udp, srt, lst):
+        _verificar_opcoes(cmd)
+
+
+def test_interface_nas_saidas(placas):
+    for i, (s, esperado) in enumerate([
+            ({"tipo": "udp", "endereco": "239.1.1.1:1234", "interface": "enp2s0"}, "--local-address 172.20.15.119"),
+            ({"tipo": "rtp", "endereco": "239.2.2.2:5004", "interface": "enp1s0"}, "--local-address 10.10.0.5 --rtp"),
+            ({"tipo": "srt", "modo": "caller", "endereco": "h:9090", "interface": "enp1s0"}, "--local-interface 10.10.0.5")]):
+        cmd = a.montar_saida(s, i, porta_entrada=42000)
+        assert esperado in " ".join(cmd)
+        _verificar_opcoes(cmd)
+
+
+def test_interface_invalida_ou_sem_ip(placas):
+    with pytest.raises(ValueError, match="não tem endereço IPv4"):
+        a.montar_saida({"tipo": "udp", "endereco": "239.1.1.1:1", "interface": "enp3s0"}, 0)
+    with pytest.raises(ValueError, match="não encontrada"):
+        a.montar_saida({"tipo": "udp", "endereco": "239.1.1.1:1", "interface": "wlan9"}, 0)
+    with pytest.raises(ValueError, match="inválido"):
+        a.montar_saida({"tipo": "udp", "endereco": "239.1.1.1:1", "interface": "eth0; rm"}, 0)
+
+
+def test_listar_interfaces_real():
+    lista = a.listar_interfaces()
+    assert all({"nome", "ips", "estado", "virtual"} <= set(i) for i in lista)
+    assert all(i["nome"] != "lo" for i in lista)
+
+
+def test_api_interfaces(gateway):
+    base, _ = gateway
+    cod, lista = _req(base, "GET", "/api/interfaces")
+    assert cod == 200 and isinstance(lista, list)

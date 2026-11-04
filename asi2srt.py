@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.12.1"
+__version__ = "2.13.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -216,13 +216,16 @@ def _udp_de_url(u):
 def entrada_de_texto(txt: str) -> dict:
     """dektec:0:0 | linuxasi:/dev/asirx0 | udp:IP:PORTA[@IP] | udp://IP:PORTA?local=IP
        | srt://:9000?mode=listener | srt://host:porta | arquivo:x.ts"""
+    if txt.startswith(("srt://", "udp://")):
+        q = {k: v[-1] for k, v in parse_qs(urlparse(txt).query).items()}
+        extra = {"interface": q["interface"]} if q.get("interface") else {}
     if txt.startswith("srt://"):
         s = _srt_de_url(urlparse(txt), "caller")
         s.pop("overhead_pct", None)
-        return s
+        return {**s, **extra}
     if txt.startswith("udp://"):
         u = _udp_de_url(urlparse(txt))
-        return {"tipo": "udp", "endereco": u["endereco"], "interface_local": u["interface_local"]}
+        return {"tipo": "udp", "endereco": u["endereco"], "interface_local": u["interface_local"], **extra}
     tipo, _, resto = txt.partition(":")
     tipo = tipo.lower()
     if tipo == "dektec":
@@ -241,6 +244,8 @@ def entrada_de_texto(txt: str) -> dict:
 
 def _com_servicos(d, url):
     q = {k: v[-1] for k, v in parse_qs(urlparse(url).query).items()}
+    if q.get("interface"):
+        d["interface"] = q["interface"]
     if q.get("servico"):
         d["servicos"] = [x for x in q["servico"].split(",") if x.strip()]
         if d.get("tipo") == "rtmp":  # o parâmetro é nosso: não vai para o servidor RTMP
@@ -299,6 +304,12 @@ def _args_srt(s: dict, entrada: bool, prefixo=None) -> list:
         a += ["--passphrase", s["senha"], "--pbkeylen", str(int(s.get("tamanho_chave") or 16))]
     if s.get("stream_id"):
         a += ["--streamid", s["stream_id"]]
+    ip = _ip_local(s)
+    if ip:
+        if modo == "caller":
+            a += ["--local-interface", ip]          # sai pela placa escolhida
+        elif re.match(r"^\d{1,5}$", end):
+            a[1] = f"{ip}:{end}"                     # listener: escuta só no IP da placa escolhida
     if prefixo:  # estatísticas do link SRT a cada 1 s, em JSON, identificadas pelo prefixo
         a += ["--statistics-interval", "1000", f"--json-line={prefixo}:"]
     return a
@@ -314,8 +325,9 @@ def _args_saida(s: dict, prefixo=None) -> list:
         a = ["ip", str(s["endereco"]).strip(), "--packet-burst", "7"]
         if s.get("ttl"):
             a += ["--ttl", str(int(s["ttl"]))]
-        if s.get("interface_local"):
-            a += ["--local-address", s["interface_local"]]
+        ip = _ip_local(s)
+        if ip:
+            a += ["--local-address", ip]
         return a
     if tipo == "rtp":
         a = _args_saida({**s, "tipo": "udp"})
@@ -370,6 +382,70 @@ def _args_ffmpeg_rtmp(s: dict, porta_entrada) -> list:
     return cmd
 
 
+def listar_interfaces():
+    """Placas de rede do computador: nome, IPv4, estado, MAC, velocidade e se é virtual."""
+    import socket
+    ips = {}
+    if shutil.which("ip"):
+        try:
+            r = subprocess.run(["ip", "-j", "-4", "addr", "show"], capture_output=True, text=True, timeout=5)
+            for it in json.loads(r.stdout or "[]"):
+                ips[it["ifname"]] = [x["local"] for x in it.get("addr_info", []) if x.get("family") == "inet"]
+        except (OSError, ValueError, subprocess.SubprocessError, KeyError):
+            ips = {}
+
+    def ler(nome, arq):
+        try:
+            with open(f"/sys/class/net/{nome}/{arq}") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    out = []
+    for _, nome in socket.if_nameindex():
+        if nome == "lo":
+            continue
+        lista = ips.get(nome)
+        if lista is None:
+            lista = []
+            try:
+                import fcntl
+                import struct
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    lista = [socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915,  # SIOCGIFADDR
+                                                          struct.pack("256s", nome[:15].encode()))[20:24])]
+                finally:
+                    s.close()
+            except (OSError, ImportError):
+                lista = []
+        vel = ler(nome, "speed")
+        out.append({"nome": nome, "ips": lista, "estado": ler(nome, "operstate") or "desconhecido",
+                    "mac": ler(nome, "address"), "velocidade_mbps": int(vel) if vel.lstrip("-").isdigit() and int(vel) > 0 else None,
+                    "virtual": not os.path.exists(f"/sys/class/net/{nome}/device")})
+    out.sort(key=lambda i: (i["virtual"], not i["ips"], i["nome"]))
+    return out
+
+
+def ip_da_interface(nome: str) -> str:
+    for i in listar_interfaces():
+        if i["nome"] == nome:
+            if not i["ips"]:
+                raise ValueError(f"a placa de rede {nome} não tem endereço IPv4")
+            return i["ips"][0]
+    raise ValueError(f"placa de rede {nome!r} não encontrada neste computador")
+
+
+def _ip_local(cfg: dict) -> str:
+    """IP local a usar: da placa escolhida (campo 'interface') ou o IP informado ('interface_local')."""
+    nome = str(cfg.get("interface") or "").strip()
+    if nome:
+        if not re.match(r"^[\w.\-:@]{1,32}$", nome):
+            raise ValueError(f"nome de placa de rede inválido: {nome!r}")
+        return ip_da_interface(nome)
+    return str(cfg.get("interface_local") or "").strip()
+
+
 def _args_ip_entrada(endereco, interface_local="") -> list:
     """Argumentos da entrada 'ip' do TSDuck. Ela só aceita IP no endereço se for MULTICAST
     ("address X is not multicast"); para unicast usa-se só a porta + --local-address."""
@@ -415,7 +491,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     elif tipo == "udp":
         if not ent.get("endereco"):
             raise ValueError("entrada UDP precisa de ip:porta (ou só porta)")
-        cmd += ["-I", "ip"] + _args_ip_entrada(ent["endereco"], ent.get("interface_local", ""))
+        cmd += ["-I", "ip"] + _args_ip_entrada(ent["endereco"], _ip_local(ent))
         cmd += ["--receive-timeout", "5000"]
     elif tipo == "srt":
         cmd[1:1] = ["--verbose"]  # mostra o endereço do outro lado ("connected from ...")
@@ -2139,6 +2215,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     self.end_headers()
                     self.wfile.write(corpo)
                     return
+                if metodo == "GET" and caminho == "/api/interfaces":
+                    return self._resp(200, listar_interfaces())
                 if caminho == "/api/aparencia":
                     if metodo == "GET":
                         return self._resp(200, ger.aparencia())
@@ -2371,6 +2449,10 @@ def cmd_verificar(args):
         print("Placas vistas pelo TSDuck:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma encontrada"))
     asi = sorted(f for f in os.listdir("/dev") if f.startswith("asirx")) if os.path.isdir("/dev") else []
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
+    print("\nPlacas de rede:")
+    for i in listar_interfaces():
+        print(f"  {i['nome']:<12} {', '.join(i['ips']) or 'sem IP':<18} {i['estado']}"
+              + (f" · {i['velocidade_mbps']} Mb/s" if i['velocidade_mbps'] else "") + (" · virtual" if i["virtual"] else ""))
     print("PyYAML: " + ("instalado" if yaml else "ausente (configuração será salva em JSON)"))
     ff = shutil.which("ffmpeg")
     if ff:
@@ -2858,6 +2940,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .pv img{width:100%;height:100%;object-fit:contain;display:block}
 .pv .pvm{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:8px;
  color:var(--mut);font-size:11px;line-height:1.3}
+.pv [hidden]{display:none!important}
 .pv .pvn{display:flex;gap:6px;align-items:baseline;padding:5px 8px;font-size:12px;background:#11161d;border-top:1px solid var(--line)}
 .pv .pvn b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}.pv .pvn small{color:var(--mut);font-family:ui-monospace,monospace}
 .pv.sai{outline:2px solid #2f81f7;outline-offset:-1px}
@@ -2874,10 +2957,11 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .ic.e{border-color:#5c1f22;background:#2a1215}.ic.e i{background:var(--err);box-shadow:0 0 8px var(--err)}.ic.e b{color:#ff8f8a}
 .ic.x{opacity:.5}.ic.x i{background:#484f58;box-shadow:none}
 .ind .sub{color:var(--mut);font-size:11px;margin-left:4px}
-.no{display:grid;grid-template-columns:86px minmax(170px,280px) 1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #20262f;font-size:13px}
+.no{display:grid;grid-template-columns:86px minmax(170px,330px) 1fr auto;gap:10px;align-items:center;padding:6px 0;border-bottom:1px dashed #20262f;font-size:13px}
 .no:last-child{border-bottom:0}.no .pp{color:var(--mut);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em}
 .no .ed{display:flex;align-items:center;gap:7px;min-width:0}.no .ed code{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .no .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
+.nicb{font-size:10.5px;font-family:ui-monospace,monospace;color:#c9b8ff;background:#251f3a;border-radius:4px;padding:1px 6px;white-space:nowrap;flex:none}
 .no .tp.udp{background:#22301f;color:#a6e3a1}.no .tp.asi{background:#3a2a1f;color:#f5c48a}
 .st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}.st i{width:8px;height:8px;border-radius:50%;background:#484f58}
 .st.conectado i,.st.ativo i{background:var(--ok);box-shadow:0 0 5px var(--ok)}.st.aguardando i{background:var(--warn)}
@@ -2946,16 +3030,17 @@ function dur(s){if(!s)return'—';const h=Math.floor(s/3600),m=Math.floor(s%3600
 const CE={
  dektec:[['dispositivo','Placa','number',0],['canal','Porta','number',0],['timeout_ms','Timeout sem sinal (ms)','number',5000]],
  linuxasi:[['dispositivo','Dispositivo','text','/dev/asirx0']],
- udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface_local','IP da interface (multicast)','text','']],
+ udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface','Placa de rede (entrada)','nic','']],
  srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Endereço (caller: IP:porta · listener: porta)','text',''],
-      ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text','']],
+      ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text',''],
+      ['interface','Placa de rede (entrada)','nic','']],
  arquivo:[['caminho','Arquivo .ts','text',''],['loop','Repetir em loop','chk',true]]};
 const CS={
  srt:[['servicos','Serviços a enviar','serv',[]],['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
-      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25]],
- udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']],
- rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text',''],
+      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25],['interface','Placa de rede (saída)','nic','']],
+ udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic','']],
+ rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],
       ['payload_type','Payload type','number',33],['ssrc','SSRC (opcional)','text','']],
  rtmp:[['url','Servidor (ex.: rtmp://a.rtmp.youtube.com/live2)','text',''],['chave','Chave de transmissão','password',''],['video','Vídeo','sel:copiar,h264','copiar'],['audio','Áudio','sel:aac,copiar','aac'],
       ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['servicos','Serviço a enviar (RTMP leva um só)','serv1',[]]]};
@@ -2964,7 +3049,7 @@ const NOMES_E={srt:'SRT',udp:'UDP / Multicast',dektec:'ASI — placa DekTec',lin
 function resE(e){switch(e.tipo){case'dektec':return`DekTec ${e.dispositivo??0}:${e.canal??0}`;case'linuxasi':return`ASI ${e.dispositivo}`;
  case'udp':return`UDP ${e.endereco}`;case'srt':return`SRT ${e.modo} ${e.endereco}${e.senha?' 🔒':''}`;case'arquivo':return`Arquivo ${(e.caminho||'').split('/').pop()}`}return e.tipo}
 const urlSemChave=u=>String(u||'').replace(/^(rtmps?:\/\/[^?#]+\/)[^/?#]+/,'$1••••');
-const resS=s=>s.tipo==='udp'?`UDP ${s.endereco}`:s.tipo==='rtp'?`RTP ${s.endereco}`:s.tipo==='rtmp'?(s.chave?String(s.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(s.url)).replace(/^rtmp/,'RTMP').replace(/^RTMPs/,'RTMPS'):`SRT ${s.modo} ${s.endereco}${s.senha?' 🔒':''}`;
+let resS=s=>s.tipo==='udp'?`UDP ${s.endereco}`:s.tipo==='rtp'?`RTP ${s.endereco}`:s.tipo==='rtmp'?(s.chave?String(s.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(s.url)).replace(/^rtmp/,'RTMP').replace(/^RTMPs/,'RTMPS'):`SRT ${s.modo} ${s.endereco}${s.senha?' 🔒':''}`;
 
 function spark(h){if(!h||h.length<2)return'<svg class="spark"></svg>';const mx=Math.max(...h)*1.15||1,w=100,hh=38;
  const p=h.map((v,i)=>`${(i/(h.length-1)*w).toFixed(2)},${(hh-v/mx*hh).toFixed(2)}`).join(' ');
@@ -3023,7 +3108,11 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
 
 let VIS='rotas';try{VIS=localStorage.getItem('asi2srt.vis')||'rotas'}catch(e){}
 const TIPO_TXT={srt:'SRT',udp:'UDP',rtp:'RTP',rtmp:'RTMP',dektec:'ASI',linuxasi:'ASI',arquivo:'ARQ'};
-function endTxt(x){return x.tipo==='rtmp'?(x.chave?String(x.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(x.url))+(x.video==='h264'?' · vídeo→H.264':'')+(x.audio==='aac'?' · áudio→AAC':''):x.tipo==='rtp'?x.endereco:x.tipo==='srt'?`${x.modo==='listener'?'listener :':'caller → '}${x.endereco}`:x.tipo==='udp'?x.endereco:x.tipo==='dektec'?`placa ${x.dispositivo??0} · porta ${x.canal??0}`:x.tipo==='linuxasi'?x.dispositivo:(x.caminho||'').split('/').pop()}
+const viaNic=x=>x.interface?` · placa ${x.interface}`:x.interface_local?` · IP ${x.interface_local}`:'';
+function endTxt(x){return viaNic0(x)}
+function viaNic0(x){return endTxtBase(x)+(x.tipo==='rtmp'?'':viaNic(x))}
+{const _rE=resE,_rS=resS;resE=e=>_rE(e)+(['udp','srt'].includes(e.tipo)?viaNic(e):'');resS=s=>_rS(s)+(s.tipo==='rtmp'?'':viaNic(s))}
+function endTxtBase(x){return x.tipo==='rtmp'?(x.chave?String(x.url||'').replace(/\/+$/,'')+'/••••':urlSemChave(x.url))+(x.video==='h264'?' · vídeo→H.264':'')+(x.audio==='aac'?' · áudio→AAC':''):x.tipo==='rtp'?x.endereco:x.tipo==='srt'?`${x.modo==='listener'?'listener :':'caller → '}${x.endereco}`:x.tipo==='udp'?x.endereco:x.tipo==='dektec'?`placa ${x.dispositivo??0} · porta ${x.canal??0}`:x.tipo==='linuxasi'?x.dispositivo:(x.caminho||'').split('/').pop()}
 function mspark(h){if(!h||h.length<2)return'<svg class="mspark"></svg>';const v=h.map(x=>x[0]),mx=Math.max(...v)*1.2||1,mxp=Math.max(...h.map(x=>x[1]),1),W=90,H=22;
  const p=v.map((y,i)=>`${(i/(v.length-1)*W).toFixed(1)},${(H-y/mx*H).toFixed(1)}`).join(' ');
  const lp=h.some(x=>x[1]>0)?`<polyline class="lp" points="${h.map((x,i)=>`${(i/(h.length-1)*W).toFixed(1)},${(H-x[1]/mxp*H*.9).toFixed(1)}`).join(' ')}"/>`:'';
@@ -3043,7 +3132,7 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  const sr=rot.startsWith('Destino')?servRotulo(x,lista):null;
  const chipServ=rot.startsWith('Destino')?(sr?`<span class="chip svout" title="serviços enviados por este destino">${sr.length===1&&sr[0].video&&PREV[cid+':'+sr[0].numero]&&PREV[cid+':'+sr[0].numero].u?`<img data-prev="${cid}:${sr[0].numero}" src="${PREV[cid+':'+sr[0].numero].u}">`:''}<small>Serviço</small>${esc(sr.map(s=>s.nome).join(', '))}</span>`
   :`<span class="chip"><small>Serviços</small>todos (TS completo)</span>`):'';
- return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
+ return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${x.tipo!=='rtmp'&&(x.interface||x.interface_local)?`<span class="nicb" title="placa de rede usada">${esc(x.interface||x.interface_local)}</span>`:''}</span>
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
 function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
@@ -3108,7 +3197,16 @@ function campoServ(n,rot,t,v){const sel=(Array.isArray(v)?v:(v||v===0?[v]:[])).m
   :`<span style="font-size:12.5px;color:var(--mut)">${sel.length?'':'nenhum marcado = TS completo'}</span>`}${op}</div>
  ${lista.length?'':`<p class="msg" style="white-space:normal;margin:0 0 6px">Os serviços da entrada aparecem aqui depois que o canal recebe sinal.</p>`}
  <label>${lista.length?'Outros (número ou nome, separados por vírgula)':'Número ou nome do serviço (separe por vírgula)'}<input name="${n}.txt" value="${esc(outros.join(', '))}" placeholder="ex.: 257"></label></div>`}
-function campo(pref,[k,rot,t,pad],obj){const v=obj[k]??(k==='servicos'&&obj.programa?[obj.programa]:pad),n=`${pref}${k}`;
+let INTERFACES=[];
+function campoNic(n,rot,obj){let v=obj.interface||'';
+ if(!v&&obj.interface_local){const m=INTERFACES.find(i=>i.ips.includes(obj.interface_local));v=m?m.nome:''}
+ const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(i.nome)} — ${esc(i.ips.join(', ')||'sem IP')}${i.estado!=='up'?' (desconectada)':''}${i.virtual?' · virtual':''}</option>`);
+ if(v&&!INTERFACES.some(i=>i.nome===v))ops.push(`<option value="${esc(v)}" selected>${esc(v)} — não encontrada neste computador</option>`);
+ const avulso=!v&&obj.interface_local?`<option value="" selected>IP ${esc(obj.interface_local)} (configurado à mão)</option>`:'';
+ return`<label title="Placa de rede usada por esta conexão. Automática = o sistema escolhe pela rota.">${rot}<select name="${n}">
+ ${avulso||`<option value="">Automática (rota do sistema)</option>`}${ops.join('')}</select></label>`}
+function campo(pref,[k,rot,t,pad],obj){
+ if(t==='nic')return campoNic(`${pref}${k}`,rot,obj);const v=obj[k]??(k==='servicos'&&obj.programa?[obj.programa]:pad),n=`${pref}${k}`;
  if(t==='serv'||t==='serv1')return campoServ(n,rot,t,v);
  if(t==='chk')return`<label class="chk"><input type="checkbox" name="${n}" ${v?'checked':''}> ${rot}</label>`;
  if(t.startsWith('sel:'))return`<label>${rot}<select name="${n}">${t.slice(4).split(',').map(o=>`<option ${String(v)===o?'selected':''}>${o}</option>`).join('')}</select></label>`;
@@ -3144,17 +3242,20 @@ function val(el,t){if(!el)return undefined;if(el.type==='checkbox')return el.che
 function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
  c.nome=g('nome').value.trim();c.ativo=g('ativo').checked;
  const tipo=g('e_tipo').value,ent={...c.entrada,tipo};
- CE[tipo].forEach(([k,,t])=>{const v=val(g('e.'+k),t);if(v!==undefined)ent[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});c.entrada=ent;
+ CE[tipo].forEach(([k,,t])=>{const v=val(g('e.'+k),t);if(v!==undefined)ent[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});
+ if(CE[tipo].some(f=>f[2]==='nic')&&(ent.interface||!g('e.interface')||g('e.interface').selectedOptions[0]?.textContent.indexOf('configurado à mão')<0))delete ent.interface_local;c.entrada=ent;
  c.processamento={...(c.processamento||{}),remover_nulos:g('p.remover_nulos').checked,analise_tr101290:g('p.analise_tr101290').checked,
   remover_pids:g('p.remover_pids').value.split(/[,\s]+/).filter(Boolean),
   bitrate_min:Math.round(Number(g('p.bitrate_min').value||0)*1e6),bitrate_max:Math.round(Number(g('p.bitrate_max').value||0)*1e6)};
  c.saidas=c.saidas.map((s,i)=>{const o={tipo:s.tipo};CS[s.tipo].forEach(([k,,t])=>{
   if(t==='serv'||t==='serv1'){const n=`s.${i}.${k}`,cb=[...f.querySelectorAll(`[name="${n}.cb"]:checked`)].map(x=>x.value).filter(Boolean),
    tx=((f.elements[n+'.txt']||{}).value||'').split(',').map(x=>x.trim()).filter(Boolean);o[k]=[...new Set([...cb,...tx])];if(t==='serv1')o[k]=o[k].slice(0,1);return}
+  if(t==='nic'){const el=g(`s.${i}.${k}`);o.interface=el?el.value:'';if(!o.interface&&s.interface_local&&el&&el.selectedOptions[0]?.textContent.indexOf('configurado à mão')>=0)o.interface_local=s.interface_local;return}
   const v=val(g(`s.${i}.${k}`),t);
   if(v!==undefined)o[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});return o})}
 
-function abrir(id){const c=id?dados.find(x=>x.id===id):null;
+async function carregarInterfaces(){try{INTERFACES=await api('GET','/api/interfaces')}catch(e){INTERFACES=[]}}
+async function abrir(id){await carregarInterfaces();const c=id?dados.find(x=>x.id===id):null;
  servConhecidos=(c&&c.status&&(c.status.servicos||[]).length?c.status.servicos:(c&&c.ultimo_relatorio&&c.ultimo_relatorio.servicos_lista)||[]);
  editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'srt',modo:'caller'},
   processamento:{remover_nulos:true,analise_tr101290:true,intervalo_relatorio_s:5},saidas:[]};

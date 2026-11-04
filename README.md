@@ -174,6 +174,23 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+## Placa de rede de entrada e saída
+
+Em computadores com mais de uma placa de rede, cada entrada (UDP, SRT) e cada saída (SRT, UDP, RTP)
+tem o menu **Placa de rede**, que lista as placas do computador com o IP de cada uma
+(`asi2srt verificar` também lista). "Automática" deixa o sistema escolher pela rota.
+
+| Conexão | O que a placa escolhida faz |
+|---|---|
+| Entrada UDP/multicast | recebe por aquela placa (o multicast é assinado nela) |
+| Entrada/saída SRT caller | a conexão sai por aquela placa (`--local-interface`) |
+| Entrada/saída SRT listener | escuta só no IP daquela placa |
+| Saída UDP/RTP | multicast sai por aquela placa; em unicast vale a rota do sistema |
+| Saída RTMP | sempre pela rota do sistema |
+
+A placa é guardada pelo nome (ex.: `enp2s0`), então continua certa mesmo se o IP mudar por DHCP
+(basta reiniciar o canal). Linha de comando: `?interface=enp2s0`.
+
 ## Serviços e janela de imagem
 
 - **Escolher o serviço de cada saída:** no formulário, cada destino lista os serviços que estão
@@ -329,7 +346,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.12.0 && git push origin v2.12.0
+git tag v2.13.0 && git push origin v2.13.0
 ```
 
 ## Licença
