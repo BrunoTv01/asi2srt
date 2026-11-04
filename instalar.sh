@@ -34,7 +34,8 @@ elif command -v dnf >/dev/null; then
 fi
 
 echo "==> Baixando o asi2srt"
-curl -fsSL -o /usr/local/bin/asi2srt "$URL"
+# "?t=..." evita a cópia antiga do cache do GitHub (até 5 min após cada atualização)
+curl -fsSL -H "Cache-Control: no-cache" -o /usr/local/bin/asi2srt "$URL?t=$(date +%s)"
 chmod 755 /usr/local/bin/asi2srt
 asi2srt --versao
 
