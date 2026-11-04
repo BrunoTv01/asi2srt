@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.19.1"
+__version__ = "2.20.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -122,6 +122,8 @@ supervisor:
   usuario: admin              # login inicial do painel (depois os usuários ficam em 'usuarios', com senha em hash)
   senha_painel: admin         # senha inicial; troque pelo painel. Para recuperar o acesso, escreva aqui uma nova
   log_arquivo: ""
+  # rotas_por_placa: true     # cada placa sai pelo próprio gateway (placa reserva em outra rede/operadora)
+  # failover: {sem_sinal_s: 15, voltar_apos_s: 30}
 """
 
 
@@ -453,6 +455,174 @@ def _ip_local(cfg: dict) -> str:
     return str(cfg.get("interface_local") or "").strip()
 
 
+# ======================================================================
+# Placa de rede reserva (failover automático por entrada e por saída)
+# ======================================================================
+_NICS_CACHE = {"t": 0.0, "v": {}}
+
+
+def estado_nics(cache_s=1.5):
+    """{nome: {"ligada": bool, "ip": str|None, "estado": str}} - link (operstate/carrier) e IPv4 de cada placa."""
+    agora = time.monotonic()
+    if agora - _NICS_CACHE["t"] < cache_s:
+        return _NICS_CACHE["v"]
+    out = {}
+    for i in listar_interfaces():
+        nome = i["nome"]
+        try:
+            with open(f"/sys/class/net/{nome}/carrier") as f:
+                carrier = f.read().strip() == "1"
+        except OSError:
+            carrier = False          # placa desligada: o kernel nem deixa ler o carrier
+        est = i.get("estado") or ""
+        ligada = (est == "up") or (est == "unknown" and carrier)
+        out[nome] = {"ligada": bool(ligada and (carrier or est == "up")), "ip": (i["ips"] or [None])[0], "estado": est}
+    _NICS_CACHE.update(t=agora, v=out)
+    return out
+
+
+def nic_utilizavel(nome, nics=None):
+    n = (nics if nics is not None else estado_nics()).get(nome)
+    return bool(n and n["ligada"] and n["ip"])
+
+
+def _validar_reserva(item):
+    res = str(item.get("interface_reserva") or "").strip()
+    if not res:
+        return
+    if not re.match(r"^[\w.\-:@]{1,32}$", res):
+        raise ValueError(f"nome de placa reserva inválido: {res!r}")
+    pri = str(item.get("interface") or "").strip()
+    if not pri:
+        raise ValueError("para usar placa reserva, escolha também a placa principal")
+    if pri == res:
+        raise ValueError("a placa reserva precisa ser diferente da principal")
+
+
+class FailoverNic:
+    """Escolhe a placa de uma conexão (entrada ou saída): principal, ou a reserva quando a principal
+    perde o link/IP ou a conexão não funciona por ela. Volta para a principal quando ela fica estável."""
+
+    def __init__(self, item, rotulo, estavel_s=30, sem_sinal_s=15):
+        self.principal = str(item.get("interface") or "").strip()
+        self.reserva = str(item.get("interface_reserva") or "").strip()
+        self.rotulo = rotulo
+        self.estavel_s = estavel_s
+        self.sem_sinal_s = sem_sinal_s
+        nics = estado_nics()
+        self.ativa = self.principal if (nic_utilizavel(self.principal, nics) or not nic_utilizavel(self.reserva, nics)) \
+            else self.reserva
+        self.motivo = None if self.ativa == self.principal else "placa principal sem link ao iniciar"
+        self.desde = time.monotonic()
+        self.eventos = collections.deque(maxlen=30)
+        self.ok_principal_desde = None
+        self.falhas_seguidas = 0       # trocas por falta de sinal sem sucesso (espaça as tentativas)
+        if self.ativa != self.principal:
+            self._evento(self.principal, self.ativa, self.motivo)
+
+    @property
+    def ativo(self):
+        return bool(self.reserva)
+
+    def aplicar(self, item):
+        """Cópia da configuração usando a placa ativa."""
+        d = dict(item)
+        if self.ativo:
+            d["interface"] = self.ativa
+            d.pop("interface_local", None)
+            d.pop("interface_reserva", None)   # o processo só precisa da placa em uso agora
+        return d
+
+    def _evento(self, de, para, motivo):
+        self.eventos.append({"em": time.time(), "de": de, "para": para, "motivo": motivo})
+
+    def avaliar(self, agora, sem_sinal_ha=None):
+        """Devolve (nova_placa, motivo) quando é preciso trocar; senão None.
+        sem_sinal_ha: há quantos segundos a conexão não funciona pela placa ativa (None = não se aplica)."""
+        if not self.ativo:
+            return None
+        nics = estado_nics()
+        outra = self.reserva if self.ativa == self.principal else self.principal
+        ok_ativa, ok_outra = nic_utilizavel(self.ativa, nics), nic_utilizavel(outra, nics)
+        if not ok_ativa and ok_outra:
+            n = nics.get(self.ativa) or {}
+            causa = "sem link (cabo/porta)" if not n.get("ligada") else "sem endereço IP"
+            return outra, f"placa {self.ativa} {causa}"
+        # conexão não funciona pela placa ativa: tenta a outra (com espera crescente se nenhuma funcionar)
+        espera = self.sem_sinal_s * min(2 ** self.falhas_seguidas, 8)
+        if sem_sinal_ha is not None and ok_outra and sem_sinal_ha > espera and agora - self.desde > espera:
+            return outra, f"sem conexão/sinal pela placa {self.ativa} há {int(sem_sinal_ha)} s"
+        # volta para a principal quando ela está estável (só se saiu dela por falta de link/IP)
+        if self.ativa == self.reserva and self.motivo and \
+                any(x in self.motivo for x in ("sem link", "sem endereço", "ao iniciar")):
+            if nic_utilizavel(self.principal, nics):
+                if self.ok_principal_desde is None:
+                    self.ok_principal_desde = agora
+                elif agora - self.ok_principal_desde >= self.estavel_s:
+                    return self.principal, f"placa {self.principal} de volta e estável há {self.estavel_s} s"
+            else:
+                self.ok_principal_desde = None
+        return None
+
+    def trocar(self, para, motivo, agora):
+        de = self.ativa
+        if "sem conexão" in motivo:
+            self.falhas_seguidas += 1
+        else:
+            self.falhas_seguidas = 0
+        self.ativa, self.motivo, self.desde, self.ok_principal_desde = para, (None if para == self.principal and
+                                                                            "de volta" in motivo else motivo), agora, None
+        self._evento(de, para, motivo)
+        return de
+
+    def sucesso(self):
+        """A conexão funcionou pela placa ativa."""
+        self.falhas_seguidas = 0
+
+    def status(self):
+        nics = estado_nics()
+        return {"principal": self.principal, "reserva": self.reserva, "ativa": self.ativa,
+                "em_reserva": self.ativa != self.principal, "motivo": self.motivo,
+                "principal_ok": nic_utilizavel(self.principal, nics), "reserva_ok": nic_utilizavel(self.reserva, nics),
+                "eventos": list(self.eventos)[-10:], "trocas": len(self.eventos)}
+
+
+def aplicar_rotas_por_placa():
+    """Roteamento pela origem: o tráfego que sai com o IP de uma placa usa o gateway DESSA placa.
+    Necessário quando a reserva está em outra rede/operadora e a principal ainda tem link (falha adiante).
+    Idempotente; precisa de root. Devolve a lista de comandos aplicados."""
+    if not shutil.which("ip"):
+        return []
+    try:
+        rotas = json.loads(subprocess.run(["ip", "-j", "-4", "route", "show", "default"], capture_output=True,
+                                          text=True, timeout=5).stdout or "[]")
+        regras = json.loads(subprocess.run(["ip", "-j", "-4", "rule", "show"], capture_output=True,
+                                           text=True, timeout=5).stdout or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    gw = {r["dev"]: r["gateway"] for r in rotas if r.get("dev") and r.get("gateway")}
+    feitos = []
+    for nome, info in estado_nics(cache_s=0).items():
+        if nome not in gw or not info["ip"]:
+            continue
+        try:
+            with open(f"/sys/class/net/{nome}/ifindex") as f:
+                idx = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        tabela = str(200 + idx)
+        cmds = [["ip", "-4", "route", "replace", "default", "via", gw[nome], "dev", nome, "table", tabela]]
+        if not any(r.get("src") == info["ip"] and str(r.get("table")) == tabela for r in regras):
+            cmds.append(["ip", "-4", "rule", "add", "from", f"{info['ip']}/32", "table", tabela, "priority", str(1000 + idx)])
+        for c in cmds:
+            r = subprocess.run(c, capture_output=True, text=True)
+            if r.returncode == 0:
+                feitos.append(" ".join(c))
+            else:
+                log.warning("rotas por placa: %s -> %s", " ".join(c), (r.stderr or "").strip())
+    return feitos
+
+
 def _args_ip_entrada(endereco, interface_local="") -> list:
     """Argumentos da entrada 'ip' do TSDuck. Ela só aceita IP no endereço se for MULTICAST
     ("address X is not multicast"); para unicast usa-se só a porta + --local-address."""
@@ -497,10 +667,21 @@ def udp_descartes():
     return out
 
 
+def _cfg_validacao(c):
+    """Para validar com a placa principal fora do ar: usa a reserva, como o canal faria ao iniciar."""
+    c = copy.deepcopy(c)
+    for it in [c.get("entrada") or {}] + list(c.get("saidas") or []):
+        res, pri = it.get("interface_reserva"), it.get("interface")
+        if res and pri and not nic_utilizavel(pri) and nic_utilizavel(res):
+            it["interface"] = res
+    return c
+
+
 def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
     """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
     canal = normalizar_canal(canal)
     ent = canal["entrada"]
+    _validar_reserva(ent)
     proc = canal.get("processamento") or {}
     saidas = canal.get("saidas") or []
     so_analise = not saidas  # sem saídas: o canal só recebe e analisa
@@ -590,6 +771,7 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     """Processo de uma saída: recebe o TS do distribuidor local e envia por SRT, UDP, RTP ou RTMP."""
     if s.get("tipo") == "rtmp":
         return _args_ffmpeg_rtmp(s, porta_entrada)
+    _validar_reserva(s)
     cmd = [tsp_bin, "--realtime"]
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
@@ -1595,7 +1777,11 @@ class ProcSaida(threading.Thread):
         self.cfg = cfg
         self.chave = f"SRTOUT{indice}"
         self.porta = _porta_udp_livre()
-        self.cmd = montar_saida(cfg, indice, canal.sup.get("tsp", "tsp"), self.porta)
+        self.fo = FailoverNic(cfg, f"Saída {indice + 1}", **canal._fo_args) \
+            if cfg.get("interface_reserva") and cfg.get("tipo") != "rtmp" else None
+        self._troca = False
+        self._sem_desde = None
+        self.cmd = montar_saida(self.fo.aplicar(cfg) if self.fo else cfg, indice, canal.sup.get("tsp", "tsp"), self.porta)
         self.proc = None
         self.parar = threading.Event()
         self.st = {"estado": "iniciando", "ultima_msg": "", "reinicios": 0, "desde": None, "info": {}}
@@ -1644,6 +1830,26 @@ class ProcSaida(threading.Thread):
         s["tempo_no_ar_s"] = int(self.tempo_no_ar + (time.time() - s["desde"] if no_ar else 0))
         s["hist"] = list(self.hist)
         return s
+
+    def trocar_nic(self, para, motivo, agora):
+        n = self.indice + 1
+        try:
+            de = self.fo.trocar(para, motivo, agora)
+            self.cmd = montar_saida(self.fo.aplicar(self.cfg), self.indice, self.canal.sup.get("tsp", "tsp"), self.porta)
+        except ValueError as e:
+            self.canal._registrar(logging.ERROR, f"[saída {n}] rede: não foi possível usar a placa {para}: {e}")
+            return
+        self.canal._registrar(logging.WARNING, f"[saída {n}] rede: passou da placa {de} para {para} ({motivo})")
+        self.st["ultima_msg"] = f"rede: saída na placa {para} ({motivo})"
+        self.canal._rotas_por_placa()
+        self._troca = True
+        self._sem_desde = None
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
 
     def _ler(self, stream):
         est = self.canal.srt.get(self.chave)
@@ -1717,6 +1923,11 @@ class ProcSaida(threading.Thread):
             rc = self.proc.wait()
             if self.parar.is_set():
                 break
+            if self._troca:            # troca de placa de rede: reinicia na hora, sem contar como queda
+                self._troca = False
+                espera = espera_min
+                self._fora_do_ar("conectando")
+                continue
             if time.time() - t0 > 60:
                 espera = espera_min
             self.st["reinicios"] += 1
@@ -1929,13 +2140,19 @@ class Canal(threading.Thread):
         super().__init__(daemon=True, name=cfg.get("nome", "canal"))
         self.cfg = cfg
         self.sup = sup
-        montar_comando(cfg, sup.get("tsp", "tsp"))  # valida antes de abrir recursos
+        ent0 = normalizar_canal(cfg)["entrada"]
+        fo = (sup.get("failover") or {})
+        self._fo_args = {"estavel_s": int(fo.get("voltar_apos_s", 30)), "sem_sinal_s": int(fo.get("sem_sinal_s", 15))}
+        self.fo_ent = FailoverNic(ent0, "Entrada", **self._fo_args) \
+            if ent0.get("interface_reserva") and ent0.get("tipo") in ("udp", "srt") else None
+        self._troca = False
+        montar_comando(self._cfg_rede(), sup.get("tsp", "tsp"))  # valida antes de abrir recursos
         self.analisador = AnalisadorTS()
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
         c0 = normalizar_canal(cfg)
         self.distribuidor = Distribuidor()
-        self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta,
+        self.cmd = montar_comando(self._cfg_rede(), sup.get("tsp", "tsp"), porta_analise=porta,
                                   porta_dist=self.distribuidor.porta if self.distribuidor else None)
         self.proc = None
         self.parar = threading.Event()
@@ -1959,6 +2176,40 @@ class Canal(threading.Thread):
         self.perda_ate = 0.0
         self._aviso_perda = 0.0
         self.reinicios_vigia = 0
+
+    def _cfg_rede(self):
+        """Configuração do canal com a placa de rede ativa da entrada (principal ou reserva)."""
+        c = normalizar_canal(self.cfg)
+        if getattr(self, "fo_ent", None):
+            c["entrada"] = self.fo_ent.aplicar(c["entrada"])
+        return c
+
+    def rede_status(self):
+        return {"entrada": self.fo_ent.status() if self.fo_ent else None,
+                "saidas": [ps.fo.status() if ps.fo else None for ps in self.procs_saida]}
+
+    def _rotas_por_placa(self):
+        if self.sup.get("rotas_por_placa"):
+            threading.Thread(target=aplicar_rotas_por_placa, daemon=True).start()
+
+    def _trocar_nic_entrada(self, para, motivo, agora):
+        try:
+            de = self.fo_ent.trocar(para, motivo, agora)
+            self.cmd = montar_comando(self._cfg_rede(), self.sup.get("tsp", "tsp"), porta_analise=self.analisador.porta,
+                                      porta_dist=self.distribuidor.porta)
+        except ValueError as e:
+            self._registrar(logging.ERROR, f"rede: não foi possível usar a placa {para}: {e}")
+            return
+        self._registrar(logging.WARNING, f"rede: entrada passou da placa {de} para {para} ({motivo})")
+        self._set(ultima_msg=f"rede: entrada na placa {para} ({motivo})")
+        self._rotas_por_placa()
+        self._troca = True
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
 
     def srt_status(self):
         rodando = not self.parar.is_set()
@@ -1987,6 +2238,7 @@ class Canal(threading.Thread):
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         s["srt"] = self.srt_status()
         s["perda_interna"] = self.perda_status()
+        s["rede"] = self.rede_status()
         s["saidas"] = [p.status() for p in self.procs_saida]
         s["servicos"] = self.analisador.servicos_resumo()
         s.update(self.analisador.taxas())
@@ -2060,6 +2312,32 @@ class Canal(threading.Thread):
                     p.terminate()
                 except OSError:
                     pass
+        # 2b) placa de rede reserva da entrada
+        if self.fo_ent and p is not None and p.poll() is None:
+            fluindo = agora - ultimo < 3 and ultimo > self.t_proc
+            if fluindo:
+                self.fo_ent.sucesso()
+            sem = None if fluindo else agora - max(ultimo, self.t_proc)
+            r = self.fo_ent.avaliar(agora, sem)
+            if r:
+                self._trocar_nic_entrada(r[0], r[1], agora)
+        # 2c) placa de rede reserva de cada saída
+        for ps in self.procs_saida:
+            if not ps.fo:
+                continue
+            sem = None
+            pp = ps.proc
+            if ps.cfg.get("tipo") == "srt" and ps.cfg.get("modo", "caller") != "listener" and pp is not None \
+                    and pp.poll() is None:
+                if ps.st.get("estado") == "rodando":
+                    ps._sem_desde = None
+                    ps.fo.sucesso()
+                else:
+                    ps._sem_desde = ps._sem_desde or agora
+                    sem = agora - ps._sem_desde
+            r = ps.fo.avaliar(agora, sem)
+            if r:
+                ps.trocar_nic(r[0], r[1], agora)
         # 3) saída travada: estava no ar, a entrada está chegando, mas o processo parou de responder
         entrada_ok = agora - ultimo < 3
         for i, ps in enumerate(self.procs_saida):
@@ -2089,7 +2367,8 @@ class Canal(threading.Thread):
                 "taxa": a.pop("taxa_sessao"), "totais": totais, "analise": a, "srt": self.srt_status(),
                 "saidas": [p.status() for p in self.procs_saida],
                 "saidas_cfg": saidas_publicas(normalizar_canal(self.cfg)["saidas"]),
-                "perda_interna": self.perda_status(), "reinicios_sem_sinal": self.reinicios_vigia}
+                "perda_interna": self.perda_status(), "reinicios_sem_sinal": self.reinicios_vigia,
+                "rede": self.rede_status()}
 
     def zerar_contadores(self):
         with self.analisador.lock:
@@ -2166,6 +2445,11 @@ class Canal(threading.Thread):
             rc = self.proc.wait()
             if self.parar.is_set():
                 break
+            if self._troca:            # troca de placa de rede: reinicia na hora, sem contar como queda
+                self._troca = False
+                espera = espera_min
+                self._set(estado="conectando", bitrate_bps=0, inicio_execucao=None)
+                continue
             if time.time() - t0 > 60:
                 espera = espera_min
             with self.lock:
@@ -2272,7 +2556,7 @@ class Gerenciador:
         return {**rel["analise"], "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
                 "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {},
-                "saidas": rel.get("saidas") or [], "saidas_cfg": rel.get("saidas_cfg") or []}
+                "saidas": rel.get("saidas") or [], "saidas_cfg": rel.get("saidas_cfg") or [], "rede": rel.get("rede")}
 
     # --- aparência (nome e logo do painel) -----------------------------
     TIPOS_LOGO = {"image/png": ".png", "image/jpeg": ".jpg", "image/svg+xml": ".svg", "image/webp": ".webp"}
@@ -2403,7 +2687,7 @@ class Gerenciador:
         c = normalizar_canal(dados)
         if c["entrada"].get("tipo") not in TIPOS_ENTRADA:
             raise ValueError("tipo de entrada inválido")
-        montar_comando(c, self.sup.get("tsp", "tsp"))  # valida (levanta ValueError)
+        montar_comando(_cfg_validacao(c), self.sup.get("tsp", "tsp"))  # valida (levanta ValueError)
         rodando = cid in self.exec
         if rodando:
             self.parar(cid, marcar=False)
@@ -2503,6 +2787,21 @@ def _desc_saida(s):
     return txt + (f" — serviços {', '.join(map(str, sv))}" if sv else " — TS completo")
 
 
+def _rede_relatorio(rede):
+    """Placas reserva configuradas e as trocas que aconteceram na sessão."""
+    itens, eventos = [], []
+    if not rede:
+        return itens, eventos
+    for rot, fo in [("Entrada", rede.get("entrada"))] + [(f"Destino {i + 1}", x) for i, x in enumerate(rede.get("saidas") or [])]:
+        if not fo:
+            continue
+        itens.append({"onde": rot, "principal": fo.get("principal"), "reserva": fo.get("reserva"), "ativa": fo.get("ativa"),
+                      "trocas": fo.get("trocas", 0)})
+        eventos += [{"onde": rot, **ev} for ev in fo.get("eventos") or []]
+    eventos.sort(key=lambda x: x.get("em") or 0)
+    return itens, eventos
+
+
 def dados_relatorio(dados, canal, titulo):
     """Organiza tudo o que vai no relatório (o mesmo conteúdo para HTML e TXT)."""
     r, tr, per = dados.get("resumo", {}), dados.get("tr101290", {}), dados.get("periodo", {})
@@ -2533,6 +2832,7 @@ def dados_relatorio(dados, canal, titulo):
         "srt": list((dados.get("srt") or {}).values()),
         "saidas": [(c, (dados.get("saidas") or [None] * 99)[i] if i < len(dados.get("saidas") or []) else None)
                    for i, c in enumerate(dados.get("saidas_cfg") or [])],
+        "placas": _rede_relatorio(dados.get("rede")),
     }
 
 
@@ -2605,6 +2905,14 @@ def relatorio_txt(d) -> str:
             if st:
                 L.append(f"    enviado {_f_n((st.get('enviado_bytes') or 0) / 1e6)} MB  ·  tempo no ar {_f_dur(st.get('tempo_no_ar_s'))}"
                          f"  ·  conexões {st.get('conexoes', 0)}  ·  quedas {st.get('reinicios', 0)}")
+    itens, eventos = d.get("placas") or ([], [])
+    if itens:
+        L += ["", "PLACAS DE REDE (RESERVA AUTOMÁTICA)", "-" * 78]
+        for it in itens:
+            L.append(f"  {it['onde']}: principal {it['principal']}  ·  reserva {it['reserva']}  ·  "
+                     f"{'na RESERVA' if it['ativa'] != it['principal'] else 'na principal'} no fim  ·  {it['trocas']} troca(s)")
+        for ev in eventos:
+            L.append(f"    {_f_dh(ev.get('em'))}  {ev['onde']}: {ev.get('de')} -> {ev.get('para')}  ({ev.get('motivo')})")
     L += ["", linha, f"Gerado por {d['titulo']} — asi2srt {__version__}", linha]
     return "\n".join(L) + "\n"
 
@@ -2711,6 +3019,20 @@ footer{{margin-top:26px;color:#8a949e;font-size:11px;border-top:1px solid #e3e7e
                      f'<td class="n">{(st.get("enviado_bytes") or 0) / 1e6:.1f} MB</td><td class="n">{_f_dur(st.get("tempo_no_ar_s"))}</td>'
                      f'<td class="n">{st.get("conexoes", 0)}</td><td class="n">{st.get("reinicios", 0)}</td></tr>')
         H.append("</table>")
+    itens, eventos = d.get("placas") or ([], [])
+    if itens:
+        H.append('<h2>Placas de rede (reserva automática)</h2><table><tr><th>Onde</th><th>Principal</th><th>Reserva</th>'
+                 '<th>No fim da sessão</th><th class="n">Trocas</th></tr>')
+        for it in itens:
+            res = it["ativa"] != it["principal"]
+            H.append(f'<tr class="{"err" if res else ""}"><td>{e(it["onde"])}</td><td class="mono">{e(it["principal"] or "")}</td>'
+                     f'<td class="mono">{e(it["reserva"] or "")}</td><td>{"na reserva" if res else "na principal"}</td>'
+                     f'<td class="n">{it["trocas"]}</td></tr>')
+        H.append("</table>")
+        if eventos:
+            H.append('<table style="margin-top:8px"><tr><th>Quando</th><th>Onde</th><th>De → para</th><th>Motivo</th></tr>'
+                     + "".join(f'<tr><td>{_f_dh(ev.get("em"))}</td><td>{e(ev["onde"])}</td><td class="mono">{e(ev.get("de") or "")} → '
+                               f'{e(ev.get("para") or "")}</td><td>{e(ev.get("motivo") or "")}</td></tr>' for ev in eventos) + "</table>")
     H.append(f'<footer>Gerado por {e(d["titulo"])} em {_f_dh(d["gerado"])} · asi2srt {__version__}</footer></div></body></html>')
     return "\n".join(H)
 
@@ -2892,6 +3214,18 @@ def relatorio_pdf(d, logo=None) -> bytes:
         E += [Paragraph("SAÍDAS", s_h2),
               tabela(["Destino", "Configuração", "Enviado", "Tempo no ar", "Conexões", "Quedas"], linhas,
                      [.11, .45, .12, .12, .1, .1], direita=(2, 3, 4, 5), vermelhas=verm)]
+    itens, eventos = d.get("placas") or ([], [])
+    if itens:
+        verm = {n for n, it in enumerate(itens, 1) if it["ativa"] != it["principal"]}
+        E += [Paragraph("PLACAS DE REDE (RESERVA AUTOMÁTICA)", s_h2),
+              tabela(["Onde", "Principal", "Reserva", "No fim da sessão", "Trocas"],
+                     [[it["onde"], it["principal"] or "", it["reserva"] or "",
+                       "na reserva" if it["ativa"] != it["principal"] else "na principal", str(it["trocas"])] for it in itens],
+                     [.16, .2, .2, .3, .14], direita=(4,), vermelhas=verm)]
+        if eventos:
+            E += [Spacer(1, 5), tabela(["Quando", "Onde", "De -> para", "Motivo"],
+                                      [[_f_dh(ev.get("em")), ev["onde"], f'{ev.get("de")} -> {ev.get("para")}', ev.get("motivo") or ""]
+                                       for ev in eventos], [.2, .14, .2, .46])]
 
     rodape = tx(f'{d["titulo"]} · {d["canal"]} · gerado em {_f_dh(d["gerado"])} · asi2srt {__version__}')
 
@@ -3501,7 +3835,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                 dados = {**t.analisador.analise(), "estado": t.status()["estado"], "srt": t.srt_status(),
                                          "saidas": [p.status() for p in t.procs_saida],
                                          "saidas_cfg": saidas_publicas(normalizar_canal(ger.defs[cid])["saidas"]),
-                                         "salvo": False, "taxa_sessao": t.analisador.taxa_sessao(),
+                                         "salvo": False, "taxa_sessao": t.analisador.taxa_sessao(), "rede": t.rede_status(),
                                          "periodo": {"inicio": t.inicio_sessao, "fim": agora_w,
                                                      "duracao_s": int(agora_w - t.inicio_sessao)}}
                             if q.get("baixar"):
@@ -3631,6 +3965,9 @@ def executar_gateway(cfg: dict, caminho=None):
     if sup.get("log_arquivo"):
         logging.getLogger().addHandler(logging.FileHandler(sup["log_arquivo"]))
     log.info("asi2srt %s - %d canal(is) configurado(s)", __version__, len(ger.defs))
+    if sup.get("rotas_por_placa"):
+        for c in aplicar_rotas_por_placa():
+            log.info("rotas por placa: %s", c)
     if sup.get("status_http", "0.0.0.0:8088"):
         ger.garantir_senha()
         try:
@@ -4318,6 +4655,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .no .ed{display:flex;align-items:center;gap:7px;min-width:0}.no .ed code{font-family:ui-monospace,monospace;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .no .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
 .nicb{font-size:10.5px;font-family:ui-monospace,monospace;color:#c9b8ff;background:#251f3a;border-radius:4px;padding:1px 6px;white-space:nowrap;flex:none}
+.nicb.res{color:#1b1300;background:#f2cc60;font-weight:700}
+.nicr{font-size:10px;font-family:ui-monospace,monospace;color:var(--mut);border:1px dashed #3a3f4b;border-radius:4px;padding:0 5px;white-space:nowrap;flex:none}
 .no .tp.udp,.lista .tp.udp{background:#22301f;color:#a6e3a1}.no .tp.asi,.lista .tp.asi{background:#3a2a1f;color:#f5c48a}
 .lista .tp{font-size:10.5px;font-weight:700;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff;letter-spacing:.03em}
 .st{display:inline-flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}.st i{width:8px;height:8px;border-radius:50%;background:#484f58}
@@ -4407,17 +4746,17 @@ function dur(s){if(!s)return'—';const h=Math.floor(s/3600),m=Math.floor(s%3600
 const CE={
  dektec:[['dispositivo','Placa','number',0],['canal','Porta','number',0],['timeout_ms','Timeout sem sinal (ms)','number',5000]],
  linuxasi:[['dispositivo','Dispositivo','text','/dev/asirx0']],
- udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface','Placa de rede (entrada)','nic','']],
+ udp:[['endereco','Endereço (ip:porta ou porta)','text','239.1.1.1:1234'],['interface','Placa de rede (entrada)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
  srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Endereço (caller: IP:porta · listener: porta)','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text',''],
-      ['interface','Placa de rede (entrada)','nic','']],
+      ['interface','Placa de rede (entrada)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
  arquivo:[['caminho','Arquivo .ts','text',''],['loop','Repetir em loop','chk',true]]};
 const CS={
  srt:[['servicos','Serviços a enviar','serv',[]],['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
-      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25],['interface','Placa de rede (saída)','nic','']],
- udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic','']],
- rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],
+      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
+ udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
+ rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2',''],
       ['payload_type','Payload type','number',33],['ssrc','SSRC (opcional)','text','']],
  rtmp:[['url','Servidor (ex.: rtmp://a.rtmp.youtube.com/live2)','text',''],['chave','Chave de transmissão','password',''],['video','Vídeo','sel:copiar,h264','copiar'],['audio','Áudio','sel:aac,copiar','aac'],
       ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['servicos','Serviço a enviar (RTMP leva um só)','serv1',[]]]};
@@ -4502,7 +4841,15 @@ function chipsSRT(e){if(e.estado!=='conectado')return'';const lat=e.latencia_ms|
  ${e.papel==='entrada'?`<span class="chip ${e.descartados?'e':''}" title="pacotes que o SRT não conseguiu recuperar a tempo (viram erros no TS)"><small>Não recup.</small>${e.descartados}/s</span>`:''}
  ${e.banda_mbps&&e.papel!=='entrada'?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
 const msgCurta=m=>String(m||'').replace(/^\*\s*(Error|Warning):\s*/i,'').replace(/^srt:\s*/,'').replace(/^\[saída \d+\]\s*/,'').slice(0,90);
-function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+function nicBadge(x,fo,ativo){if(x.tipo==='rtmp')return'';
+ if(fo&&ativo){const tip=`Principal: ${fo.principal} (${fo.principal_ok?'ok':'fora do ar'}) · Reserva: ${fo.reserva} (${fo.reserva_ok?'ok':'fora do ar'})`
+   +(fo.motivo?`\nNa reserva porque: ${fo.motivo}`:'')+(fo.trocas?`\n${fo.trocas} troca(s) nesta sessão`:'');
+  return`<span class="nicb${fo.em_reserva?' res':''}" title="${esc(tip)}">${fo.em_reserva?'⚠ ':''}${esc(fo.ativa)}${fo.em_reserva?' · reserva':''}</span>${fo.em_reserva?'':`<span class="nicr" title="${esc(tip)}">↺ ${esc(fo.reserva)}</span>`}`}
+ const n=x.interface||x.interface_local;if(!n)return'';
+ return`<span class="nicb" title="placa de rede usada">${esc(n)}</span>${x.interface_reserva?`<span class="nicr" title="placa reserva (failover)">↺ ${esc(x.interface_reserva)}</span>`:''}`}
+function pRede(s){const r=s&&s.rede;if(!r)return'';const l=[r.entrada,...(r.saidas||[])].filter(f=>f&&f.em_reserva);
+ return l.length?`<span class="pill pint" title="${esc(l.map(f=>`${f.ativa} no lugar de ${f.principal}: ${f.motivo||''}`).join('\n'))}">⚠ placa reserva</span>`:''}
+function no(rot,x,e,ativo,ps,cid,lista,fo){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
  const falha=ativo&&ps&&ps.estado!=='rodando'&&ps.ultima_msg&&(!e||e.estado!=='conectado')?`<span class="chip w" title="${esc(ps.ultima_msg)}">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` · ${ps.reinicios} tentativa(s)`:''}</span>`:'';
  let st;if(e){const tx={conectado:'conectado',aguardando:x.modo==='listener'?'aguardando conexão':'conectando…',parado:'parado'}[e.estado];
   st=`<span class="st ${e.estado}"><i></i>${tx}${e.peer?` · <code>${esc(e.peer)}</code>`:''}${e.estado==='conectado'&&e.conectado_s?` · ${dur(e.conectado_s)}`:''}</span>`}
@@ -4511,7 +4858,7 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  const sr=rot.startsWith('Destino')?servRotulo(x,lista):null;
  const chipServ=rot.startsWith('Destino')?(sr?`<span class="chip svout" title="serviços enviados por este destino">${sr.length===1&&sr[0].video&&PREV[cid+':'+sr[0].numero]&&PREV[cid+':'+sr[0].numero].u?`<img data-prev="${cid}:${sr[0].numero}" src="${PREV[cid+':'+sr[0].numero].u}">`:''}<small>Serviço</small>${esc(sr.map(s=>s.nome).join(', '))}</span>`
   :`<span class="chip"><small>Serviços</small>todos (TS completo)</span>`):'';
- return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${x.tipo!=='rtmp'&&(x.interface||x.interface_local)?`<span class="nicb" title="placa de rede usada">${esc(x.interface||x.interface_local)}</span>`:''}</span>
+ return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${nicBadge(x,fo,ativo)}</span>
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${rot==='Origem'?'<span></span>':e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
 const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
@@ -4581,11 +4928,11 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`
   +`<button class="bx" data-x="${c.id}" title="${ab?'recolher detalhes':'ver todos os indicadores e imagens maiores'}">${ab?'▴':'▾'}</button>`;
- const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
- return`<div class="rota e-${esc(s.estado)}${ab?'':' cp'}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}
+ const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos,((s.rede||{}).saidas||[])[i])).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
+ return`<div class="rota e-${esc(s.estado)}${ab?'':' cp'}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>${pInt(s)}${pRede(s)}
  ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa útil: só o conteúdo, sem pacotes nulos de enchimento${x.temNulos?` (o TS chega com ${mb(x.ts)} Mb/s com enchimento)`:''}">${mb(x.ut)} <small>Mb/s</small></span> ${seloModo(s.modo_ts)}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${ab?indicadores(ativo?t:null,ativo?null:r):indCompacto(ativo?t:null,ativo?null:r)}
- <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
+ <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo,undefined,undefined,undefined,(s.rede||{}).entrada)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
    return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}${grafRota(s,srt.SRTIN)}</div>`:''}${destinos}
  ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
@@ -4604,11 +4951,11 @@ function linhaLista(c){const s=c.status||{},ativo=s.estado!=='parado',t=s.tr1012
  const acs=(ativo?`<button data-a="parar" data-id="${c.id}" title="parar">■</button><button data-a="analise" data-id="${c.id}">Análise</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}" title="iniciar">▶</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button>`;
- return`<tr class="e-${esc(s.estado)}"><td>${th}</td><td><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b> ${pInt(s)}</td>
+ return`<tr class="e-${esc(s.estado)}"><td>${th}</td><td><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b> ${pInt(s)}${pRede(s)}</td>
  <td><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span></td>
  <td class="n">${ativo?`<b>${mb(x.ut)}</b> <small style="color:var(--mut)">Mb/s</small>`:r?`<small style="color:var(--mut)">méd.</small> ${mb(r.taxa.media)}`:'—'}</td>
  <td>${ativo?seloModo(s.modo_ts,true):''}</td>${pr(1)}${pr(2)}${pr(3)}
- <td class="ent" title="${esc(endTxt(c.entrada))}"><span class="tp ${cl}">${tp}</span> <code>${esc(endTxtBase(c.entrada))}</code>${srtTxt}</td>
+ <td class="ent" title="${esc(endTxt(c.entrada))}"><span class="tp ${cl}">${tp}</span> <code>${esc(endTxtBase(c.entrada))}</code> ${ativo?nicBadge(c.entrada,(s.rede||{}).entrada,ativo):''}${srtTxt}</td>
  <td>${c.saidas.length?`<span class="pb ${!ativo?'x':noar===c.saidas.length?'ok':noar?'w':'e'}">${ativo?noar:0}/${c.saidas.length}</span> <small style="color:var(--mut)">no ar</small>`:'<small style="color:var(--mut)">só análise</small>'}</td>
  <td><div class="acs">${acs}</div></td></tr>`}
 function lista(){return`<div class="lista"><table><tr><th></th><th>Canal</th><th>Estado</th><th class="n">Taxa útil</th><th>Tipo</th>
@@ -4640,8 +4987,13 @@ function campoNic(n,rot,obj){let v=obj.interface||'';
  const avulso=!v&&obj.interface_local?`<option value="" selected>IP ${esc(obj.interface_local)} (configurado à mão)</option>`:'';
  return`<label title="Placa de rede usada por esta conexão. Automática = o sistema escolhe pela rota.">${rot}<select name="${n}">
  ${avulso||`<option value="">Automática (rota do sistema)</option>`}${ops.join('')}</select></label>`}
+function campoNic2(n,rot,obj){const v=obj.interface_reserva||'';
+ const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(i.nome)} — ${esc(i.ips.join(', ')||'sem IP')}${i.estado!=='up'?' (desconectada)':''}${i.virtual?' · virtual':''}</option>`);
+ if(v&&!INTERFACES.some(i=>i.nome===v))ops.push(`<option value="${esc(v)}" selected>${esc(v)} — não encontrada neste computador</option>`);
+ return`<label title="Se a placa principal perder o link/IP, ou a conexão não funcionar por ela, o sistema passa sozinho para esta placa e volta quando a principal ficar estável. Precisa escolher a placa principal.">${rot}<select name="${n}">
+ <option value="">Nenhuma</option>${ops.join('')}</select></label>`}
 function campo(pref,[k,rot,t,pad],obj){
- if(t==='nic')return campoNic(`${pref}${k}`,rot,obj);const v=obj[k]??(k==='servicos'&&obj.programa?[obj.programa]:pad),n=`${pref}${k}`;
+ if(t==='nic')return campoNic(`${pref}${k}`,rot,obj);if(t==='nic2')return campoNic2(`${pref}${k}`,rot,obj);const v=obj[k]??(k==='servicos'&&obj.programa?[obj.programa]:pad),n=`${pref}${k}`;
  if(t==='serv'||t==='serv1')return campoServ(n,rot,t,v);
  if(t==='chk')return`<label class="chk"><input type="checkbox" name="${n}" ${v?'checked':''}> ${rot}</label>`;
  if(t.startsWith('sel:'))return`<label>${rot}<select name="${n}">${t.slice(4).split(',').map(o=>`<option ${String(v)===o?'selected':''}>${o}</option>`).join('')}</select></label>`;
@@ -4940,6 +5292,8 @@ def main(argv=None):
     p.add_argument("--forcar", action="store_true", help="reinstala mesmo com o driver carregado")
     p.set_defaults(func=cmd_instalar_dektec)
 
+    p = sub.add_parser("rotas-por-placa", help="cada placa de rede sai pelo próprio gateway (root; para placa reserva)")
+    p.set_defaults(func=lambda a: print("\n".join(aplicar_rotas_por_placa()) or "nada a fazer (ou sem permissão)"))
     p = sub.add_parser("instalar-servico", help="instala serviço systemd (root)")
     p.add_argument("-c", "--config", default="/etc/asi2srt/config.yaml")
     p.set_defaults(func=cmd_instalar_servico)

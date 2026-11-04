@@ -197,6 +197,28 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+### Placa de rede reserva (failover automático)
+
+Cada entrada (UDP/SRT) e cada saída (SRT/UDP/RTP) pode ter uma **placa reserva**. Escolha a
+**Placa de rede** (principal) e a **Placa reserva (failover)** no formulário do canal.
+
+- **Cabo/porta caiu ou a placa perdeu o IP:** troca para a reserva em até ~2 s.
+- **A conexão não funciona pela placa ativa** (SRT caller sem conectar ou entrada sem sinal por 15 s,
+  com a placa "ligada" mas a rede adiante com problema): tenta a outra placa. Se nenhuma funcionar,
+  alterna com espera crescente (15 s, 30 s, 60 s, até 2 min) para não ficar trocando sem parar.
+- **Volta para a principal** sozinho quando ela fica de volta e estável por 30 s (quando saiu dela por
+  link/IP). Se saiu por falta de conexão, fica na reserva enquanto a reserva estiver funcionando.
+- Troca de placa **não conta como queda**; a análise continua. A rota mostra **⚠ PLACA RESERVA** e a
+  placa em amarelo (`enp2s0 · reserva`); passe o mouse para ver o motivo. O log e os relatórios
+  (PDF/HTML/TXT) trazem cada troca com horário e motivo.
+- Ajustes em `supervisor.failover` (opcional): `sem_sinal_s: 15`, `voltar_apos_s: 30`.
+- **Placas em redes/operadoras diferentes:** para a saída usar mesmo o gateway da placa reserva,
+  ative `supervisor.rotas_por_placa: true` (ou rode `sudo asi2srt rotas-por-placa`). Isso cria uma
+  regra de rota por origem para cada placa (o tráfego com o IP de uma placa sai pelo gateway dela).
+  Se as duas placas estão na mesma rede, não é preciso.
+- Alternativa no sistema operacional: *bonding* `active-backup` (duas portas no mesmo switch viram uma
+  placa só). Funciona junto, mas só cobre falha de link na mesma rede.
+
 ### Muitos sinais: visão compacta e Lista
 
 - **Rotas** (padrão compacto): os indicadores TR 101 290 ficam numa linha só por canal, mostrando
@@ -429,7 +451,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.19.1 && git push origin v2.17.1
+git tag v2.20.0 && git push origin v2.17.1
 ```
 
 ## Licença

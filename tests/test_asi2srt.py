@@ -1,3 +1,4 @@
+import io
 import base64
 import shutil
 import json
@@ -1174,3 +1175,126 @@ def test_hash_de_senha():
     h = a.hash_senha("abc123")
     assert h.startswith("pbkdf2_sha256$") and "abc123" not in h
     assert a.conferir_senha("abc123", h) and not a.conferir_senha("abc124", h) and not a.conferir_senha("x", "lixo")
+
+
+# ---------------- placa de rede reserva (2.20) ----------------
+def _nics(monkeypatch, estado):
+    """estado: {nome: (ligada, ip)}"""
+    monkeypatch.setattr(a, "estado_nics", lambda cache_s=1.5: {n: {"ligada": l, "ip": ip, "estado": "up" if l else "down"}
+                                                               for n, (l, ip) in estado.items()})
+    monkeypatch.setattr(a, "ip_da_interface", lambda n: estado[n][1] or (_ for _ in ()).throw(ValueError("sem IP")))
+
+
+def test_failover_nic_link_e_volta(monkeypatch):
+    est = {"eth0": (True, "10.0.0.5"), "eth1": (True, "192.168.1.5")}
+    _nics(monkeypatch, est)
+    fo = a.FailoverNic({"interface": "eth0", "interface_reserva": "eth1"}, "Saída 1", estavel_s=30, sem_sinal_s=15)
+    assert fo.ativa == "eth0" and fo.avaliar(100) is None
+    est["eth0"] = (False, "10.0.0.5")                       # cabo da principal desconectado
+    para, motivo = fo.avaliar(101)
+    assert para == "eth1" and "sem link" in motivo
+    fo.trocar(para, motivo, 101)
+    assert fo.aplicar({"interface": "eth0", "interface_local": "1.1.1.1"})["interface"] == "eth1"
+    est["eth0"] = (True, "10.0.0.5")                        # voltou: só retorna depois de 30 s estável
+    assert fo.avaliar(110) is None and fo.avaliar(130) is None
+    para, motivo = fo.avaliar(141)
+    assert para == "eth0" and "estável" in motivo
+    fo.trocar(para, motivo, 141)
+    st = fo.status()
+    assert st["ativa"] == "eth0" and not st["em_reserva"] and st["trocas"] == 2
+
+
+def test_failover_nic_sem_conexao_nao_volta_sozinho(monkeypatch):
+    _nics(monkeypatch, {"eth0": (True, "10.0.0.5"), "eth1": (True, "192.168.1.5")})
+    fo = a.FailoverNic({"interface": "eth0", "interface_reserva": "eth1"}, "Entrada", estavel_s=5, sem_sinal_s=15)
+    t0 = fo.desde
+    assert fo.avaliar(t0 + 10, sem_sinal_ha=10) is None          # ainda dentro do prazo
+    para, motivo = fo.avaliar(t0 + 20, sem_sinal_ha=16)
+    assert para == "eth1" and "sem conexão" in motivo
+    fo.trocar(para, motivo, t0 + 20)
+    assert fo.avaliar(t0 + 100) is None                          # funcionando pela reserva: fica nela
+    # se a reserva também não conectar, tenta a principal de novo, com espera maior (2x)
+    assert fo.avaliar(t0 + 45, sem_sinal_ha=20) is None
+    assert fo.avaliar(t0 + 60, sem_sinal_ha=31)[0] == "eth0"
+
+
+def test_failover_validacao():
+    base = {"tipo": "udp", "endereco": "239.1.1.1:1234"}
+    for item, erro in (({**base, "interface_reserva": "eth1"}, "principal"),
+                       ({**base, "interface": "eth1", "interface_reserva": "eth1"}, "diferente")):
+        with pytest.raises(ValueError, match=erro):
+            a.montar_comando({"entrada": item, "saidas": []})
+        with pytest.raises(ValueError, match=erro):
+            a.montar_saida(item, 0, porta_entrada=1)
+
+
+TSP_REGISTRA = """#!/usr/bin/env python3
+import sys, re, socket, time, os
+arg = " ".join(sys.argv)
+with open(os.environ["REG_TSP"], "a") as f:
+    f.write(arg + "\\n")
+if "--local-address 127.0.0.1" in arg:
+    while True: time.sleep(1)
+portas = [int(p) for p in re.findall(r"127\\\\.0\\\\.0\\\\.1:(\\\\d+)", arg)]
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+pkt = bytes([0x47, 0x00, 0x00, 0x10]) + bytes(184)
+while True:
+    for p in portas: s.sendto(pkt * 7, ("127.0.0.1", p))
+    time.sleep(0.02)
+"""
+
+
+def test_canal_troca_placa_da_entrada_quando_cai(monkeypatch):
+    est = {"eth0": (True, "10.0.0.5"), "eth1": (True, "192.168.1.5")}
+    _nics(monkeypatch, est)
+    d = tempfile.mkdtemp()
+    tsp, reg = os.path.join(d, "tsp"), os.path.join(d, "reg.txt")
+    with open(tsp, "w") as f:
+        f.write(TSP_REGISTRA)
+    os.chmod(tsp, 0o755)
+    monkeypatch.setenv("REG_TSP", reg)
+    canal = {"nome": "fo", "entrada": {"tipo": "udp", "endereco": "239.1.1.1:1234", "interface": "eth0",
+                                       "interface_reserva": "eth1"}, "saidas": []}
+    c = a.Canal(canal, {"tsp": tsp, "reinicio_min_s": 1, "reinicio_max_s": 1})
+    c.start()
+    try:
+        time.sleep(3)
+        assert "--local-address 10.0.0.5" in open(reg).read()
+        est["eth0"] = (False, "10.0.0.5")
+        fim = time.time() + 12
+        while time.time() < fim and "--local-address 192.168.1.5" not in open(reg).read():
+            time.sleep(0.5)
+        assert "--local-address 192.168.1.5" in open(reg).read()
+        st = c.status()
+        assert st["rede"]["entrada"]["ativa"] == "eth1" and st["rede"]["entrada"]["em_reserva"]
+        assert st["reinicios"] == 0                          # troca de placa não conta como queda
+        assert any("passou da placa eth0 para eth1" in x for x in c.log)
+    finally:
+        c.encerrar()
+
+
+def test_rotas_por_placa_comandos(monkeypatch):
+    chamadas = []
+
+    class R:
+        def __init__(self, out="", rc=0):
+            self.stdout, self.returncode, self.stderr = out, rc, ""
+
+    def falso(cmd, **k):
+        chamadas.append(cmd)
+        if cmd[:5] == ["ip", "-j", "-4", "route", "show"]:
+            return R(json.dumps([{"dst": "default", "gateway": "10.0.0.1", "dev": "eth0"},
+                                 {"dst": "default", "gateway": "192.168.1.1", "dev": "eth1"}]))
+        if cmd[:4] == ["ip", "-j", "-4", "rule"]:
+            return R("[]")
+        return R()
+    _nics(monkeypatch, {"eth0": (True, "10.0.0.5"), "eth1": (True, "192.168.1.5")})
+    monkeypatch.setattr(a.subprocess, "run", falso)
+    monkeypatch.setattr(a.shutil, "which", lambda x: "/sbin/ip")
+    reais = {"eth0": "2", "eth1": "3"}
+    orig_open = open
+    monkeypatch.setattr("builtins.open", lambda f, *x, **k: io.StringIO(reais[f.split("/")[4]]) if str(f).endswith("/ifindex")
+                        else orig_open(f, *x, **k))
+    feitos = a.aplicar_rotas_por_placa()
+    assert "ip -4 route replace default via 192.168.1.1 dev eth1 table 203" in feitos
+    assert "ip -4 rule add from 192.168.1.5/32 table 203 priority 1003" in feitos
