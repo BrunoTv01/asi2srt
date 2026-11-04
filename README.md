@@ -176,8 +176,9 @@ sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo 
 
 ## Taxa: total, útil, por serviço, CBR ou VBR
 
-A rota e o card mostram a **taxa total do TS**, a parte **útil** (sem pacotes nulos de enchimento) e
-quanto é **nulos**; cada janela de serviço mostra a **taxa do serviço**. O sistema também classifica:
+A rota, o card, o gráfico e os relatórios mostram só a **taxa útil** (o conteúdo, sem os pacotes nulos
+de enchimento); a taxa total do TS, com nulos, fica na tela de Análise. Cada janela de serviço mostra a
+**taxa do serviço**. As saídas removem os nulos e nada é acrescentado. O sistema também classifica:
 
 - **TS CBR ou VBR:** CBR quando a taxa total varia menos de 2% (típico de mux com enchimento);
 - **cada serviço CBR ou VBR:** CBR quando a taxa do serviço varia menos de 3%.
@@ -359,7 +360,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.14.0 && git push origin v2.14.0
+git tag v2.14.1 && git push origin v2.14.1
 ```
 
 ## Licença

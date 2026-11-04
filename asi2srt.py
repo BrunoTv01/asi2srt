@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.14.0"
+__version__ = "2.14.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -719,7 +719,7 @@ class AnalisadorTS:
 
     # --- estado -------------------------------------------------------
     def zerar(self):
-        self.est_taxa = [0, 0.0, None, None]   # n, soma, mín, máx (bitrate total por segundo)
+        self.est_taxa = [0, 0.0, None, None]   # n, soma, mín, máx (taxa ÚTIL por segundo, sem nulos)
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
         self.cc_pid = {}
@@ -749,6 +749,7 @@ class AnalisadorTS:
         self.taxa = {}
         self.taxa_total = 0
         self.hist_total = collections.deque(maxlen=300)
+        self.hist_util = collections.deque(maxlen=300)   # taxa sem pacotes nulos, a cada 1 s
         self.hist_serv = {}         # número do programa -> deque das taxas por segundo (por chegada)
         # taxa medida pelo relógio do próprio fluxo (PCR): não depende de quando os pacotes chegam
         self.pid_prog = {}          # pid -> número do programa
@@ -1131,12 +1132,14 @@ class AnalisadorTS:
                     pids.add(pcr)
                 self.hist_serv.setdefault(num, collections.deque(maxlen=60)).append(
                     int(sum(self.taxa.get(p, 0) for p in pids)))
-            if self.taxa_total > 0 and self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL:
+            util = self.taxa_total - self.taxa.get(0x1FFF, 0)
+            self.hist_util.append(int(util))
+            if util > 0 and self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL:
                 e = self.est_taxa
                 e[0] += 1
-                e[1] += self.taxa_total
-                e[2] = self.taxa_total if e[2] is None else min(e[2], self.taxa_total)
-                e[3] = self.taxa_total if e[3] is None else max(e[3], self.taxa_total)
+                e[1] += util
+                e[2] = util if e[2] is None else min(e[2], util)
+                e[3] = util if e[3] is None else max(e[3], util)
             self.pcr_info = {p: {"intervalo_ms": round(j[0] / 27000, 2), "jitter_ns": int(j[1])}
                              for p, j in self.pcr_janela.items()}
             self.pcr_janela = {}
@@ -1381,7 +1384,8 @@ class AnalisadorTS:
                 },
                 "pids": pids,
                 "servicos": servicos,
-                "historico": list(self.hist_total),
+                "historico": list(self.hist_util),
+                "historico_ts": list(self.hist_total),
             }
 
     # --- recepção pela rede local -------------------------------------
@@ -1872,7 +1876,7 @@ class Canal(threading.Thread):
     def status(self):
         with self.lock:
             s = dict(self.st)
-            s["historico"] = list(self.hist)
+            s["historico"] = list(self.hist)   # substituído abaixo pela taxa útil do analisador
         if s["inicio_execucao"]:
             s["uptime_s"] = int(time.time() - s["inicio_execucao"])
         intervalo = (self.cfg.get("processamento") or {}).get("intervalo_relatorio_s", 5)
@@ -1885,6 +1889,10 @@ class Canal(threading.Thread):
         s["saidas"] = [p.status() for p in self.procs_saida]
         s["servicos"] = self.analisador.servicos_resumo()
         s.update(self.analisador.taxas())
+        with self.analisador.lock:
+            hu = list(self.analisador.hist_util)[-60:]
+        if any(hu):
+            s["historico"] = hu
         return s
 
     def relatorio(self, motivo):
@@ -3136,7 +3144,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
   <div class="acol"><div class="painel" id="psrt" hidden><h3>Saídas e conexões<span id="asrtn"></span></h3><div id="asrt"></div></div>
-  <div class="painel"><h3>Bitrate do TS<span>últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
+  <div class="painel"><h3>Bitrate útil<span>sem nulos · últimos 5 min</span></h3><div class="graf" id="agraf"></div></div>
   <div class="painel"><h3>Serviços<span id="anserv"></span></h3><div id="aserv"></div></div></div></div>
  <div class="painel"><h3>PIDs<span id="anpid"></span></h3><div class="tabw"><table class="t" id="apids"></table></div></div>
 </section>
@@ -3231,7 +3239,7 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
    return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}
  ${!ativo&&c.ultimo_relatorio?relCard(c):`${spark(s.historico)}
- <div class="met"><div>${(()=>{const x=taxaTS(s);return`<small>Bitrate do TS ${seloModo(s.modo_ts,true)}</small><b class="big">${mb(x.ts)}<small> Mb/s</small></b>${x.temNulos?`<small style="color:var(--mut)">útil <b style="color:#a6e3a1;font-size:12px">${mb(x.ut)}</b> · nulos ${mb(x.nul)}</small>`:''}`})()}</div>
+ <div class="met"><div>${(()=>{const x=taxaTS(s);return`<small>Bitrate ${seloModo(s.modo_ts,true)}</small><b class="big" title="taxa útil, sem pacotes nulos de enchimento${x.temNulos?` (o TS chega com ${mb(x.ts)} Mb/s)`:''}">${mb(x.ut)}<small> Mb/s</small></b>`})()}</div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>`}
  ${tr(s)}
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
@@ -3271,10 +3279,11 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
 const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
-function seloModo(m,curto){if(!m)return'';if(!m.modo)return curto?'':`<span class="modo med" title="medindo a variação da taxa (${m.amostras||0} s)">medindo…</span>`;
- const tip=`${m.modo==='CBR'?'Taxa constante':'Taxa variável'} — variação ${m.variacao_pct}% nos últimos ${m.amostras} s`+(m.min?` (mín ${mbps(m.min)}, máx ${mbps(m.max)})`:'');
+function seloModo(m,curto){if(!m)return'';const ehTS=!curto||true;if(!m.modo)return curto?'':`<span class="modo med" title="medindo a variação da taxa (${m.amostras||0} s)">medindo…</span>`;
+ const tip=`${m.modo==='CBR'?'Taxa constante':'Taxa variável'} — variação ${m.variacao_pct}% nos últimos ${m.amostras} s`+(m.min?` (mín ${mbps(m.min)}, máx ${mbps(m.max)})`:'')
+  +(m.modo==='CBR'?'. No TS, CBR costuma significar enchimento com pacotes nulos (removidos nas saídas).':'');
  return`<span class="modo ${m.modo.toLowerCase()}" title="${esc(tip)}">${m.modo}${curto?'':` <small>±${m.variacao_pct}%</small>`}</span>`}
-function taxaTS(s){const ts=s.taxa_ts||s.bitrate_bps||0,ut=s.taxa_util||0,nul=s.taxa_nulos||0;
+function taxaTS(s){const ts=s.taxa_ts||s.bitrate_bps||0,nul=s.taxa_nulos||0,ut=s.taxa_util||(s.taxa_ts?0:ts);
  return{ts,ut,nul,temNulos:ts>0&&nul/ts>0.02}}
 function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
  const msg=!s.video?'♪ sem vídeo':p.u?'':esc(p.erro||'carregando imagem…');
@@ -3315,7 +3324,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
- ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa total do TS (inclui pacotes nulos)">${mb(x.ts)} <small>Mb/s TS</small></span> ${seloModo(s.modo_ts)}${x.temNulos?`<span class="ut" title="sem pacotes nulos (enchimento)">útil <b>${mb(x.ut)}</b> · nulos ${mb(x.nul)}</span>`:''}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
+ ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa útil: só o conteúdo, sem pacotes nulos de enchimento${x.temNulos?` (o TS chega com ${mb(x.ts)} Mb/s com enchimento)`:''}">${mb(x.ut)} <small>Mb/s</small></span> ${seloModo(s.modo_ts)}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
@@ -3327,7 +3336,7 @@ function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll(
  $('#grid').className=VIS==='rotas'?'rotas':'grid';
  $('#grid').innerHTML=dados.length?dados.map(VIS==='rotas'?linha:card).join(''):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
- const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.bitrate_bps||0),0);
+ const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.estado!=='parado'?taxaTS(c.status).ut:0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
 
 async function atualizar(){try{dados=await api('GET','/api/canais');render()}catch(e){}}
