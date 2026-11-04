@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.17.1"
+__version__ = "2.17.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -2626,7 +2626,6 @@ def relatorio_html(d, logo=None) -> str:
         kpis.append(("Rajadas de chegada", f"{tx['rajadas']} s"))
     if tx.get("perda_interna"):
         kpis.append(("Perda interna (servidor)", _f_n(tx["perda_interna"])))
-    total_erros = sum(d["totais"].values())
     H = [f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Relatório — {e(d['canal'])}</title>
 <style>
@@ -2654,7 +2653,7 @@ footer{{margin-top:26px;color:#8a949e;font-size:11px;border-top:1px solid #e3e7e
 @media print{{body{{background:#fff}}.pag{{box-shadow:none;margin:0;max-width:none;padding:0}}h2{{break-after:avoid}}.serv,tr{{break-inside:avoid}}}}
 </style></head><body><div class="pag">
 <header>{logo_tag}<h1>{e(d['titulo'])}<small>Relatório de análise · {e(d['canal'])}</small></h1>
-<span style="margin-left:auto" class="res {'err' if total_erros else 'ok'}">{'TR 101 290: ' + _f_n(total_erros) + ' ocorrência(s)' if total_erros else 'TR 101 290 sem erros'}</span></header>
+</header>
 <div class="info"><b>Canal</b><span>{e(d['canal'])}</span><b>Entrada</b><span>{e(d['entrada'])}</span>
 <b>Período</b><span>{_f_dh(d['inicio'])} até {_f_dh(d['fim'])} ({_f_dur(d['duracao'])})</span>
 <b>Situação</b><span>{e(MOTIVOS_REL.get(d['motivo'], 'sessão ao vivo (no momento da geração)'))}</span>
@@ -2770,7 +2769,6 @@ def relatorio_pdf(d, logo=None) -> bytes:
         return Paragraph(f'<font color="{c}">{html.escape(tx(v))}</font>', st or s_cel)
 
     taxa, m = d["taxa"], d["modo"]
-    total = sum(d["totais"].values())
     E = []
     # cabeçalho: logo, título e resultado geral
     cab = []
@@ -2783,13 +2781,10 @@ def relatorio_pdf(d, logo=None) -> bytes:
             cab.append(img)
         except Exception:
             cab = []
-    res = (f'<font color="#b3261e"><b>TR 101 290: {_f_n(total)} ocorrência(s)</b></font>' if total
-           else '<font color="#17733f"><b>TR 101 290 sem erros</b></font>')
     bloco = [Paragraph(html.escape(tx(d["titulo"])), s_h1),
              Paragraph("Relatório de análise · " + html.escape(tx(d["canal"])), s_sub)]
-    larg_cab = ([50 * mm] if cab else []) + [None, 55 * mm]
-    tcab = Table([cab + [bloco, Paragraph(tx(res), ParagraphStyle("res", parent=s_cel, fontSize=9, alignment=2))]],
-                 colWidths=larg_cab)
+    larg_cab = ([50 * mm] if cab else []) + [None]
+    tcab = Table([cab + [bloco]], colWidths=larg_cab)
     tcab.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LINEBELOW", (0, 0), (-1, 0), 2, VERDE),
                               ("BOTTOMPADDING", (0, 0), (-1, -1), 6), ("LEFTPADDING", (0, 0), (0, 0), 0)]))
     E += [tcab, Spacer(1, 6)]

@@ -938,7 +938,7 @@ def test_relatorio_txt_e_html():
     h = a.relatorio_html(d, ("image/png", b"\x89PNG"))
     assert h.startswith("<!doctype html>") and "data:image/png;base64," in h
     assert "Canal &lt;A&gt;" in h and "Rede &lt;Teste&gt;" in h and "<A>" not in h       # tudo escapado
-    assert "TR 101 290: 127 ocorrência(s)" in h and "segredo123456" not in h
+    assert "ocorrência(s)" not in h and "segredo123456" not in h
     assert "RTMP rtmp://a.rtmp.youtube.com/live2/******** — serviços 257" in h and "abc-def" not in h
 
 
