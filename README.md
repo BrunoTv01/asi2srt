@@ -266,11 +266,19 @@ ao software, então na prática o "TS sync loss" aparece sobretudo como perda do
 Ao parar um canal (ou desligar o serviço), a análise da sessão é **salva**: o card do canal parado
 mostra o resumo (período, duração, bitrate médio/mín/máx, erros TR 101 290, serviços) e
 **Ver relatório** abre a análise completa como estava no fim da sessão. A tela de análise tem um
-seletor com as **últimas 20 sessões** de cada canal e o botão **Baixar relatório** (JSON).
+seletor com as **últimas 20 sessões** de cada canal e os botões **Baixar relatório: HTML · TXT · JSON**:
+
+- **HTML** – relatório formatado com o logo do painel, tabela TR 101 290 em cores, serviços, PIDs,
+  SRT e saídas. Abre no navegador e pode ser impresso ou salvo em PDF (Ctrl+P).
+- **TXT** – o mesmo conteúdo em texto simples, bom para e-mail ou anexar em chamados.
+- **JSON** – dados completos, para integrar com outros sistemas.
+
+Funciona tanto com o canal rodando (análise ao vivo) quanto com sessões salvas. Senhas SRT e
+chaves RTMP nunca aparecem no relatório.
 
 Os relatórios ficam em `<arquivo-de-config>-relatorios.json` (ex.: `/etc/asi2srt/config-relatorios.json`)
 e a sessão em andamento é salva a cada 60 s, então nada se perde se o programa cair.
-API: `GET /api/canais/{id}/relatorios` e `GET /api/canais/{id}/analise?sessao=N[&baixar=1]`.
+API: `GET /api/canais/{id}/relatorios` e `GET /api/canais/{id}/analise?sessao=N[&baixar=1&formato=html|txt|json]`.
 
 ## Linha de comando (sem painel nem arquivo)
 
@@ -360,7 +368,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.14.1 && git push origin v2.14.1
+git tag v2.15.0 && git push origin v2.15.0
 ```
 
 ## Licença

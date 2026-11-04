@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.14.1"
+__version__ = "2.15.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -579,9 +579,14 @@ def saidas_publicas(saidas):
     """Configuração das saídas sem senhas nem chaves RTMP (para relatórios e telas)."""
     out = []
     for s in saidas:
+        tinha_chave = bool(str(s.get("chave") or "").strip())
         s = {k: v for k, v in s.items() if k not in ("senha", "chave")}
-        if s.get("url"):
-            s["url"] = mascarar(str(s["url"]))
+        if tinha_chave:
+            s["chave_oculta"] = True          # a chave estava em campo separado e foi retirada
+        url = str(s.get("url") or "")
+        # rtmp://servidor/app = só o servidor; rtmp://servidor/app/chave = chave no fim da URL
+        if url and (not tinha_chave or len([x for x in urlparse(url).path.split("/") if x]) >= 2):
+            s["url"] = mascarar(url)
         out.append(s)
     return out
 
@@ -1284,6 +1289,11 @@ class AnalisadorTS:
         if pid < 0x20:
             return "SI reservado", "psi"
         return "Não referenciado", "desconhecido"
+
+    def taxa_sessao(self):
+        with self.lock:
+            n, soma, mn, mx = self.est_taxa
+        return {"media": int(soma / n) if n else 0, "min": int(mn or 0), "max": int(mx or 0), "segundos_com_sinal": n}
 
     def relatorio(self, agora_mono=None, agora_wall=None):
         """Análise congelada para guardar: horários absolutos no lugar de 'há N s'."""
@@ -2265,6 +2275,263 @@ class Gerenciador:
 
 
 # ======================================================================
+# Relatório para download: HTML (formatado, imprimível) e TXT
+# ======================================================================
+def _f_taxa(b):
+    b = float(b or 0)
+    return f"{b / 1e6:.2f} Mb/s" if b >= 1e6 else f"{b / 1e3:.1f} kb/s"
+
+
+def _f_dur(s):
+    s = int(s or 0)
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}h{m:02d}min{s:02d}s" if h else (f"{m}min{s:02d}s" if m else f"{s}s")
+
+
+def _f_dh(ts):
+    return time.strftime("%d/%m/%Y %H:%M:%S", time.localtime(ts)) if ts else "—"
+
+
+def _f_n(v):
+    return f"{int(v or 0):,}".replace(",", ".")
+
+
+def _desc_entrada(e):
+    t = e.get("tipo")
+    if t == "srt":
+        txt = f"SRT {e.get('modo', 'caller')} {e.get('endereco', '')}" + (f", latência {e.get('latencia_ms')} ms" if e.get("latencia_ms") else "")
+    elif t == "udp":
+        txt = f"UDP {e.get('endereco', '')}"
+    elif t == "dektec":
+        txt = f"ASI DekTec placa {e.get('dispositivo', 0)} porta {e.get('canal', 0)}"
+    elif t == "linuxasi":
+        txt = f"ASI {e.get('dispositivo', '')}"
+    else:
+        txt = f"{t} {e.get('caminho', '')}"
+    nic = e.get("interface") or e.get("interface_local")
+    return txt + (f" (placa {nic})" if nic and t in ("srt", "udp") else "")
+
+
+def _desc_saida(s):
+    t = s.get("tipo")
+    if t == "rtmp":
+        url = str(s.get("url", "")).rstrip("/")
+        txt = "RTMP " + (url + "/********" if s.get("chave") or s.get("chave_oculta") else mascarar(url))
+    elif t == "srt":
+        txt = f"SRT {s.get('modo', 'caller')} {s.get('endereco', '')}"
+    else:
+        txt = f"{t.upper()} {s.get('endereco', '')}"
+    nic = s.get("interface") or s.get("interface_local")
+    if nic and t != "rtmp":
+        txt += f" (placa {nic})"
+    sv = s.get("servicos") or ([s["programa"]] if s.get("programa") else [])
+    return txt + (f" — serviços {', '.join(map(str, sv))}" if sv else " — TS completo")
+
+
+def dados_relatorio(dados, canal, titulo):
+    """Organiza tudo o que vai no relatório (o mesmo conteúdo para HTML e TXT)."""
+    r, tr, per = dados.get("resumo", {}), dados.get("tr101290", {}), dados.get("periodo", {})
+    agora = time.time()
+    ts = dados.get("taxa_sessao") or {}
+    cont = tr.get("contadores", {})
+    na = set(tr.get("nao_aplicavel") or [])
+    ultimo = dict(tr.get("ultimo_em") or {})
+    for k, ha in (tr.get("ha_s") or {}).items():
+        ultimo.setdefault(k, agora - ha)
+    indicadores = [{"prio": prio, "cod": cod, "nome": nome, "desc": desc, "valor": cont.get(k, 0),
+                    "na": k in na and not cont.get(k, 0), "ultimo": ultimo.get(k)}
+                   for k, prio, cod, nome, desc in TR_ITENS]
+    modo = r.get("modo_taxa") or {}
+    return {
+        "titulo": titulo, "canal": canal.get("nome", ""), "gerado": agora,
+        "salvo": bool(dados.get("salvo")), "motivo": per.get("motivo"),
+        "inicio": per.get("inicio"), "fim": per.get("fim") or agora, "duracao": per.get("duracao_s", 0),
+        "entrada": _desc_entrada(canal.get("entrada", {})),
+        "taxa": {"media": ts.get("media"), "min": ts.get("min"), "max": ts.get("max"),
+                 "atual_util": r.get("taxa_util"), "atual_ts": r.get("taxa_total")},
+        "modo": modo, "tsid": r.get("tsid"), "rede": r.get("rede"), "hora_ts": r.get("hora_ts"),
+        "n_pids": r.get("n_pids"), "pacotes": r.get("pacotes"),
+        "indicadores": indicadores,
+        "totais": {p: sum(i["valor"] for i in indicadores if i["prio"] == p) for p in (1, 2, 3)},
+        "servicos": dados.get("servicos", []), "pids": dados.get("pids", []),
+        "srt": list((dados.get("srt") or {}).values()),
+        "saidas": [(c, (dados.get("saidas") or [None] * 99)[i] if i < len(dados.get("saidas") or []) else None)
+                   for i, c in enumerate(dados.get("saidas_cfg") or [])],
+    }
+
+
+MOTIVOS_REL = {"parado": "encerrada pelo usuário", "encerrado": "encerrada (serviço desligado)",
+               "interrompido": "interrompida", "em andamento": "em andamento (último salvamento automático)"}
+
+
+def relatorio_txt(d) -> str:
+    L = []
+    linha = "=" * 78
+    L += [linha, f"{d['titulo']} — Relatório de análise", linha,
+          f"Canal ............: {d['canal']}",
+          f"Entrada ..........: {d['entrada']}",
+          f"Período ..........: {_f_dh(d['inicio'])}  até  {_f_dh(d['fim'])}  ({_f_dur(d['duracao'])})",
+          f"Situação .........: {MOTIVOS_REL.get(d['motivo'], 'sessão ao vivo (no momento da geração)')}",
+          f"Gerado em ........: {_f_dh(d['gerado'])}", ""]
+    tx = d["taxa"]
+    L += ["TAXA (útil, sem pacotes nulos)", "-" * 78]
+    if tx.get("media"):
+        L += [f"  Média {_f_taxa(tx['media'])}   ·   mínima {_f_taxa(tx['min'])}   ·   máxima {_f_taxa(tx['max'])}"]
+    if not d["salvo"] and tx.get("atual_util") is not None:
+        L += [f"  Agora {_f_taxa(tx['atual_util'])} úteis   (TS total com nulos: {_f_taxa(tx['atual_ts'])})"]
+    m = d["modo"]
+    if m.get("modo"):
+        L += [f"  Tipo do TS: {m['modo']} (variação {m['variacao_pct']}%)"]
+    L += [f"  TS ID {d['tsid'] if d['tsid'] is not None else '—'}   ·   Rede {d['rede'] or '—'}   ·   "
+          f"{len(d['servicos'])} serviço(s)   ·   {d['n_pids'] or 0} PIDs   ·   {_f_n(d['pacotes'])} pacotes", ""]
+    L += ["TR 101 290", "-" * 78]
+    for p in (1, 2, 3):
+        L.append(f"  Prioridade {p}  (total {_f_n(d['totais'][p])})")
+        for i in (x for x in d["indicadores"] if x["prio"] == p):
+            val = "n/a" if i["na"] else _f_n(i["valor"])
+            ult = f"último em {_f_dh(i['ultimo'])}" if i["ultimo"] and i["valor"] else ""
+            L.append(f"    {i['cod']:<5} {i['nome']:<28} {val:>10}   {ult}")
+        L.append("")
+    L += ["SERVIÇOS", "-" * 78]
+    for s in d["servicos"]:
+        md = (s.get("modo") or {}).get("modo")
+        L.append(f"  {s['nome']}  (programa {s['numero']})  {s.get('provedor') or ''}  {s.get('tipo') or ''}"
+                 f"  {_f_taxa(s.get('taxa'))}{'  ' + md if md else ''}")
+        pcr = s.get("pcr") or {}
+        L.append(f"    PMT {s.get('pmt')}  PCR {s.get('pcr_pid') or '—'}"
+                 + (f"  intervalo PCR {pcr.get('intervalo_ms')} ms  jitter {pcr.get('jitter_ns')} ns" if pcr else ""))
+        for c in s.get("componentes", []):
+            L.append(f"      {c['hex']}  {c['desc']:<26} {c['stream_type']}  {_f_taxa(c['taxa'])}")
+    if not d["servicos"]:
+        L.append("  (nenhum serviço identificado)")
+    L += ["", "PIDS", "-" * 78, f"  {'PID':<8}{'Dec':>6}  {'Descrição':<28}{'Bitrate':>13}{'%':>7}{'Pacotes':>13}{'Erros CC':>10}"]
+    for p in d["pids"]:
+        L.append(f"  {p['hex']:<8}{p['pid']:>6}  {p['desc'][:27]:<28}{_f_taxa(p['taxa']):>13}{p['pct']:>7.1f}"
+                 f"{_f_n(p['pacotes']):>13}{p['cc']:>10}")
+    if d["srt"]:
+        L += ["", "CONEXÕES SRT", "-" * 78]
+        for e in d["srt"]:
+            t = e.get("totais") or {}
+            L.append(f"  {e.get('rotulo')}: {e.get('modo')} {e.get('endereco')}  ·  {e.get('conexoes', 0)} conexão(ões)")
+            L.append(f"    RTT médio/máx {e.get('rtt_medio_ms', 0)}/{e.get('rtt_max_ms', 0)} ms  ·  pacotes {_f_n(t.get('pacotes'))}"
+                     f"  ·  perdidos {_f_n(t.get('perdidos'))}  ·  retransmitidos {_f_n(t.get('retransmitidos'))}"
+                     f"  ·  não recuperados {_f_n(t.get('descartados'))}")
+    if d["saidas"]:
+        L += ["", "SAÍDAS", "-" * 78]
+        for i, (c, st) in enumerate(d["saidas"], 1):
+            L.append(f"  Destino {i}: {_desc_saida(c)}")
+            if st:
+                L.append(f"    enviado {_f_n((st.get('enviado_bytes') or 0) / 1e6)} MB  ·  tempo no ar {_f_dur(st.get('tempo_no_ar_s'))}"
+                         f"  ·  conexões {st.get('conexoes', 0)}  ·  quedas {st.get('reinicios', 0)}")
+    L += ["", linha, f"Gerado por {d['titulo']} — asi2srt {__version__}", linha]
+    return "\n".join(L) + "\n"
+
+
+def relatorio_html(d, logo=None) -> str:
+    e = html.escape
+    cor = lambda i: "na" if i["na"] else ("err" if i["valor"] else "ok")  # noqa: E731
+    logo_tag = ""
+    if logo:
+        tipo, dados_logo = logo
+        logo_tag = f'<img class="logo" src="data:{tipo};base64,{base64.b64encode(dados_logo).decode()}" alt="">'
+    tx = d["taxa"]
+    m = d["modo"]
+    kpis = []
+    if tx.get("media"):
+        kpis += [("Bitrate médio (útil)", _f_taxa(tx["media"])), ("Mínimo", _f_taxa(tx["min"])), ("Máximo", _f_taxa(tx["max"]))]
+    if not d["salvo"] and tx.get("atual_util") is not None:
+        kpis += [("Bitrate útil agora", _f_taxa(tx["atual_util"]))]
+    kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
+             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
+             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—")]
+    total_erros = sum(d["totais"].values())
+    H = [f"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Relatório — {e(d['canal'])}</title>
+<style>
+*{{box-sizing:border-box}}body{{font:13px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1d2329;margin:0;background:#f4f6f8}}
+.pag{{max-width:1050px;margin:24px auto;background:#fff;padding:28px 34px;border-radius:10px;box-shadow:0 1px 4px #0001}}
+header{{display:flex;align-items:center;gap:16px;border-bottom:3px solid #00a859;padding-bottom:14px;margin-bottom:18px}}
+.logo{{height:52px}}h1{{font-size:20px;margin:0}}h1 small{{display:block;font-size:13px;font-weight:400;color:#5b6570;margin-top:2px}}
+h2{{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#3a4550;margin:24px 0 8px;border-bottom:1px solid #e3e7eb;padding-bottom:4px}}
+.info{{display:grid;grid-template-columns:150px 1fr;gap:3px 12px;font-size:13px}}.info b{{color:#5b6570;font-weight:500}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}}
+.kpi{{border:1px solid #e3e7eb;border-radius:8px;padding:8px 10px}}.kpi small{{display:block;color:#6b7580;font-size:11px;text-transform:uppercase;letter-spacing:.04em}}
+.kpi b{{font-size:16px}}
+table{{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeric:tabular-nums}}
+th{{text-align:left;color:#5b6570;font-weight:600;font-size:11.5px;padding:6px 8px;border-bottom:2px solid #e3e7eb;background:#fafbfc}}
+td{{padding:5px 8px;border-bottom:1px solid #eef1f3}}td.n,th.n{{text-align:right;white-space:nowrap}}.mono{{font-family:ui-monospace,Consolas,monospace;white-space:nowrap}}
+.st{{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle}}
+.ok .st{{background:#1f9d55}}.err .st{{background:#d64045}}.na .st{{background:#b8c0c8}}
+tr.err td{{color:#b3261e;font-weight:600}}tr.na td{{color:#9aa3ab}}
+.prio td{{background:#f4f6f8;font-weight:700;color:#3a4550}}
+.serv{{border:1px solid #e3e7eb;border-radius:8px;padding:10px 12px;margin-bottom:10px}}.serv h3{{margin:0 0 4px;font-size:14px}}
+.meta{{color:#5b6570;font-size:12px;margin-bottom:6px}}.tag{{display:inline-block;background:#eef3ff;color:#2f5fb3;border-radius:4px;padding:0 6px;font-size:11px;font-weight:600}}
+.res{{display:inline-block;padding:2px 10px;border-radius:99px;font-weight:600;font-size:12px}}
+.res.ok{{background:#e5f6ec;color:#17733f}}.res.err{{background:#fdecec;color:#b3261e}}
+footer{{margin-top:26px;color:#8a949e;font-size:11px;border-top:1px solid #e3e7eb;padding-top:8px}}
+@media print{{body{{background:#fff}}.pag{{box-shadow:none;margin:0;max-width:none;padding:0}}h2{{break-after:avoid}}.serv,tr{{break-inside:avoid}}}}
+</style></head><body><div class="pag">
+<header>{logo_tag}<h1>{e(d['titulo'])}<small>Relatório de análise · {e(d['canal'])}</small></h1>
+<span style="margin-left:auto" class="res {'err' if total_erros else 'ok'}">{'TR 101 290: ' + _f_n(total_erros) + ' ocorrência(s)' if total_erros else 'TR 101 290 sem erros'}</span></header>
+<div class="info"><b>Canal</b><span>{e(d['canal'])}</span><b>Entrada</b><span>{e(d['entrada'])}</span>
+<b>Período</b><span>{_f_dh(d['inicio'])} até {_f_dh(d['fim'])} ({_f_dur(d['duracao'])})</span>
+<b>Situação</b><span>{e(MOTIVOS_REL.get(d['motivo'], 'sessão ao vivo (no momento da geração)'))}</span>
+<b>Gerado em</b><span>{_f_dh(d['gerado'])}</span></div>
+<h2>Resumo</h2><div class="kpis">{''.join(f'<div class="kpi"><small>{e(a)}</small><b>{e(b)}</b></div>' for a, b in kpis)}</div>
+<h2>TR 101 290</h2><table><tr><th>Código</th><th>Indicador</th><th class="n">Ocorrências</th><th>Última ocorrência</th><th>Regra</th></tr>"""]
+    for p in (1, 2, 3):
+        H.append(f'<tr class="prio"><td colspan="5">Prioridade {p} — total {_f_n(d["totais"][p])}</td></tr>')
+        for i in (x for x in d["indicadores"] if x["prio"] == p):
+            H.append(f'<tr class="{cor(i)}"><td class="mono"><span class="st"></span>{e(i["cod"])}</td><td>{e(i["nome"])}</td>'
+                     f'<td class="n">{"n/a" if i["na"] else _f_n(i["valor"])}</td>'
+                     f'<td>{_f_dh(i["ultimo"]) if i["ultimo"] and i["valor"] else ""}</td><td style="color:#6b7580">{e(i["desc"])}</td></tr>')
+    H.append("</table><h2>Serviços</h2>")
+    for s in d["servicos"]:
+        pcr = s.get("pcr") or {}
+        md = (s.get("modo") or {}).get("modo")
+        H.append(f'<div class="serv"><h3>{e(s["nome"])} <span class="tag">programa {s["numero"]}</span> '
+                 f'{f"<span class=tag>{e(md)}</span>" if md else ""} <span style="float:right">{_f_taxa(s.get("taxa"))}</span></h3>'
+                 f'<div class="meta">{e(s.get("provedor") or "")} {e(s.get("tipo") or "")} · PMT <span class="mono">{e(s.get("pmt") or "")}</span> · '
+                 f'PCR <span class="mono">{e(s.get("pcr_pid") or "—")}</span>'
+                 + (f' · intervalo PCR {pcr.get("intervalo_ms")} ms · jitter {pcr.get("jitter_ns")} ns' if pcr else "")
+                 + '</div><table><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>'
+                 + "".join(f'<tr><td class="mono">{e(c["hex"])}</td><td>{e(c["desc"])}</td><td class="mono">{e(c["stream_type"])}</td>'
+                           f'<td class="n">{_f_taxa(c["taxa"])}</td></tr>' for c in s.get("componentes", []))
+                 + "</table></div>")
+    if not d["servicos"]:
+        H.append("<p>Nenhum serviço identificado.</p>")
+    H.append('<h2>PIDs</h2><table><tr><th>PID</th><th class="n">Dec</th><th>Descrição</th><th>Serviço</th><th class="n">Bitrate</th>'
+             '<th class="n">%</th><th class="n">Pacotes</th><th class="n">Erros CC</th></tr>')
+    for p in d["pids"]:
+        H.append(f'<tr class="{"err" if p["cc"] or p["tipo"] == "desconhecido" else ""}"><td class="mono">{e(p["hex"])}</td><td class="n">{p["pid"]}</td>'
+                 f'<td>{e(p["desc"])}</td><td>{e(p.get("servico") or "")}</td><td class="n">{_f_taxa(p["taxa"])}</td>'
+                 f'<td class="n">{p["pct"]:.1f}</td><td class="n">{_f_n(p["pacotes"])}</td><td class="n">{p["cc"]}</td></tr>')
+    H.append("</table>")
+    if d["srt"]:
+        H.append('<h2>Conexões SRT</h2><table><tr><th>Conexão</th><th>Endereço</th><th class="n">Conexões</th><th class="n">RTT médio / máx</th>'
+                 '<th class="n">Pacotes</th><th class="n">Perdidos</th><th class="n">Retransmitidos</th><th class="n">Não recuperados</th></tr>')
+        for s in d["srt"]:
+            t = s.get("totais") or {}
+            H.append(f'<tr class="{"err" if t.get("descartados") else ""}"><td>{e(s.get("rotulo") or "")}</td><td class="mono">{e(s.get("modo") or "")} {e(s.get("endereco") or "")}</td>'
+                     f'<td class="n">{s.get("conexoes", 0)}</td><td class="n">{s.get("rtt_medio_ms", 0)} / {s.get("rtt_max_ms", 0)} ms</td>'
+                     f'<td class="n">{_f_n(t.get("pacotes"))}</td><td class="n">{_f_n(t.get("perdidos"))}</td>'
+                     f'<td class="n">{_f_n(t.get("retransmitidos"))}</td><td class="n">{_f_n(t.get("descartados"))}</td></tr>')
+        H.append("</table>")
+    if d["saidas"]:
+        H.append('<h2>Saídas</h2><table><tr><th>Destino</th><th>Configuração</th><th class="n">Enviado</th><th class="n">Tempo no ar</th>'
+                 '<th class="n">Conexões</th><th class="n">Quedas</th></tr>')
+        for i, (c, st) in enumerate(d["saidas"], 1):
+            st = st or {}
+            H.append(f'<tr class="{"err" if st.get("reinicios") else ""}"><td>Destino {i}</td><td>{e(_desc_saida(c))}</td>'
+                     f'<td class="n">{(st.get("enviado_bytes") or 0) / 1e6:.1f} MB</td><td class="n">{_f_dur(st.get("tempo_no_ar_s"))}</td>'
+                     f'<td class="n">{st.get("conexoes", 0)}</td><td class="n">{st.get("reinicios", 0)}</td></tr>')
+        H.append("</table>")
+    H.append(f'<footer>Gerado por {e(d["titulo"])} em {_f_dh(d["gerado"])} · asi2srt {__version__}</footer></div></body></html>')
+    return "\n".join(H)
+
+
+# ======================================================================
 # Servidor web: painel + API
 # ======================================================================
 def servidor_web(ger: Gerenciador, endereco: str):
@@ -2398,11 +2665,32 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                 dados = {**t.analisador.analise(), "estado": t.status()["estado"], "srt": t.srt_status(),
                                          "saidas": [p.status() for p in t.procs_saida],
                                          "saidas_cfg": saidas_publicas(normalizar_canal(ger.defs[cid])["saidas"]),
-                                         "salvo": False, "periodo": {"inicio": t.inicio_sessao,
-                                                                     "duracao_s": int(agora_w - t.inicio_sessao)}}
+                                         "salvo": False, "taxa_sessao": t.analisador.taxa_sessao(),
+                                         "periodo": {"inicio": t.inicio_sessao, "fim": agora_w,
+                                                     "duracao_s": int(agora_w - t.inicio_sessao)}}
                             if q.get("baixar"):
                                 nome = re.sub(r"[^\w.-]+", "_", ger.defs[cid]["nome"])
                                 data = time.strftime("%Y%m%d-%H%M", time.localtime(dados["periodo"]["inicio"]))
+                                fmt = q.get("formato", "json")
+                                if fmt in ("html", "txt"):
+                                    canal = {**normalizar_canal(ger.defs[cid])}
+                                    d = dados_relatorio(dados, canal, ger.aparencia()["titulo"])
+                                    if fmt == "txt":
+                                        corpo = relatorio_txt(d).encode("utf-8")
+                                        return self._resp(200, corpo, "text/plain; charset=utf-8",
+                                                          baixar=f"relatorio-{nome}-{data}.txt")
+                                    logo = None
+                                    cam = ger.logo_arquivo()
+                                    if cam:
+                                        ext = os.path.splitext(cam)[1].lower()
+                                        tipo = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                                                ".webp": "image/webp"}.get(ext)
+                                        if tipo:   # SVG fica de fora do HTML exportado (não executa nada)
+                                            with open(cam, "rb") as f:
+                                                logo = (tipo, f.read())
+                                    corpo = relatorio_html(d, logo).encode("utf-8")
+                                    return self._resp(200, corpo, "text/html; charset=utf-8",
+                                                      baixar=f"relatorio-{nome}-{data}.html")
                                 return self._resp(200, dados, baixar=f"relatorio-{nome}-{data}.json")
                             return self._resp(200, dados)
                         if metodo == "GET" and acao == "comando":
@@ -2987,6 +3275,7 @@ main{padding:20px;max-width:1400px;margin:auto}
 .aban{background:#10233d;border:1px solid #1f4b85;color:#cfe3ff;padding:9px 12px;border-radius:9px;margin-bottom:12px;font-size:13px}
 #asess{width:auto;max-width:330px}a.btn{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:13px;text-decoration:none}
 a.btn:hover{border-color:#8b949e}
+.baixar{display:inline-flex;align-items:center;gap:4px}.baixar .bl{font-size:12px;color:var(--mut);margin-right:2px}.baixar a.btn{padding:6px 9px}
 .btnf{background:#21262d;color:var(--txt);border:1px solid var(--line);border-radius:7px;padding:6px 11px;font-size:13px}.btnf:hover{border-color:#8b949e}
 .trp{display:flex;gap:10px;align-items:center;margin-top:7px;font-size:11.5px;color:var(--mut)}
 .trp .e{color:var(--err)}.trp .w{color:var(--warn)}.trp a{margin-left:auto;color:var(--acc);cursor:pointer;text-decoration:none}
@@ -3139,7 +3428,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
   <span class="sp" style="flex:1"></span><select id="asess" title="Sessões de análise salvas"></select>
-  <a class="btn" id="abaixar" href="#">Baixar relatório</a><button id="azerar">Zerar contadores</button></div>
+  <span class="baixar"><span class="bl">Baixar relatório:</span><a class="btn" id="abx_html" href="#" title="relatório formatado, com logo; abre no navegador e pode ser impresso ou salvo em PDF">HTML</a><a class="btn" id="abx_txt" href="#" title="texto simples">TXT</a><a class="btn" id="abx_json" href="#" title="dados completos">JSON</a></span><button id="azerar">Zerar contadores</button></div>
  <div class="aban" id="aban" hidden></div>
  <div class="kpis" id="akpi"></div>
  <div class="agrid"><div class="painel"><h3>TR 101 290<span id="adesde"></span></h3><div id="atr"></div></div>
@@ -3433,7 +3722,7 @@ function rota(){const m=location.hash.match(/^#\/analise\/(\w+)/);anaId=m?m[1]:n
  $('#vana').hidden=!anaId;$('#vlista').hidden=!!anaId;window.scrollTo(0,0);
  if(anaId){$('#akpi').innerHTML=$('#atr').innerHTML=$('#aserv').innerHTML=$('#apids').innerHTML='';carregarAna()}else render()}
 async function carregarAna(){if(!anaId)return;const c=dados.find(x=>x.id===anaId);$('#anome').textContent=c?c.nome:'';
- const qs=sessSel==null?'':`?sessao=${sessSel}`;$('#abaixar').href=`/api/canais/${anaId}/analise?baixar=1`+(sessSel==null?'':`&sessao=${sessSel}`);
+ const qs=sessSel==null?'':`?sessao=${sessSel}`;['html','txt','json'].forEach(f=>{$('#abx_'+f).href=`/api/canais/${anaId}/analise?baixar=1&formato=${f}`+(sessSel==null?'':`&sessao=${sessSel}`)});
  try{ana=await api('GET',`/api/canais/${anaId}/analise${qs}`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
 function kpi(r,v,t){return`<div class="kpi" title="${esc(t||'')}"><small>${r}</small><b>${v}</b></div>`}
 function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts=a.taxa_sessao;

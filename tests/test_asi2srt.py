@@ -903,3 +903,54 @@ def test_api_interfaces(gateway):
     base, _ = gateway
     cod, lista = _req(base, "GET", "/api/interfaces")
     assert cod == 200 and isinstance(lista, list)
+
+
+# ---------------- relatório em HTML e TXT ----------------
+def _dados_falsos():
+    return {"salvo": True, "periodo": {"inicio": 1793300000, "fim": 1793303600, "duracao_s": 3600, "motivo": "parado"},
+            "taxa_sessao": {"media": 4_900_000, "min": 4_700_000, "max": 5_100_000},
+            "resumo": {"tsid": 1105, "rede": "Rede <Teste>", "n_pids": 3, "pacotes": 123456, "taxa_util": 0, "taxa_total": 0,
+                       "modo_taxa": {"modo": "CBR", "variacao_pct": 0.3}},
+            "tr101290": {"contadores": {**{k: 0 for k in a.TIPOS_TR101290}, "cc": 7, "pcr_rep": 120},
+                         "ultimo_em": {"cc": 1793301000}, "nao_aplicavel": ["nit", "cat"]},
+            "servicos": [{"numero": 257, "nome": "REDE ALESP HD", "provedor": "ALESP", "tipo": "TV HD H.264", "taxa": 4_800_000,
+                          "pmt": "0x0100", "pcr_pid": "0x0101", "pcr": {"intervalo_ms": 38, "jitter_ns": 120},
+                          "modo": {"modo": "VBR"},
+                          "componentes": [{"hex": "0x0101", "desc": "H.264/AVC vídeo", "stream_type": "0x1B", "taxa": 4_500_000}]}],
+            "pids": [{"pid": 257, "hex": "0x0101", "desc": "H.264/AVC vídeo", "servico": "REDE ALESP HD", "tipo": "video",
+                      "taxa": 4_500_000, "pct": 91.0, "pacotes": 100000, "cc": 7}],
+            "srt": {"SRTIN": {"rotulo": "Entrada", "modo": "caller", "endereco": "187.60.226.82:6001", "conexoes": 1,
+                              "rtt_medio_ms": 12.1, "rtt_max_ms": 30, "totais": {"pacotes": 1, "perdidos": 2, "retransmitidos": 2, "descartados": 0}}},
+            "saidas": [{"enviado_bytes": 2_000_000_000, "tempo_no_ar_s": 3500, "conexoes": 1, "reinicios": 0}],
+            "saidas_cfg": a.saidas_publicas([{"tipo": "rtmp", "url": "rtmp://a.rtmp.youtube.com/live2", "chave": "abc-def",
+                                              "servicos": ["257"]}])}
+
+
+def test_relatorio_txt_e_html():
+    canal = {"nome": "Canal <A>", "entrada": {"tipo": "srt", "modo": "caller", "endereco": "187.60.226.82:6001",
+                                            "senha": "segredo123456", "interface": "enp1s0"}}
+    d = a.dados_relatorio(_dados_falsos(), canal, "Engenharia TV Cultura")
+    txt = a.relatorio_txt(d)
+    assert "Engenharia TV Cultura" in txt and "Canal <A>" in txt and "1h00min00s" in txt
+    assert "Média 4.90 Mb/s" in txt and "CBR (variação 0.3%)" in txt
+    assert "1.4   Continuity count error" in txt and "2.3a  PCR repetition error" in txt
+    assert "n/a" in txt and "REDE ALESP HD" in txt and "segredo123456" not in txt and "(placa enp1s0)" in txt
+    h = a.relatorio_html(d, ("image/png", b"\x89PNG"))
+    assert h.startswith("<!doctype html>") and "data:image/png;base64," in h
+    assert "Canal &lt;A&gt;" in h and "Rede &lt;Teste&gt;" in h and "<A>" not in h       # tudo escapado
+    assert "TR 101 290: 127 ocorrência(s)" in h and "segredo123456" not in h
+    assert "RTMP rtmp://a.rtmp.youtube.com/live2/******** — serviços 257" in h and "abc-def" not in h
+
+
+def test_api_baixar_relatorio_formatos(gateway):
+    base, _ = gateway
+    canal = {"nome": "R", "entrada": {"tipo": "udp", "endereco": "1234"}, "saidas": []}
+    cid = _req(base, "POST", "/api/canais", canal)[1]["id"]
+    time.sleep(2.5)
+    hdr = {"Authorization": "Basic " + base64.b64encode(b"admin:segredo").decode()}
+    for fmt, tipo, ext in (("html", "text/html", ".html"), ("txt", "text/plain", ".txt"), ("json", "application/json", ".json")):
+        r = urllib.request.Request(f"{base}/api/canais/{cid}/analise?baixar=1&formato={fmt}", headers=hdr)
+        with urllib.request.urlopen(r) as resp:
+            assert resp.headers["Content-Type"].startswith(tipo)
+            assert resp.headers["Content-Disposition"].endswith(ext + '"')
+            assert len(resp.read()) > 200
