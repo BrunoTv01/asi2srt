@@ -132,8 +132,8 @@ asi2srt rodar -e dektec:0:0                                  # analisa uma entra
 asi2srt rodar
 ```
 
-Abra `http://IP-DO-SERVIDOR:8088` e entre com **admin / admin**. Para trocar, altere
-`usuario` e `senha_painel` no arquivo de configuração e reinicie o serviço.
+Abra `http://IP-DO-SERVIDOR:8088` e entre com **admin / admin**. Troque a senha pelo menu do usuário
+(canto superior direito) e crie os outros usuários em **Usuários e permissões** (veja "Acesso" abaixo).
 
 ![Painel](docs/painel.png)
 
@@ -153,6 +153,29 @@ Tudo que é alterado no painel é salvo no arquivo de configuração e sobrevive
 dá para trocar o nome e enviar o logo (PNG, JPG, SVG ou WebP, até 2 MB). O logo fica salvo no
 servidor junto da configuração (`/etc/asi2srt/logo-painel.*`) e aparece no topo e na aba do navegador. O instalador já
 coloca o logo padrão (`marca/logo-tv-cultura.png`); se ele for removido pelo painel, as atualizações não o recolocam.
+
+## Acesso: login, usuários e perfis
+
+O painel abre numa **tela de login própria** (com o logo e o nome do painel). Ao entrar, o menu com o
+nome do usuário (canto superior direito) tem **Trocar minha senha**, **Usuários e permissões** (só
+administrador) e **Sair**.
+
+| Perfil | Pode |
+|---|---|
+| **Administrador** | tudo: criar, editar e excluir canais, aparência (nome/logo) e usuários |
+| **Operador** | ver tudo, iniciar/parar/reiniciar canais, zerar contadores, ver análise e baixar relatórios |
+
+- Login inicial: **admin / admin**. O painel mostra um aviso até a senha padrão ser trocada.
+- Senhas ficam no arquivo de configuração só como **hash PBKDF2** (nunca em texto). O arquivo fica
+  com permissão 600.
+- A sessão vale **12 h sem uso** (no máximo 30 dias) e continua depois de reiniciar o serviço. Trocar a
+  senha ou excluir um usuário encerra as sessões dele.
+- **5 senhas erradas** em 10 min bloqueiam aquele IP por 5 min.
+- Scripts e monitoração externa continuam funcionando com usuário e senha no cabeçalho
+  (`curl -u usuario:senha http://servidor:8088/status.json`).
+- **Esqueceu a senha?** No servidor, coloque `senha_painel: NOVA_SENHA` (e, se quiser, `usuario: admin`)
+  em `supervisor:` no `/etc/asi2srt/config.yaml` e reinicie (`sudo systemctl restart asi2srt`). A senha
+  é redefinida e a linha some do arquivo.
 
 ## Rotas e saúde do SRT
 
@@ -396,7 +419,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.17.2 && git push origin v2.17.1
+git tag v2.18.0 && git push origin v2.17.1
 ```
 
 ## Licença

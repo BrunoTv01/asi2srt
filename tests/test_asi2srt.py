@@ -1087,3 +1087,90 @@ def test_unidade_systemd_sem_tempo_real():
     u = a.UNIDADE_SYSTEMD
     assert "CPUSchedulingPolicy=fifo" not in u and "StartLimitIntervalSec=0" in u and "Restart=always" in u
     assert "net.core.rmem_max" in a.SYSCTL_ASI2SRT
+
+
+# ---------------- tela de login, usuários e perfis (2.18) ----------------
+def _http(base, metodo, caminho, corpo=None, cookie=None, csrf=True):
+    h = {"Content-Type": "application/json"}
+    if csrf:
+        h["X-Asi2srt"] = "1"
+    if cookie:
+        h["Cookie"] = cookie
+    r = urllib.request.Request(base + caminho, method=metodo, headers=h,
+                               data=json.dumps(corpo).encode() if corpo is not None else None)
+
+    class SemRedir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    op = urllib.request.build_opener(SemRedir)
+    try:
+        with op.open(r) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def _login(base, u, s):
+    cod, hd, corpo = _http(base, "POST", "/api/login", {"usuario": u, "senha": s})
+    ck = hd.get("Set-Cookie", "") or ""
+    return cod, ck.split(";")[0], json.loads(corpo or b"{}")
+
+
+def test_login_sessao_e_perfis(gateway):
+    base, cfg = gateway
+    cod, hd, _ = _http(base, "GET", "/analise/x")
+    assert cod == 302 and hd["Location"].startswith("/login?volta=")
+    cod, _, pag = _http(base, "GET", "/login")
+    assert cod == 200 and b"Entrar" in pag and b"Engenharia TV Cultura" in pag
+    assert _login(base, "admin", "errada")[0] == 401
+    cod, ck, eu = _login(base, "admin", "segredo")
+    assert cod == 200 and ck.startswith("asi2srt_sessao=") and eu["papel"] == "admin"
+    assert _http(base, "GET", "/", cookie=ck)[0] == 200
+    assert json.loads(_http(base, "GET", "/api/eu", cookie=ck)[2])["usuario"] == "admin"
+    # senha nunca em texto no arquivo
+    salvo = json.load(open(cfg))["supervisor"]
+    assert "senha_painel" not in salvo and salvo["usuarios"][0]["senha"].startswith("pbkdf2_sha256$")
+    assert oct(os.stat(cfg).st_mode & 0o777) == "0o600"
+    # operador
+    cod, _, _ = _http(base, "POST", "/api/usuarios", {"usuario": "op1", "nome": "Operador 1", "papel": "operador",
+                                                     "senha": "senha-op1"}, cookie=ck)
+    assert cod == 201
+    assert _http(base, "POST", "/api/usuarios", {"usuario": "op2", "papel": "operador", "senha": "123"}, cookie=ck)[0] == 400
+    canal = {"nome": "C", "entrada": {"tipo": "udp", "endereco": "1234"}, "saidas": []}
+    cid = json.loads(_http(base, "POST", "/api/canais", canal, cookie=ck)[2])["id"]
+    _, cko, eu = _login(base, "op1", "senha-op1")
+    assert eu["papel"] == "operador"
+    assert _http(base, "GET", "/api/canais", cookie=cko)[0] == 200
+    assert _http(base, "POST", f"/api/canais/{cid}/parar", cookie=cko)[0] == 200       # operar pode
+    assert _http(base, "POST", "/api/canais", canal, cookie=cko)[0] == 403             # criar não
+    assert _http(base, "PUT", f"/api/canais/{cid}", canal, cookie=cko)[0] == 403
+    assert _http(base, "DELETE", f"/api/canais/{cid}", cookie=cko)[0] == 403
+    assert _http(base, "PUT", "/api/aparencia", {"titulo": "x"}, cookie=cko)[0] == 403
+    assert _http(base, "GET", "/api/usuarios", cookie=cko)[0] == 403
+    # trocar a própria senha encerra as outras sessões dele
+    _, cko2, _ = _login(base, "op1", "senha-op1")
+    assert _http(base, "PUT", "/api/eu/senha", {"atual": "errada", "nova": "nova-senha"}, cookie=cko)[0] == 400
+    assert _http(base, "PUT", "/api/eu/senha", {"atual": "senha-op1", "nova": "nova-senha"}, cookie=cko)[0] == 200
+    assert _http(base, "GET", "/api/canais", cookie=cko)[0] == 200 and _http(base, "GET", "/api/canais", cookie=cko2)[0] == 401
+    # regras de administrador
+    assert _http(base, "DELETE", "/api/usuarios/admin", cookie=ck)[0] == 400          # não exclui a si mesmo
+    assert _http(base, "PUT", "/api/usuarios/admin", {"papel": "operador"}, cookie=ck)[0] == 400   # último admin
+    assert _http(base, "DELETE", "/api/usuarios/op1", cookie=ck)[0] == 200
+    assert _http(base, "GET", "/api/canais", cookie=cko)[0] == 401                     # excluído: sessão cai
+    # sair
+    assert _http(base, "POST", "/api/logout", cookie=ck)[0] == 200
+    assert _http(base, "GET", "/api/canais", cookie=ck)[0] == 401
+    assert _http(base, "POST", "/api/login", {"usuario": "admin", "senha": "segredo"}, csrf=False)[0] == 403
+
+
+def test_login_bloqueia_apos_tentativas(gateway):
+    base, _ = gateway
+    cods = [_login(base, "admin", f"errada{i}")[0] for i in range(6)]
+    assert cods[:4] == [401] * 4 and cods[4] == 429 and cods[5] == 429
+    assert _login(base, "admin", "segredo")[0] == 429        # nem a senha certa entra durante o bloqueio
+
+
+def test_hash_de_senha():
+    h = a.hash_senha("abc123")
+    assert h.startswith("pbkdf2_sha256$") and "abc123" not in h
+    assert a.conferir_senha("abc123", h) and not a.conferir_senha("abc124", h) and not a.conferir_senha("x", "lixo")

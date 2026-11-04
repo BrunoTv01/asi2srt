@@ -27,6 +27,7 @@ import argparse
 import base64
 import collections
 import copy
+import hashlib
 import hmac
 import html
 import json
@@ -45,9 +46,10 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from http.cookies import SimpleCookie
+from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.17.2"
+__version__ = "2.18.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -117,8 +119,8 @@ supervisor:
   reinicio_max_s: 60
   tsp: tsp                    # caminho do executável do TSDuck
   status_http: "0.0.0.0:8088" # painel web. Vazio desativa
-  usuario: admin              # login do painel
-  senha_painel: admin         # troque se o painel ficar acessível fora da rede local
+  usuario: admin              # login inicial do painel (depois os usuários ficam em 'usuarios', com senha em hash)
+  senha_painel: admin         # senha inicial; troque pelo painel. Para recuperar o acesso, escreva aqui uma nova
   log_arquivo: ""
 """
 
@@ -162,6 +164,10 @@ def salvar_config(caminho: str, cfg: dict):
         else:
             f.write("# asi2srt - configuração (gerenciada também pelo painel web)\n")
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+    try:
+        os.chmod(tmp, 0o600)   # guarda os hashes de senha dos usuários
+    except OSError:
+        pass
     os.replace(tmp, caminho)
 
 
@@ -2242,6 +2248,8 @@ class Gerenciador:
     def _autosave(self):
         """Salva a sessão em andamento a cada 60 s (preserva os dados se o processo cair)."""
         while not self._parar_autosave.wait(60):
+            if getattr(self, "acesso", None):
+                self.acesso.gravar_sessoes(forcar=False)
             for cid, t in list(self.exec.items()):
                 try:
                     self._guardar(cid, t, "em andamento")
@@ -2339,13 +2347,9 @@ class Gerenciador:
             salvar_config(self.caminho, cfg)
 
     def garantir_senha(self):
-        self.sup.setdefault("usuario", "admin")
-        if not self.sup.get("senha_painel"):
-            self.sup["senha_painel"] = "admin"
-            self.persistir()
-        if self.sup["usuario"] == "admin" and self.sup["senha_painel"] == "admin":
-            log.warning("painel com login padrão admin/admin - troque 'senha_painel' em %s "
-                        "se o servidor for acessível fora da rede local", self.caminho or "--senha-painel")
+        if getattr(self, "acesso", None) is None:
+            self.acesso = Acesso(self)
+        return self.acesso
 
     # --- controle ----------------------------------------------------
     def iniciar_ativos(self):
@@ -2907,11 +2911,346 @@ def relatorio_pdf(d, logo=None) -> bytes:
 
 
 # ======================================================================
+# Usuários do painel e sessões (tela de login)
+# ======================================================================
+PAPEIS = {"admin": "Administrador", "operador": "Operador"}
+SESSAO_OCIOSA_S = 12 * 3600          # sessão expira após 12 h sem uso
+SESSAO_MAX_S = 30 * 24 * 3600        # e no máximo 30 dias após o login
+COOKIE_SESSAO = "asi2srt_sessao"
+RE_USUARIO = re.compile(r"^[A-Za-z0-9._@-]{2,40}$")
+
+
+def hash_senha(senha: str, iteracoes: int = 120_000) -> str:
+    sal = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", senha.encode(), sal, iteracoes)
+    return f"pbkdf2_sha256${iteracoes}${sal.hex()}${h.hex()}"
+
+
+def conferir_senha(senha: str, guardado: str) -> bool:
+    try:
+        alg, it, sal, h = str(guardado).split("$")
+        if alg != "pbkdf2_sha256":
+            return False
+        calc = hashlib.pbkdf2_hmac("sha256", senha.encode(), bytes.fromhex(sal), int(it))
+        return hmac.compare_digest(calc.hex(), h)
+    except (ValueError, TypeError):
+        return False
+
+
+class Acesso:
+    """Usuários (no arquivo de configuração, com senha em hash), sessões e bloqueio por tentativas."""
+
+    MAX_FALHAS = 5
+    JANELA_FALHAS_S = 600
+    BLOQUEIO_S = 300
+
+    def __init__(self, ger):
+        self.ger = ger
+        self.lock = threading.RLock()
+        self.sessoes = {}       # sha256(token) -> {usuario, criada, uso}
+        self.falhas = {}        # ip -> [instantes]
+        self.bloqueado = {}     # ip -> até quando
+        self._sujo = False
+        self.arq = (os.path.splitext(ger.caminho)[0] + "-sessoes.json") if ger.caminho else None
+        self._falso = hash_senha(secrets.token_hex(8))
+        self._cache_basic = {}  # (usuario, sha256(senha)) -> válido até (evita PBKDF2 a cada requisição de script)
+        self._migrar()
+        self._carregar_sessoes()
+
+    # --- usuários -----------------------------------------------------
+    @property
+    def usuarios(self):
+        return self.ger.sup.setdefault("usuarios", [])
+
+    def _migrar(self):
+        """Converte o login antigo (usuario/senha_painel em texto) para a lista de usuários com hash.
+        Também serve para recuperar o acesso: 'senha_painel: NOVA' no arquivo redefine a senha."""
+        sup = self.ger.sup
+        mudou = False
+        plano = sup.pop("senha_painel", None)
+        nome = str(sup.pop("usuario", None) or "admin")
+        if not self.usuarios:
+            self.usuarios.append({"usuario": nome, "nome": "Administrador", "papel": "admin",
+                                  "senha": hash_senha(str(plano or "admin"))})
+            mudou = True
+        elif plano:
+            u = self._achar(nome)
+            if u:
+                u["senha"] = hash_senha(str(plano))
+                u["papel"] = "admin"
+            else:
+                self.usuarios.append({"usuario": nome, "nome": nome, "papel": "admin", "senha": hash_senha(str(plano))})
+            log.warning("senha do usuário '%s' redefinida pelo arquivo de configuração", nome)
+            mudou = True
+        if mudou:
+            self.ger.persistir()
+        if any(conferir_senha("admin", u.get("senha", "")) for u in self.usuarios):
+            log.warning("há usuário com a senha padrão 'admin' - troque pelo painel (menu do usuário > Trocar senha)")
+
+    def _achar(self, usuario):
+        u = str(usuario or "").lower()
+        return next((x for x in self.usuarios if x["usuario"].lower() == u), None)
+
+    @staticmethod
+    def publico(u):
+        return {"usuario": u["usuario"], "nome": u.get("nome") or u["usuario"], "papel": u.get("papel", "operador"),
+                "papel_nome": PAPEIS.get(u.get("papel"), "Operador"), "criado": u.get("criado"),
+                "ultimo_acesso": u.get("ultimo_acesso")}
+
+    def listar(self):
+        with self.lock:
+            return [self.publico(u) for u in self.usuarios]
+
+    def senha_padrao(self, usuario):
+        u = self._achar(usuario)
+        return bool(u and conferir_senha("admin", u.get("senha", "")))
+
+    @staticmethod
+    def _validar_senha(s):
+        s = str(s or "")
+        if len(s) < 6:
+            raise ValueError("a senha precisa ter pelo menos 6 caracteres")
+        if len(s) > 128:
+            raise ValueError("senha longa demais")
+        return s
+
+    def _admins(self):
+        return [u for u in self.usuarios if u.get("papel") == "admin"]
+
+    def salvar(self, dados, existente=None):
+        papel = dados.get("papel", "operador")
+        if papel not in PAPEIS:
+            raise ValueError("perfil inválido (admin ou operador)")
+        nome = str(dados.get("nome") or "").strip()[:60]
+        with self.lock:
+            if existente is None:
+                usuario = str(dados.get("usuario") or "").strip()
+                if not RE_USUARIO.match(usuario):
+                    raise ValueError("usuário: 2 a 40 caracteres (letras, números, ponto, hífen, _ ou @)")
+                if self._achar(usuario):
+                    raise ValueError("já existe um usuário com esse nome")
+                u = {"usuario": usuario, "nome": nome or usuario, "papel": papel,
+                     "senha": hash_senha(self._validar_senha(dados.get("senha"))), "criado": int(time.time())}
+                self.usuarios.append(u)
+            else:
+                u = self._achar(existente)
+                if not u:
+                    raise KeyError(existente)
+                if u.get("papel") == "admin" and papel != "admin" and len(self._admins()) <= 1:
+                    raise ValueError("é preciso ter pelo menos um administrador")
+                u["papel"] = papel
+                if nome:
+                    u["nome"] = nome
+                if dados.get("senha"):
+                    u["senha"] = hash_senha(self._validar_senha(dados["senha"]))
+                    self._encerrar_de(u["usuario"])
+            self.ger.persistir()
+            return self.publico(u)
+
+    def remover(self, usuario, por):
+        with self.lock:
+            u = self._achar(usuario)
+            if not u:
+                raise KeyError(usuario)
+            if u["usuario"].lower() == str(por).lower():
+                raise ValueError("você não pode excluir o próprio usuário")
+            if u.get("papel") == "admin" and len(self._admins()) <= 1:
+                raise ValueError("é preciso ter pelo menos um administrador")
+            self.usuarios.remove(u)
+            self._encerrar_de(u["usuario"])
+            self.ger.persistir()
+
+    def trocar_senha(self, usuario, atual, nova, token_atual=None):
+        with self.lock:
+            u = self._achar(usuario)
+            if not u or not conferir_senha(str(atual or ""), u.get("senha", "")):
+                raise ValueError("senha atual incorreta")
+            u["senha"] = hash_senha(self._validar_senha(nova))
+            self._encerrar_de(u["usuario"], exceto=token_atual)   # derruba as outras sessões
+            self.ger.persistir()
+
+    # --- login e bloqueio ---------------------------------------------
+    def espera_bloqueio(self, ip):
+        with self.lock:
+            ate = self.bloqueado.get(ip, 0)
+            return max(0, int(ate - time.time()))
+
+    def autenticar(self, usuario, senha, ip):
+        """Devolve o usuário ou None. Bloqueia o IP após várias senhas erradas."""
+        agora = time.time()
+        with self.lock:
+            if self.bloqueado.get(ip, 0) > agora:
+                return None
+            u = self._achar(usuario)
+            guardado = u.get("senha", "") if u else self._falso
+        ok = conferir_senha(str(senha or ""), guardado) and u is not None   # hash fora do lock (é lento)
+        with self.lock:
+            if ok:
+                self.falhas.pop(ip, None)
+                u["ultimo_acesso"] = int(agora)
+                return u
+            lst = [t for t in self.falhas.get(ip, []) if agora - t < self.JANELA_FALHAS_S] + [agora]
+            self.falhas[ip] = lst
+            if len(lst) >= self.MAX_FALHAS:
+                self.bloqueado[ip] = agora + self.BLOQUEIO_S
+                self.falhas.pop(ip, None)
+                log.warning("painel: %d senhas erradas de %s - bloqueado por %d min", len(lst), ip, self.BLOQUEIO_S // 60)
+        return None
+
+    def autenticar_basic(self, usuario, senha, ip):
+        """Login por cabeçalho (scripts, monitoração externa, curl -u)."""
+        chave = (str(usuario).lower(), hashlib.sha256(str(senha).encode()).hexdigest())
+        agora = time.time()
+        with self.lock:
+            if self._cache_basic.get(chave, 0) > agora:
+                u = self._achar(usuario)
+                if u:
+                    return u
+        u = self.autenticar(usuario, senha, ip)
+        if u:
+            with self.lock:
+                if len(self._cache_basic) > 200:
+                    self._cache_basic.clear()
+                self._cache_basic[chave] = agora + 60
+        return u
+
+    # --- sessões --------------------------------------------------------
+    @staticmethod
+    def _h(token):
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def criar_sessao(self, u):
+        token = secrets.token_urlsafe(32)
+        agora = time.time()
+        with self.lock:
+            self.sessoes[self._h(token)] = {"usuario": u["usuario"], "criada": agora, "uso": agora}
+            self._sujo = True
+        self.gravar_sessoes()
+        self.ger.persistir()     # guarda o último acesso
+        return token
+
+    def sessao(self, token):
+        if not token:
+            return None
+        agora = time.time()
+        with self.lock:
+            s = self.sessoes.get(self._h(token))
+            if not s:
+                return None
+            u = self._achar(s["usuario"])
+            if not u or agora - s["uso"] > SESSAO_OCIOSA_S or agora - s["criada"] > SESSAO_MAX_S:
+                self.sessoes.pop(self._h(token), None)
+                self._sujo = True
+                return None
+            if agora - s["uso"] > 60:
+                self._sujo = True
+            s["uso"] = agora
+            return u
+
+    def encerrar(self, token):
+        with self.lock:
+            self.sessoes.pop(self._h(token or ""), None)
+            self._sujo = True
+        self.gravar_sessoes()
+
+    def _encerrar_de(self, usuario, exceto=None):
+        hx = self._h(exceto) if exceto else None
+        with self.lock:
+            self._cache_basic.clear()
+            for k in [k for k, s in self.sessoes.items() if s["usuario"].lower() == usuario.lower() and k != hx]:
+                del self.sessoes[k]
+            self._sujo = True
+        self.gravar_sessoes()
+
+    def _carregar_sessoes(self):
+        if not self.arq or not os.path.exists(self.arq):
+            return
+        try:
+            with open(self.arq, encoding="utf-8") as f:
+                self.sessoes = {k: v for k, v in (json.load(f) or {}).items() if isinstance(v, dict)}
+        except (OSError, ValueError):
+            self.sessoes = {}
+
+    def gravar_sessoes(self, forcar=True):
+        """Sessões sobrevivem a reinícios do serviço (só o hash do token vai para o disco)."""
+        if not self.arq or not (forcar or self._sujo):
+            return
+        with self.lock:
+            agora = time.time()
+            self.sessoes = {k: s for k, s in self.sessoes.items()
+                            if agora - s["uso"] <= SESSAO_OCIOSA_S and agora - s["criada"] <= SESSAO_MAX_S}
+            dados = json.dumps(self.sessoes)
+            self._sujo = False
+        try:
+            tmp = self.arq + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(dados)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.arq)
+        except OSError as e:
+            log.error("não foi possível salvar as sessões: %s", e)
+
+
+LOGIN_HTML = r"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar · __TITULO__</title>
+<meta name="robots" content="noindex">
+<style>
+:root{--bg:#0b0f14;--card:#121821;--line:#232c37;--txt:#e6edf3;--mut:#8b96a3;--acc:#2f81f7;--err:#f85149;--ok:#00a859}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+ display:flex;align-items:center;justify-content:center;padding:16px;
+ background-image:radial-gradient(ellipse at 50% -10%,#16301f 0%,transparent 55%),radial-gradient(ellipse at 100% 100%,#101b2c 0%,transparent 50%)}
+.caixa{width:min(400px,100%);background:var(--card);border:1px solid var(--line);border-radius:16px;padding:30px 28px 24px;
+ box-shadow:0 20px 60px #0008;border-top:3px solid var(--ok)}
+.topo{display:flex;flex-direction:column;align-items:center;gap:12px;margin-bottom:22px;text-align:center}
+.topo img{max-height:64px;max-width:200px}
+.topo h1{font-size:19px;margin:0;font-weight:650}
+.topo p{margin:0;color:var(--mut);font-size:13px}
+label{display:block;font-size:12px;color:var(--mut);margin:0 0 14px;text-transform:uppercase;letter-spacing:.04em}
+input{display:block;width:100%;margin-top:6px;padding:11px 12px;font:inherit;font-size:15px;color:var(--txt);background:#0b0f14;
+ border:1px solid var(--line);border-radius:9px;outline:none;text-transform:none;letter-spacing:0}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px #2f81f733}
+.senha{position:relative}.senha input{padding-right:64px}
+.ver{position:absolute;right:6px;bottom:6px;background:none;border:0;color:var(--mut);font:inherit;font-size:12px;cursor:pointer;padding:6px 8px;border-radius:6px}
+.ver:hover{color:var(--txt);background:#ffffff0d}
+button.ent{width:100%;margin-top:6px;padding:11px;font:inherit;font-size:15px;font-weight:600;color:#fff;background:var(--acc);border:0;border-radius:9px;cursor:pointer}
+button.ent:hover{filter:brightness(1.08)}button.ent:disabled{opacity:.6;cursor:default}
+.erro{min-height:20px;color:var(--err);font-size:13px;margin:10px 0 0;text-align:center}
+.rod{margin-top:18px;color:var(--mut);font-size:11.5px;text-align:center}
+</style></head><body>
+<main class="caixa">
+ <div class="topo">__LOGO__<h1>__TITULO__</h1><p>Acesso ao sistema de monitoração e distribuição de sinais</p></div>
+ <form id="f" autocomplete="on">
+  <label>Usuário<input name="usuario" id="u" autocomplete="username" autocapitalize="off" spellcheck="false" required autofocus></label>
+  <label class="senha">Senha<input name="senha" id="s" type="password" autocomplete="current-password" required>
+   <button type="button" class="ver" id="ver" aria-label="mostrar senha">mostrar</button></label>
+  <button class="ent" id="b" type="submit">Entrar</button>
+  <p class="erro" id="e" role="alert">__MSG__</p>
+ </form>
+ <p class="rod">Acesso restrito · __VERSAO__</p>
+</main>
+<script>
+const f=document.getElementById('f'),b=document.getElementById('b'),e=document.getElementById('e'),s=document.getElementById('s');
+document.getElementById('ver').onclick=ev=>{const v=s.type==='password';s.type=v?'text':'password';ev.target.textContent=v?'ocultar':'mostrar'};
+f.onsubmit=async ev=>{ev.preventDefault();b.disabled=true;e.textContent='';
+ try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json','X-Asi2srt':'1'},
+   body:JSON.stringify({usuario:f.usuario.value.trim(),senha:f.senha.value})});
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){let v=new URLSearchParams(location.search).get('volta')||('/'+location.hash);if(!v.startsWith('/')||v.startsWith('//'))v='/';location.replace(v);return}
+  e.textContent=j.erro||'Não foi possível entrar';s.select()}
+ catch(x){e.textContent='Sem conexão com o servidor'}
+ b.disabled=false};
+</script></body></html>
+"""
+
+
+# ======================================================================
 # Servidor web: painel + API
 # ======================================================================
 def servidor_web(ger: Gerenciador, endereco: str):
     host, _, porta = endereco.rpartition(":")
-    usuario = ger.sup.get("usuario", "admin")
+    acesso = ger.garantir_senha()
 
     class H(BaseHTTPRequestHandler):
         server_version = "asi2srt/" + __version__
@@ -2919,22 +3258,82 @@ def servidor_web(ger: Gerenciador, endereco: str):
         def log_message(self, *a):
             pass
 
-        def _autorizado(self):
+        def _ip(self):
+            return self.client_address[0]
+
+        def _token(self):
+            try:
+                m = SimpleCookie(self.headers.get("Cookie", "")).get(COOKIE_SESSAO)
+            except Exception:  # noqa: BLE001
+                return None
+            return m.value if m else None
+
+        def _quem(self):
+            """Usuário logado: sessão (cookie da tela de login) ou cabeçalho Basic (scripts/monitoração)."""
+            u = acesso.sessao(self._token())
+            if u:
+                return u
             cab = self.headers.get("Authorization", "")
             if cab.startswith("Basic "):
                 try:
-                    u, _, s = base64.b64decode(cab[6:]).decode().partition(":")
-                except Exception:
-                    return False
-                return hmac.compare_digest(u, usuario) and \
-                    hmac.compare_digest(s, str(ger.sup.get("senha_painel", "")))
+                    us, _, s = base64.b64decode(cab[6:]).decode().partition(":")
+                except Exception:  # noqa: BLE001
+                    return None
+                return acesso.autenticar_basic(us, s, self._ip())
+            return None
+
+        def _redir(self, destino, cookie=None):
+            self.send_response(302)
+            self.send_header("Location", destino)
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def _pagina_login(self):
+            ap = ger.aparencia()
+            logo = f'<img src="/logo?v={ap.get("logo_v", "")}" alt="">' if ger.logo_arquivo() else ""
+            pag = (LOGIN_HTML.replace("__TITULO__", html.escape(ap["titulo"])).replace("__LOGO__", logo)
+                   .replace("__VERSAO__", "v" + __version__).replace("__MSG__", ""))
+            return self._resp(200, pag.encode(), "text/html; charset=utf-8",
+                              cab={"X-Frame-Options": "DENY", "Content-Security-Policy":
+                                   "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self'"})
+
+        def _login(self):
+            ip = self._ip()
+            espera = acesso.espera_bloqueio(ip)
+            if espera:
+                return self._resp(429, {"erro": f"Muitas tentativas erradas. Aguarde {max(1, round(espera / 60))} min."})
+            d = self._corpo()
+            u = acesso.autenticar(d.get("usuario", ""), d.get("senha", ""), ip)
+            if not u:
+                time.sleep(0.5)
+                espera = acesso.espera_bloqueio(ip)
+                return self._resp(429 if espera else 401, {"erro": f"Muitas tentativas erradas. Aguarde {max(1, round(espera / 60))} min."
+                                                           if espera else "Usuário ou senha incorretos"})
+            token = acesso.criar_sessao(u)
+            log.info("painel: login de %s (%s) a partir de %s", u["usuario"], u.get("papel"), ip)
+            return self._resp(200, acesso.publico(u), cab={"Set-Cookie": f"{COOKIE_SESSAO}={token}; Path=/; HttpOnly; "
+                                                                      f"SameSite=Strict; Max-Age={SESSAO_MAX_S}"})
+
+        @staticmethod
+        def _so_admin(metodo, caminho, partes):
+            if partes[:2] == ["api", "usuarios"]:
+                return True
+            if caminho == "/api/aparencia" and metodo != "GET":
+                return True
+            if partes[:2] == ["api", "canais"]:
+                return (len(partes) == 2 and metodo == "POST") or (len(partes) == 3 and metodo in ("PUT", "DELETE"))
             return False
 
-        def _resp(self, codigo, corpo, tipo="application/json", baixar=None):
+        def _resp(self, codigo, corpo, tipo="application/json", baixar=None, cab=None):
             if not isinstance(corpo, bytes):
                 corpo = json.dumps(corpo, ensure_ascii=False, indent=2 if baixar else None).encode()
             self.send_response(codigo)
             self.send_header("Content-Type", tipo)
+            for k, v in (cab or {}).items():
+                self.send_header(k, v)
             if baixar:
                 self.send_header("Content-Disposition", f'attachment; filename="{baixar}"')
             self.send_header("Content-Length", str(len(corpo)))
@@ -2942,12 +3341,6 @@ def servidor_web(ger: Gerenciador, endereco: str):
             self.end_headers()
             self.wfile.write(corpo)
 
-        def _negar(self):
-            self.send_response(401)
-            realm = re.sub(r'[^\w À-ÿ.-]', '', ger.aparencia()["titulo"]) or "Painel"
-            self.send_header("WWW-Authenticate", f'Basic realm="{realm}", charset="UTF-8"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
 
         def _corpo(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -2956,16 +3349,55 @@ def servidor_web(ger: Gerenciador, endereco: str):
             return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
         def _rota(self, metodo):
-            if not self._autorizado():
-                return self._negar()
-            # proteção contra CSRF: ações exigem cabeçalho próprio
-            if metodo != "GET" and self.headers.get("X-Asi2srt") != "1":
-                return self._resp(403, {"erro": "cabeçalho X-Asi2srt ausente"})
             url = urlparse(self.path)
             caminho = url.path.rstrip("/") or "/"
             q = {k: v[-1] for k, v in parse_qs(url.query).items()}
             partes = caminho.strip("/").split("/")
+            # proteção contra CSRF: ações exigem cabeçalho próprio (e o cookie é SameSite=Strict)
+            if metodo != "GET" and self.headers.get("X-Asi2srt") != "1":
+                return self._resp(403, {"erro": "cabeçalho X-Asi2srt ausente"})
             try:
+                if metodo == "GET" and caminho == "/login":
+                    if acesso.sessao(self._token()):
+                        return self._redir("/")
+                    return self._pagina_login()
+                if metodo == "POST" and caminho == "/api/login":
+                    return self._login()
+                u = None if (metodo == "GET" and caminho == "/logo") else self._quem()
+                if u is None and caminho != "/logo":
+                    if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
+                        volta = "" if self.path in ("", "/") else "?volta=" + quote(self.path, safe="")
+                        return self._redir("/login" + volta)
+                    if acesso.espera_bloqueio(self._ip()):
+                        return self._resp(429, {"erro": "muitas tentativas erradas; aguarde alguns minutos"})
+                    return self._resp(401, {"erro": "login necessário"})
+                if caminho == "/api/logout" and metodo == "POST":
+                    acesso.encerrar(self._token())
+                    return self._resp(200, {"ok": True}, cab={"Set-Cookie": f"{COOKIE_SESSAO}=; Path=/; HttpOnly; "
+                                                                             "SameSite=Strict; Max-Age=0"})
+                if caminho == "/api/eu" and metodo == "GET":
+                    return self._resp(200, {**acesso.publico(u), "senha_padrao": acesso.senha_padrao(u["usuario"])})
+                if caminho == "/api/eu/senha" and metodo == "PUT":
+                    d = self._corpo()
+                    acesso.trocar_senha(u["usuario"], d.get("atual"), d.get("nova"), self._token())
+                    return self._resp(200, {"ok": True})
+                if u is not None and u.get("papel") != "admin" and self._so_admin(metodo, caminho, partes):
+                    return self._resp(403, {"erro": "apenas administradores podem fazer isso"})
+                if partes[:2] == ["api", "usuarios"]:
+                    if len(partes) == 2 and metodo == "GET":
+                        return self._resp(200, acesso.listar())
+                    if len(partes) == 2 and metodo == "POST":
+                        return self._resp(201, acesso.salvar(self._corpo()))
+                    if len(partes) == 3:
+                        try:
+                            if metodo == "PUT":
+                                return self._resp(200, acesso.salvar(self._corpo(), partes[2]))
+                            if metodo == "DELETE":
+                                acesso.remover(partes[2], u["usuario"])
+                                return self._resp(200, {"ok": True})
+                        except KeyError:
+                            return self._resp(404, {"erro": "usuário não encontrado"})
+                    return self._resp(404, {"erro": "rota não encontrada"})
                 if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
                     titulo = html.escape(ger.aparencia()["titulo"])
                     return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__)
@@ -3120,7 +3552,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
 
     srv = ThreadingHTTPServer((host or "0.0.0.0", int(porta)), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("painel: http://%s:%s/  (usuário: %s)", host or "0.0.0.0", porta, usuario)
+    log.info("painel: http://%s:%s/  (%d usuário(s))", host or "0.0.0.0", porta, len(acesso.usuarios))
     return srv
 
 
@@ -3595,7 +4027,7 @@ def cmd_instalar_servico(args):
     ajustar_rede()
     print("serviço instalado.\n"
           "  1. sudo systemctl enable --now asi2srt\n"
-          "  2. login do painel: admin / admin  (troque em senha_painel no arquivo de configuração)\n"
+          "  2. login inicial do painel: admin / admin  (troque no menu do usuário > Trocar minha senha)\n"
           "  3. abra http://<ip-do-servidor>:8088/ e configure os canais")
 
 
@@ -3650,6 +4082,21 @@ header h1{font-size:17px;margin:0;font-weight:650}header .v{color:var(--mut);fon
 header .sp{flex:1}
 .resumo{display:flex;gap:18px;color:var(--mut);font-size:13px}.resumo b{color:var(--txt)}
 main{padding:20px;max-width:1400px;margin:auto}
+/* usuário logado */
+.usr{position:relative}.usr>button{display:flex;align-items:center;gap:7px;padding:5px 10px 5px 6px}
+.usr .av{width:24px;height:24px;border-radius:50%;background:#1f6feb33;color:#9ec5ff;display:flex;align-items:center;justify-content:center;font-size:11.5px;font-weight:700}
+.usr .un{display:flex;flex-direction:column;line-height:1.1;text-align:left}.usr .un small{color:var(--mut);font-size:10.5px}
+.usr .mn{position:absolute;right:0;top:calc(100% + 6px);min-width:210px;background:var(--card);border:1px solid var(--line);border-radius:10px;
+ box-shadow:0 12px 30px #0008;padding:6px;z-index:30}
+.usr .mn button{display:block;width:100%;text-align:left;border:0;background:none;padding:8px 10px;border-radius:6px}
+.usr .mn button:hover{background:#ffffff0d}.usr .mn .q{padding:8px 10px 10px;border-bottom:1px solid var(--line);margin-bottom:4px;font-size:12px;color:var(--mut)}
+.usr .mn .q b{display:block;color:var(--txt);font-size:13px}
+body.op #novo,body.op #bap,body.op [data-a="editar"],body.op [data-a="excluir"],body.op .so-adm{display:none!important}
+table.us{width:100%;border-collapse:collapse;font-size:13px}table.us th{text-align:left;color:var(--mut);font-weight:500;font-size:11.5px;padding:6px 8px;border-bottom:1px solid var(--line)}
+table.us td{padding:7px 8px;border-bottom:1px solid #20262f}table.us td:last-child{text-align:right;white-space:nowrap}
+.papel{font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:99px;letter-spacing:.03em;text-transform:uppercase}
+.papel.admin{background:#3a2a1f;color:#f5c48a}.papel.operador{background:#1f2a3a;color:#9ec5ff}
+@media(max-width:760px){.usr .un{display:none}}
 .aviso{background:#3b2e00;border:1px solid #6b5300;padding:8px 12px;border-radius:8px;margin-bottom:14px;color:#f0d67a}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
@@ -3834,7 +4281,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="cards">Cards</button></div>
-<button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button></header>
+<button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><fieldset><legend>Nome do painel</legend><label>Nome<input name="titulo" maxlength="80" required></label></fieldset>
@@ -3844,6 +4291,24 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
+<dialog id="dlgsenha" style="width:min(420px,96vw)"><form method="dialog" id="frmsenha">
+<div class="dh"><h3>Trocar minha senha</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db" style="display:grid;gap:12px"><label>Senha atual<input type="password" name="atual" autocomplete="current-password" required></label>
+<label>Nova senha<input type="password" name="nova" autocomplete="new-password" minlength="6" required></label>
+<label>Repita a nova senha<input type="password" name="nova2" autocomplete="new-password" minlength="6" required></label>
+<p class="msg" style="white-space:normal;margin:0">Mínimo de 6 caracteres. Ao trocar, as outras sessões abertas com este usuário são encerradas.</p></div>
+<div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Trocar senha</button></div></form></dialog>
+<dialog id="dlgus"><div class="dh"><h3>Usuários</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db"><table class="us" id="tus"></table>
+<form id="frmus" style="margin-top:16px"><fieldset><legend id="uslg">Novo usuário</legend><div class="campos">
+<label>Usuário<input name="usuario" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="40" required></label>
+<label>Nome<input name="nome" maxlength="60" placeholder="ex.: Bruno Alves"></label>
+<label>Perfil<select name="papel"><option value="operador">Operador</option><option value="admin">Administrador</option></select></label>
+<label>Senha<input type="password" name="senha" autocomplete="new-password" minlength="6"></label></div>
+<p class="msg" style="white-space:normal;margin:10px 0 0"><b>Administrador</b>: tudo, inclusive criar/editar/excluir canais, aparência e usuários.
+<b>Operador</b>: vê tudo, inicia/para/reinicia canais, zera contadores e baixa relatórios.</p>
+<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button type="button" id="uscanc" hidden>Cancelar edição</button><button class="pri" type="submit" id="ussub">Adicionar usuário</button></div>
+</fieldset></form></div></dialog>
 <main id="vlista"><div id="avisos"></div><div class="grid" id="grid"></div></main>
 <section id="vana" hidden>
  <div class="atop"><button id="voltar">← Canais</button><h2 id="anome"></h2><span class="pill" id="aest"></span>
@@ -3870,7 +4335,9 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <script>
 const H={'Content-Type':'application/json','X-Asi2srt':'1'};
 const $=s=>document.querySelector(s);
+function irLogin(){location.href='/login?volta='+encodeURIComponent(location.pathname+location.search+location.hash)}
 async function api(m,u,b){const r=await fetch(u,{method:m,headers:H,body:b?JSON.stringify(b):undefined});
+ if(r.status===401&&!u.startsWith('/api/eu/senha')){irLogin();throw new Error('sessão encerrada')}
  const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.erro||r.statusText);return j}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(t,bom){const d=document.createElement('div');d.className='toast'+(bom?' bom':'');d.textContent=t;
@@ -4029,7 +4496,7 @@ function grafRota(s,e){const h=(s.historico||[]).slice(-60),W=300,H=100;
  const ep=e&&e.estado==='conectado'&&e.hist&&e.hist.length>1?e.hist.slice(-60).map(x=>x[1]):null;
  if(h.length<2)return`<div class="gpv"><div class="gh"><b>Taxa útil</b></div><div class="gv gm">aguardando dados…</div></div>`;
  const mx=Math.max(...h)*1.15||1,xs=(i,n)=>(i/(n-1)*W).toFixed(1),p=h.map((y,i)=>`${xs(i,h.length)},${(H-y/mx*H).toFixed(1)}`).join(' ');
- const at=h[h.length-1],mn=Math.min(...h),mxv=Math.max(...h);
+ const at=h[h.length-1],hv=h.filter(x=>x>0),mn=hv.length?Math.min(...hv):0,mxv=Math.max(...h);
  let lp='',pa='';if(ep){const mp=Math.max(...ep,1);
   lp=`<polyline class="lp" points="${ep.map((y,i)=>`${xs(i,ep.length)},${(H-y/mp*H*.9).toFixed(1)}`).join(' ')}"/>`;
   const pv=ep[ep.length-1];pa=`<span class="${pv>1?'e':pv>0?'w':''}"><i class="lr"></i>Perda SRT <b>${pv.toFixed(2)}%</b></span>`}
@@ -4059,7 +4526,7 @@ document.addEventListener('click',e=>{const b=e.target.closest('[data-vis]');if(
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
  $('#grid').className=VIS==='rotas'?'rotas':'grid';
  $('#grid').innerHTML=dados.length?dados.map(VIS==='rotas'?linha:card).join(''):
- '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
+ '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri so-adm" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.estado!=='parado'?taxaTS(c.status).ut:0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
 
@@ -4284,6 +4751,45 @@ $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o 
 $('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim()};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Aparência salva',1)}catch(e){toast(e.message)}};
+let EU=null;
+const ini=n=>String(n||'?').trim().split(/\s+/).map(x=>x[0]).slice(0,2).join('').toUpperCase();
+function desenharUsr(){if(!EU)return;document.body.classList.toggle('op',EU.papel!=='admin');
+ $('#usr').innerHTML=`<button id="busr" title="${esc(EU.usuario)}"><span class="av">${esc(ini(EU.nome))}</span><span class="un">${esc(EU.nome)}<small>${esc(EU.papel_nome)}</small></span> ▾</button>
+ <div class="mn" id="mnusr" hidden><div class="q"><b>${esc(EU.nome)}</b>${esc(EU.usuario)} · ${esc(EU.papel_nome)}</div>
+ <button data-u="senha">Trocar minha senha</button>${EU.papel==='admin'?'<button data-u="usuarios">Usuários e permissões</button>':''}<button data-u="sair">Sair</button></div>`;
+ const av=$('#avisos');const id='avsenha';if(EU.senha_padrao&&!document.getElementById(id))av.insertAdjacentHTML('afterbegin',
+  `<div class="aviso" id="${id}">Você está usando a senha padrão <b>admin</b>. <button class="mini" data-u="senha">Trocar agora</button></div>`);
+ else if(!EU.senha_padrao&&document.getElementById(id))document.getElementById(id).remove()}
+async function carregarEu(){try{EU=await api('GET','/api/eu');desenharUsr()}catch(e){}}
+document.addEventListener('click',async e=>{const m=$('#mnusr');const b=e.target.closest('#busr');
+ if(b){m.hidden=!m.hidden;return}if(m&&!e.target.closest('#mnusr'))m.hidden=true;
+ const u=e.target.closest('[data-u]');if(!u)return;if(m)m.hidden=true;const a=u.dataset.u;
+ if(a==='sair'){try{await api('POST','/api/logout')}catch(x){}location.href='/login';return}
+ if(a==='senha'){$('#frmsenha').reset();$('#dlgsenha').showModal();return}
+ if(a==='usuarios'){usEdit(null);await listarUs();$('#dlgus').showModal();return}
+ if(a==='ued'){usEdit(US.find(x=>x.usuario===u.dataset.n));return}
+ if(a==='uex'){if(!confirm(`Excluir o usuário "${u.dataset.n}"?`))return;
+  try{await api('DELETE','/api/usuarios/'+encodeURIComponent(u.dataset.n));toast('Usuário excluído',1);listarUs()}catch(x){toast(x.message)}}});
+$('#frmsenha').onsubmit=async ev=>{ev.preventDefault();const f=ev.target.elements;
+ if(f.nova.value!==f.nova2.value){toast('As senhas novas não conferem');return}
+ try{await api('PUT','/api/eu/senha',{atual:f.atual.value,nova:f.nova.value});$('#dlgsenha').close();toast('Senha alterada',1);carregarEu()}catch(x){toast(x.message)}};
+let US=[],usAlvo=null;
+const fmtD=t=>t?new Date(t*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'}):'—';
+async function listarUs(){US=await api('GET','/api/usuarios');
+ $('#tus').innerHTML='<tr><th>Usuário</th><th>Nome</th><th>Perfil</th><th>Último acesso</th><th></th></tr>'+US.map(x=>`<tr><td><code>${esc(x.usuario)}</code>${x.usuario===EU.usuario?' <small style="color:var(--mut)">(você)</small>':''}</td>
+ <td>${esc(x.nome)}</td><td><span class="papel ${esc(x.papel)}">${esc(x.papel_nome)}</span></td><td>${fmtD(x.ultimo_acesso)}</td>
+ <td><button class="mini" data-u="ued" data-n="${esc(x.usuario)}">Editar</button>${x.usuario===EU.usuario?'':` <button class="mini perigo" data-u="uex" data-n="${esc(x.usuario)}">Excluir</button>`}</td></tr>`).join('')}
+function usEdit(x){usAlvo=x?x.usuario:null;const f=$('#frmus');f.reset();const el=f.elements;
+ el.usuario.disabled=!!x;el.usuario.value=x?x.usuario:'';el.nome.value=x?x.nome:'';el.papel.value=x?x.papel:'operador';
+ el.senha.required=!x;el.senha.placeholder=x?'deixe vazio para manter':'mínimo 6 caracteres';
+ $('#uslg').textContent=x?`Editar ${x.usuario}`:'Novo usuário';$('#ussub').textContent=x?'Salvar alterações':'Adicionar usuário';$('#uscanc').hidden=!x}
+$('#uscanc').onclick=()=>usEdit(null);
+$('#frmus').onsubmit=async ev=>{ev.preventDefault();const el=ev.target.elements;
+ const b={nome:el.nome.value.trim(),papel:el.papel.value};if(el.senha.value)b.senha=el.senha.value;
+ try{if(usAlvo){await api('PUT','/api/usuarios/'+encodeURIComponent(usAlvo),b);toast('Usuário atualizado',1)}
+  else{b.usuario=el.usuario.value.trim();await api('POST','/api/usuarios',b);toast('Usuário criado',1)}
+  usEdit(null);await listarUs();carregarEu()}catch(x){toast(x.message)}};
+carregarEu();
 api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];marca(i.aparencia);render();if(!i.persistente)$('#avisos').innerHTML='<div class="aviso">Modo linha de comando: alterações feitas aqui não são salvas em arquivo. Inicie o serviço com um arquivo de configuração para salvar as alterações.</div>'}).catch(()=>{});
 atualizar();setInterval(atualizar,2000);setInterval(carregarLog,2000);setInterval(()=>{if(!(ana&&ana.salvo&&sessSel!=null))carregarAna()},1000);setInterval(carregarSess,10000);rota();
 </script></body></html>
