@@ -859,7 +859,7 @@ def placas(monkeypatch):
     lista = [{"nome": "enp1s0", "ips": ["10.10.0.5"], "estado": "up", "mac": "", "velocidade_mbps": 1000, "virtual": False},
              {"nome": "enp2s0", "ips": ["172.20.15.119"], "estado": "up", "mac": "", "velocidade_mbps": 1000, "virtual": False},
              {"nome": "enp3s0", "ips": [], "estado": "down", "mac": "", "velocidade_mbps": None, "virtual": False}]
-    monkeypatch.setattr(a, "listar_interfaces", lambda: lista)
+    monkeypatch.setattr(a, "listar_interfaces", lambda todas=False: lista)
     return lista
 
 
