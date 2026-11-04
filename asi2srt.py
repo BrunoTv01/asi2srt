@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.13.1"
+__version__ = "2.13.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1154,14 +1154,29 @@ class AnalisadorTS:
         return sorted(na - recentes)
 
     def servicos_resumo(self):
-        """[{numero, nome, video}] dos serviços presentes na entrada (PAT/PMT/SDT)."""
+        """[{numero, nome, video, taxa}] dos serviços presentes na entrada (PAT/PMT/SDT)."""
         with self.lock:
+            fluindo = self.ultimo_pacote is not None and time.monotonic() - self.ultimo_pacote < self.LIM_SINAL
             out = []
             for ppid, num in sorted(self.pmt_pids.items(), key=lambda x: x[1]):
                 sdt = self.servicos_sdt.get(num)
+                pids = {ppid} | {e for e, v in self.es_pids.items() if v[0] == ppid}
+                pcr = (self.programas.get(ppid) or {}).get("pcr_pid")
+                if pcr is not None and pcr != 0x1FFF:
+                    pids.add(pcr)
                 out.append({"numero": num, "nome": sdt[0] if sdt and sdt[0] else f"Programa {num}",
-                            "video": any(v[0] == ppid and v[2] == "video" for v in self.es_pids.values())})
+                            "video": any(v[0] == ppid and v[2] == "video" for v in self.es_pids.values()),
+                            "taxa": int(sum(self.taxa.get(p, 0) for p in pids)) if fluindo else 0})
             return out
+
+    def taxas(self):
+        """Taxa total do TS e taxa útil (sem pacotes nulos), em bit/s, medidas a cada 1 s."""
+        with self.lock:
+            fluindo = self.ultimo_pacote is not None and time.monotonic() - self.ultimo_pacote < self.LIM_SINAL
+            if not fluindo:
+                return {"taxa_ts": 0, "taxa_util": 0, "taxa_nulos": 0}
+            nulos = int(self.taxa.get(0x1FFF, 0))
+            return {"taxa_ts": int(self.taxa_total), "taxa_util": int(self.taxa_total) - nulos, "taxa_nulos": nulos}
 
     def _desc_pid(self, pid):
         fixos = {0: "PAT", 1: "CAT", 2: "TSDT", 0x10: "NIT", 0x11: "SDT/BAT", 0x12: "EIT",
@@ -1780,6 +1795,7 @@ class Canal(threading.Thread):
         s["srt"] = self.srt_status()
         s["saidas"] = [p.status() for p in self.procs_saida]
         s["servicos"] = self.analisador.servicos_resumo()
+        s.update(self.analisador.taxas())
         return s
 
     def relatorio(self, motivo):
@@ -2961,6 +2977,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
  color:var(--mut);font-size:11px;line-height:1.3}
 .pv [hidden]{display:none!important}
 .pv .pvn{display:flex;gap:6px;align-items:baseline;padding:5px 8px;font-size:12px;background:#11161d;border-top:1px solid var(--line)}
+.pv .pvn .pvt{font-size:11.5px;font-variant-numeric:tabular-nums;color:#9ec5ff;white-space:nowrap}
+.rb .ut{display:block;font-size:11px;font-weight:400;color:var(--mut)}.rb .ut b{color:#a6e3a1;font-weight:600}
 .pv .pvn b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}.pv .pvn small{color:var(--mut);font-family:ui-monospace,monospace}
 .pv.sai{outline:2px solid #2f81f7;outline-offset:-1px}
 .pv.g{width:240px;flex:none}.serv .sh .pv{margin:-2px 4px -2px -4px}
@@ -3120,7 +3138,7 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
    return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}
  ${!ativo&&c.ultimo_relatorio?relCard(c):`${spark(s.historico)}
- <div class="met"><div><small>Bitrate</small><b class="big">${mb(s.bitrate_bps||0)}<small> Mb/s</small></b></div>
+ <div class="met"><div>${(()=>{const x=taxaTS(s);return`<small>Bitrate do TS</small><b class="big">${mb(x.ts)}<small> Mb/s</small></b>${x.temNulos?`<small style="color:var(--mut)">útil <b style="color:#a6e3a1;font-size:12px">${mb(x.ut)}</b> · nulos ${mb(x.nul)}</small>`:''}`})()}</div>
  <div><small>Reinícios</small><b>${s.reinicios||0}</b></div><div><small>Uptime</small><b>${dur(s.uptime_s)}</b></div></div>`}
  ${tr(s)}
  <div class="msg" title="${esc(s.ultima_msg)}">${esc(s.ultima_msg||'')}</div>
@@ -3159,11 +3177,14 @@ function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.t
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${x.tipo!=='rtmp'&&(x.interface||x.interface_local)?`<span class="nicb" title="placa de rede usada">${esc(x.interface||x.interface_local)}</span>`:''}</span>
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
+const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
+function taxaTS(s){const ts=s.taxa_ts||s.bitrate_bps||0,ut=s.taxa_util||0,nul=s.taxa_nulos||0;
+ return{ts,ut,nul,temNulos:ts>0&&nul/ts>0.02}}
 function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
  const msg=!s.video?'♪ sem vídeo':p.u?'':esc(p.erro||'carregando imagem…');
  if(s.video)prevAlvos.add(k);
  return`<div class="pv ${cls||''}" title="${esc(s.nome)} · serviço ${s.numero}"><div class="im">${s.video?`<img data-prev="${k}" ${p.u?`src="${p.u}"`:'hidden'} alt="">`:''}
- <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b><small>${s.numero}</small></div></div>`}
+ <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b>${s.taxa?`<span class="pvt" title="taxa deste serviço (vídeo + áudio + dados do programa)">${mbps(s.taxa)}</span>`:''}<small>${s.numero}</small></div></div>`}
 let prevOcupado=false;
 async function atualizarPrevias(){if(prevOcupado||document.hidden)return;prevOcupado=true;
  try{for(const k of [...prevAlvos]){const [cid,sid]=k.split(':');
@@ -3198,7 +3219,7 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
  const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
- ${dots}<span class="rb">${ativo?`${mb(s.bitrate_bps||0)} <small>Mb/s</small>`:r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
+ ${dots}<span class="rb">${ativo?(()=>{const x=taxaTS(s);return`<span title="taxa total do TS (inclui pacotes nulos)">${mb(x.ts)} <small>Mb/s TS</small></span>${x.temNulos?`<span class="ut" title="sem pacotes nulos (enchimento)">útil <b>${mb(x.ut)}</b> · nulos ${mb(x.nul)}</span>`:''}`})():r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${indicadores(ativo?t:null,ativo?null:r)}
  <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
  ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
