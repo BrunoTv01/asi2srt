@@ -197,6 +197,20 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+### Placas de rede reconhecidas
+
+O botão **Rede** (no topo do painel) mostra todas as placas que o servidor reconhece, lidas do sistema
+na hora (placa nova ou cabo religado aparecem sozinhos):
+
+- link (verde/vermelho), velocidade e duplex, IPv4/IPv6, gateway, MAC, MTU, endereço PCI;
+- **modelo e driver** da placa (via `lspci`; o instalador coloca `pciutils` e `iproute2`);
+- tipo: física, Wi-Fi, bond (com as portas membro), VLAN, bridge, VPN;
+- tráfego recebido/enviado em tempo real e **quais canais usam a placa** (principal ou reserva);
+- aviso de **placa detectada no PCI sem driver** (o sistema não consegue usá-la até instalar o driver).
+
+Interfaces internas (Docker, VMs, containers) ficam escondidas da lista e dos formulários
+(há uma opção para mostrá-las). `asi2srt verificar` e o log de início também listam as placas.
+
 ### Placa de rede reserva (failover automático)
 
 Cada entrada (UDP/SRT) e cada saída (SRT/UDP/RTP) pode ter uma **placa reserva**. Escolha a
@@ -451,7 +465,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.20.0 && git push origin v2.17.1
+git tag v2.21.0 && git push origin v2.17.1
 ```
 
 ## Licença

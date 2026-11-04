@@ -1298,3 +1298,18 @@ def test_rotas_por_placa_comandos(monkeypatch):
     feitos = a.aplicar_rotas_por_placa()
     assert "ip -4 route replace default via 192.168.1.1 dev eth1 table 203" in feitos
     assert "ip -4 rule add from 192.168.1.5/32 table 203 priority 1003" in feitos
+
+
+def test_listar_interfaces_detalhes():
+    lst = a.listar_interfaces(todas=True)
+    for i in lst:
+        assert {"nome", "ips", "link", "tipo", "modelo", "driver", "gateway", "rx_bps", "virtual"} <= set(i)
+        assert i["tipo"] in ("fisica", "wifi", "bond", "vlan", "bridge", "vpn", "virtual", "interna")
+    assert all(i["tipo"] != "interna" for i in a.listar_interfaces())
+    assert isinstance(a.placas_sem_driver(), list)
+
+
+def test_api_rede(gateway):
+    base, _ = gateway
+    cod, r = _req(base, "GET", "/api/rede")
+    assert cod == 200 and {"interfaces", "sem_driver", "uso"} <= set(r)

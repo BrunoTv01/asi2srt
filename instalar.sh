@@ -23,13 +23,13 @@ fi
 echo "==> Dependências"
 if command -v apt-get >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq python3 python3-yaml curl ca-certificates >/dev/null
+  apt-get install -y -qq python3 python3-yaml curl ca-certificates iproute2 pciutils >/dev/null
   # ffmpeg: usado pelas saídas RTMP/RTMPS
   apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null || echo "aviso: ffmpeg não instalado (saídas RTMP indisponíveis)"
   # reportlab: relatório em PDF
   apt-get install -y -qq python3-reportlab >/dev/null || echo "aviso: python3-reportlab não instalado (relatório PDF indisponível)"
 elif command -v dnf >/dev/null; then
-  dnf install -y -q python3 python3-pyyaml curl python3-reportlab
+  dnf install -y -q python3 python3-pyyaml curl python3-reportlab iproute pciutils
   dnf install -y -q ffmpeg 2>/dev/null || echo "aviso: ffmpeg não instalado (saídas RTMP indisponíveis; habilite RPM Fusion)"
 fi
 

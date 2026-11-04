@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.20.0"
+__version__ = "2.21.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -391,29 +391,125 @@ def _args_ffmpeg_rtmp(s: dict, porta_entrada) -> list:
     return cmd
 
 
-def listar_interfaces():
-    """Placas de rede do computador: nome, IPv4, estado, MAC, velocidade e se é virtual."""
+_FABRICANTES_PCI = {
+    "8086": "Intel", "10ec": "Realtek", "14e4": "Broadcom", "15b3": "Mellanox/NVIDIA", "1d6a": "Aquantia/Marvell",
+    "11ab": "Marvell", "1924": "Solarflare/AMD", "1425": "Chelsio", "19a2": "Emulex", "1077": "QLogic",
+    "1022": "AMD", "1af4": "Virtio (VM)", "15ad": "VMware (VM)", "1414": "Microsoft Hyper-V (VM)", "1969": "Qualcomm Atheros",
+    "168c": "Qualcomm Atheros", "14c3": "MediaTek", "177d": "Cavium", "1137": "Cisco", "8088": "Wangxun",
+    "1dab": "Pensando", "1fc9": "Tehuti", "19ee": "Netronome", "1ae0": "Google (VM)", "1d0f": "Amazon (VM)",
+}
+_MODELO_CACHE = {}
+_TRAFEGO_ANT = {}
+_PREFIXOS_INTERNOS = ("docker", "veth", "br-", "virbr", "vnet", "cni", "flannel", "kube", "cali", "vxlan", "ifb",
+                      "dummy", "lxc", "lxd", "podman")
+
+
+def _ler_sys(caminho):
+    try:
+        with open(caminho) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _pci_do_dispositivo(nome):
+    """Endereço PCI (ex. 0000:03:00.0) da placa, também quando ela é virtio (um nível abaixo do PCI)."""
+    try:
+        real = os.path.realpath(f"/sys/class/net/{nome}/device")
+    except OSError:
+        return None
+    for parte in reversed(real.split("/")):
+        if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", parte):
+            return parte
+    return None
+
+
+def _modelo_pci(slot):
+    if not slot:
+        return None
+    if slot in _MODELO_CACHE:
+        return _MODELO_CACHE[slot]
+    modelo = None
+    if shutil.which("lspci"):
+        try:
+            r = subprocess.run(["lspci", "-mm", "-s", slot], capture_output=True, text=True, timeout=5)
+            campos = shlex.split(r.stdout.strip()) if r.stdout.strip() else []
+            if len(campos) >= 4:      # slot, classe, fabricante, dispositivo
+                modelo = f"{campos[2]} {campos[3]}".strip()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            modelo = None
+    if not modelo:
+        base = f"/sys/bus/pci/devices/{slot}"
+        ven = _ler_sys(f"{base}/vendor").replace("0x", "")
+        dev = _ler_sys(f"{base}/device").replace("0x", "")
+        if ven:
+            modelo = f"{_FABRICANTES_PCI.get(ven, 'fabricante ' + ven)} (id {ven}:{dev})"
+    _MODELO_CACHE[slot] = modelo
+    return modelo
+
+
+def _tipo_interface(nome):
+    base = f"/sys/class/net/{nome}"
+    if os.path.isdir(f"{base}/wireless") or os.path.isdir(f"{base}/phy80211"):
+        return "wifi"
+    if os.path.isdir(f"{base}/bonding"):
+        return "bond"
+    if os.path.isdir(f"{base}/bridge"):
+        return "bridge" if not nome.startswith(("docker", "br-", "virbr", "cni", "lxc")) else "interna"
+    if os.path.exists(f"/proc/net/vlan/{nome}"):
+        return "vlan"
+    if nome.startswith(_PREFIXOS_INTERNOS):
+        return "interna"
+    if os.path.exists(f"{base}/device"):
+        return "fisica"
+    if nome.startswith(("tun", "tap", "ppp", "wwan", "wg", "zt", "tailscale")):
+        return "vpn"
+    return "virtual"
+
+
+def listar_interfaces(todas=False):
+    """Placas de rede do computador: nome, IPs, estado do link, velocidade, MAC, tipo, modelo, driver,
+    gateway e tráfego. Sem 'todas', as interfaces internas (Docker, VM, containers) ficam de fora."""
     import socket
-    ips = {}
+    ips, ips6, gw = {}, {}, {}
     if shutil.which("ip"):
         try:
-            r = subprocess.run(["ip", "-j", "-4", "addr", "show"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(["ip", "-j", "addr", "show"], capture_output=True, text=True, timeout=5)
             for it in json.loads(r.stdout or "[]"):
                 ips[it["ifname"]] = [x["local"] for x in it.get("addr_info", []) if x.get("family") == "inet"]
+                ips6[it["ifname"]] = [x["local"] for x in it.get("addr_info", []) if x.get("family") == "inet6"
+                                      and x.get("scope") == "global"]
+            r = subprocess.run(["ip", "-j", "-4", "route", "show", "default"], capture_output=True, text=True, timeout=5)
+            for it in json.loads(r.stdout or "[]"):
+                if it.get("dev") and it.get("gateway"):
+                    gw.setdefault(it["dev"], it["gateway"])
         except (OSError, ValueError, subprocess.SubprocessError, KeyError):
-            ips = {}
-
-    def ler(nome, arq):
+            ips, ips6 = {}, {}
+    if not gw:   # sem o comando ip: tabela de rotas do kernel
         try:
-            with open(f"/sys/class/net/{nome}/{arq}") as f:
-                return f.read().strip()
-        except OSError:
-            return ""
+            with open("/proc/net/route") as f:
+                next(f, None)
+                for ln in f:
+                    c = ln.split()
+                    if len(c) > 2 and c[1] == "00000000" and c[2] != "00000000":
+                        g = bytes.fromhex(c[2])[::-1]
+                        gw.setdefault(c[0], ".".join(str(b) for b in g))
+        except (OSError, ValueError):
+            pass
 
+    agora = time.monotonic()
     out = []
-    for _, nome in socket.if_nameindex():
+    try:
+        nomes = [n for _, n in socket.if_nameindex()]
+    except OSError:
+        nomes = sorted(os.listdir("/sys/class/net")) if os.path.isdir("/sys/class/net") else []
+    for nome in nomes:
         if nome == "lo":
             continue
+        tipo = _tipo_interface(nome)
+        if tipo == "interna" and not todas:
+            continue
+        base = f"/sys/class/net/{nome}"
         lista = ips.get(nome)
         if lista is None:
             lista = []
@@ -428,16 +524,66 @@ def listar_interfaces():
                     s.close()
             except (OSError, ImportError):
                 lista = []
-        vel = ler(nome, "speed")
-        out.append({"nome": nome, "ips": lista, "estado": ler(nome, "operstate") or "desconhecido",
-                    "mac": ler(nome, "address"), "velocidade_mbps": int(vel) if vel.lstrip("-").isdigit() and int(vel) > 0 else None,
-                    "virtual": not os.path.exists(f"/sys/class/net/{nome}/device")})
-    out.sort(key=lambda i: (i["virtual"], not i["ips"], i["nome"]))
+        vel = _ler_sys(f"{base}/speed")
+        carrier = _ler_sys(f"{base}/carrier") == "1"
+        estado = _ler_sys(f"{base}/operstate") or "desconhecido"
+        slot = _pci_do_dispositivo(nome)
+        drv = os.path.basename(os.path.realpath(f"{base}/device/driver")) if os.path.exists(f"{base}/device/driver") else None
+        modelo = _modelo_pci(slot)
+        if not modelo and os.path.exists(f"{base}/device"):   # USB: fabricante/produto do dispositivo
+            raiz = os.path.realpath(f"{base}/device")
+            for _ in range(3):
+                prod = _ler_sys(f"{raiz}/product")
+                if prod:
+                    modelo = f"{_ler_sys(f'{raiz}/manufacturer')} {prod}".strip() + " (USB)"
+                    break
+                raiz = os.path.dirname(raiz)
+        rx = _ler_sys(f"{base}/statistics/rx_bytes")
+        tx = _ler_sys(f"{base}/statistics/tx_bytes")
+        rx, tx = (int(rx) if rx.isdigit() else 0), (int(tx) if tx.isdigit() else 0)
+        ant = _TRAFEGO_ANT.get(nome)
+        taxa_rx = taxa_tx = None
+        if ant and agora - ant[0] >= 0.5 and rx >= ant[1] and tx >= ant[2]:
+            dt = agora - ant[0]
+            taxa_rx, taxa_tx = int((rx - ant[1]) * 8 / dt), int((tx - ant[2]) * 8 / dt)
+        if not ant or agora - ant[0] >= 0.5:
+            _TRAFEGO_ANT[nome] = (agora, rx, tx)
+        membros = None
+        if tipo == "bond":
+            membros = _ler_sys(f"{base}/bonding/slaves").split() or None
+        mestre = os.path.basename(os.path.realpath(f"{base}/master")) if os.path.exists(f"{base}/master") else None
+        out.append({"nome": nome, "ips": lista, "ipv6": ips6.get(nome, []), "estado": estado,
+                    "link": carrier and estado in ("up", "unknown"), "mac": _ler_sys(f"{base}/address"),
+                    "velocidade_mbps": int(vel) if vel.lstrip("-").isdigit() and int(vel) > 0 else None,
+                    "duplex": _ler_sys(f"{base}/duplex") or None, "mtu": int(_ler_sys(f"{base}/mtu") or 0) or None,
+                    "virtual": tipo not in ("fisica", "wifi"), "tipo": tipo, "modelo": modelo, "driver": drv,
+                    "pci": slot, "gateway": gw.get(nome), "membros": membros, "mestre": mestre,
+                    "rx_bytes": rx, "tx_bytes": tx, "rx_bps": taxa_rx, "tx_bps": taxa_tx})
+    ordem = {"fisica": 0, "wifi": 1, "bond": 2, "vlan": 3, "bridge": 4, "vpn": 5, "virtual": 6, "interna": 7}
+    out.sort(key=lambda i: (ordem.get(i["tipo"], 9), not i["link"], not i["ips"], i["nome"]))
+    return out
+
+
+def placas_sem_driver():
+    """Controladoras de rede vistas no barramento PCI que não viraram interface (falta driver/firmware)."""
+    out = []
+    base = "/sys/bus/pci/devices"
+    if not os.path.isdir(base):
+        return out
+    for slot in sorted(os.listdir(base)):
+        if not _ler_sys(f"{base}/{slot}/class").startswith("0x02"):     # classe 02 = controladora de rede
+            continue
+        d = f"{base}/{slot}"
+        tem_net = os.path.isdir(f"{d}/net") or any(os.path.isdir(os.path.join(d, x, "net")) for x in os.listdir(d)
+                                                    if x.startswith("virtio"))
+        if not tem_net:
+            drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else None
+            out.append({"pci": slot, "modelo": _modelo_pci(slot), "driver": drv})
     return out
 
 
 def ip_da_interface(nome: str) -> str:
-    for i in listar_interfaces():
+    for i in listar_interfaces(todas=True):
         if i["nome"] == nome:
             if not i["ips"]:
                 raise ValueError(f"a placa de rede {nome} não tem endereço IPv4")
@@ -467,7 +613,7 @@ def estado_nics(cache_s=1.5):
     if agora - _NICS_CACHE["t"] < cache_s:
         return _NICS_CACHE["v"]
     out = {}
-    for i in listar_interfaces():
+    for i in listar_interfaces(todas=True):
         nome = i["nome"]
         try:
             with open(f"/sys/class/net/{nome}/carrier") as f:
@@ -3786,6 +3932,16 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     return
                 if metodo == "GET" and caminho == "/api/interfaces":
                     return self._resp(200, listar_interfaces())
+                if metodo == "GET" and caminho == "/api/rede":
+                    uso = {}
+                    for c in ger.defs.values():
+                        c = normalizar_canal(c)
+                        for rot, it in [("entrada", c["entrada"])] + [(f"destino {i + 1}", s) for i, s in enumerate(c["saidas"])]:
+                            for k, papel in (("interface", "principal"), ("interface_reserva", "reserva")):
+                                if it.get(k):
+                                    uso.setdefault(it[k], []).append({"canal": c["nome"], "onde": rot, "papel": papel})
+                    return self._resp(200, {"interfaces": listar_interfaces(todas=q.get("todas") == "1"),
+                                            "sem_driver": placas_sem_driver(), "uso": uso})
                 if caminho == "/api/aparencia":
                     if metodo == "GET":
                         return self._resp(200, ger.aparencia())
@@ -3965,6 +4121,15 @@ def executar_gateway(cfg: dict, caminho=None):
     if sup.get("log_arquivo"):
         logging.getLogger().addHandler(logging.FileHandler(sup["log_arquivo"]))
     log.info("asi2srt %s - %d canal(is) configurado(s)", __version__, len(ger.defs))
+    try:
+        for i in listar_interfaces():
+            log.info("placa de rede %s: %s, %s%s%s", i["nome"], ", ".join(i["ips"]) or "sem IP",
+                     "link OK" if i["link"] else "sem link", f", {i['velocidade_mbps']} Mb/s" if i["velocidade_mbps"] else "",
+                     f", {i['modelo']}" if i.get("modelo") else "")
+        for pl in placas_sem_driver():
+            log.warning("placa de rede no PCI %s (%s) sem driver: não aparece para o sistema", pl["pci"], pl.get("modelo"))
+    except Exception:  # noqa: BLE001
+        log.exception("listar placas de rede")
     if sup.get("rotas_por_placa"):
         for c in aplicar_rotas_por_placa():
             log.info("rotas por placa: %s", c)
@@ -4050,8 +4215,11 @@ def cmd_verificar(args):
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
     print("\nPlacas de rede:")
     for i in listar_interfaces():
-        print(f"  {i['nome']:<12} {', '.join(i['ips']) or 'sem IP':<18} {i['estado']}"
-              + (f" · {i['velocidade_mbps']} Mb/s" if i['velocidade_mbps'] else "") + (" · virtual" if i["virtual"] else ""))
+        print(f"  {i['nome']:<12} {', '.join(i['ips']) or 'sem IP':<18} {'link OK' if i['link'] else 'sem link':<9}"
+              + (f" · {i['velocidade_mbps']} Mb/s" if i['velocidade_mbps'] else "") + f" · {i['tipo']}"
+              + (f" · {i['modelo']}" if i.get("modelo") else "") + (f" · driver {i['driver']}" if i.get("driver") else ""))
+    for p in placas_sem_driver():
+        print(f"  ✗ {p['pci']}  {p.get('modelo') or 'placa de rede'}: detectada no PCI, mas SEM DRIVER (sem interface)")
     print("PyYAML: " + ("instalado" if yaml else "ausente (configuração será salva em JSON)"))
     ff = shutil.which("ffmpeg")
     if ff:
@@ -4463,6 +4631,20 @@ table.us td{padding:7px 8px;border-bottom:1px solid #20262f}table.us td:last-chi
 .papel{font-size:10.5px;font-weight:700;padding:1px 7px;border-radius:99px;letter-spacing:.03em;text-transform:uppercase}
 .papel.admin{background:#3a2a1f;color:#f5c48a}.papel.operador{background:#1f2a3a;color:#9ec5ff}
 @media(max-width:760px){.usr .un{display:none}}
+/* placas de rede */
+.nics{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+.nic{border:1px solid var(--line);border-radius:10px;background:#11161d;padding:10px 12px;display:flex;flex-direction:column;gap:6px;font-size:12.5px}
+.nic.off{opacity:.75}.nic .nh{display:flex;align-items:center;gap:8px}.nic .nh b{font-family:ui-monospace,monospace;font-size:14px}
+.nic .lk{width:10px;height:10px;border-radius:50%;background:#484f58;flex:none}.nic .lk.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.nic .lk.dn{background:var(--err);box-shadow:0 0 6px var(--err)}
+.nic .tpn{font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:1px 6px;border-radius:4px;background:#1f2a3a;color:#9ec5ff}
+.nic .tpn.wifi{background:#2a1f3a;color:#d2b8ff}.nic .tpn.bond,.nic .tpn.vlan,.nic .tpn.bridge{background:#22301f;color:#a6e3a1}
+.nic .tpn.virtual,.nic .tpn.interna,.nic .tpn.vpn{background:#262b33;color:var(--mut)}
+.nic .md{color:var(--mut);font-size:12px;min-height:16px}
+.nic dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}.nic dt{color:var(--mut)}.nic dd{margin:0;font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}
+.nic .ntr{display:flex;gap:14px;font-variant-numeric:tabular-nums;font-size:12px;border-top:1px solid #1c222a;padding-top:6px}.nic .ntr span b{color:var(--txt)}.nic .ntr span{color:var(--mut);white-space:nowrap}
+.nic .uso{display:flex;flex-wrap:wrap;gap:4px}.nic .uso span{font-size:11px;background:var(--in);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.nic .uso span.r{border-style:dashed;color:var(--mut)}
 .aviso{background:#3b2e00;border:1px solid #6b5300;padding:8px 12px;border-radius:8px;margin-bottom:14px;color:#f0d67a}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
@@ -4679,7 +4861,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button></div>
-<button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
+<button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><fieldset><legend>Nome do painel</legend><label>Nome<input name="titulo" maxlength="80" required></label></fieldset>
@@ -4689,6 +4871,9 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
+<dialog id="dlgrede" style="width:min(980px,96vw)"><div class="dh"><h3>Placas de rede do servidor</h3>
+<label class="chk" style="margin-right:12px;font-size:12px"><input type="checkbox" id="redetodas"> mostrar internas (Docker/VM)</label><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db" id="redecorpo"></div></dialog>
 <dialog id="dlgsenha" style="width:min(420px,96vw)"><form method="dialog" id="frmsenha">
 <div class="dh"><h3>Trocar minha senha</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db" style="display:grid;gap:12px"><label>Senha atual<input type="password" name="atual" autocomplete="current-password" required></label>
@@ -4982,13 +5167,14 @@ function campoServ(n,rot,t,v){const sel=(Array.isArray(v)?v:(v||v===0?[v]:[])).m
 let INTERFACES=[];
 function campoNic(n,rot,obj){let v=obj.interface||'';
  if(!v&&obj.interface_local){const m=INTERFACES.find(i=>i.ips.includes(obj.interface_local));v=m?m.nome:''}
- const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(i.nome)} — ${esc(i.ips.join(', ')||'sem IP')}${i.estado!=='up'?' (desconectada)':''}${i.virtual?' · virtual':''}</option>`);
+ const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(nicOpt(i))}</option>`);
  if(v&&!INTERFACES.some(i=>i.nome===v))ops.push(`<option value="${esc(v)}" selected>${esc(v)} — não encontrada neste computador</option>`);
  const avulso=!v&&obj.interface_local?`<option value="" selected>IP ${esc(obj.interface_local)} (configurado à mão)</option>`:'';
  return`<label title="Placa de rede usada por esta conexão. Automática = o sistema escolhe pela rota.">${rot}<select name="${n}">
  ${avulso||`<option value="">Automática (rota do sistema)</option>`}${ops.join('')}</select></label>`}
+const nicOpt=i=>`${i.nome} — ${i.ips.join(', ')||'sem IP'}${i.link===false||i.estado==='down'?' · SEM LINK':''}${i.velocidade_mbps?' · '+(i.velocidade_mbps>=1000?i.velocidade_mbps/1000+'G':i.velocidade_mbps+'M'):''}${i.tipo&&i.tipo!=='fisica'?' · '+(TIPO_NIC[i.tipo]||i.tipo):''}`;
 function campoNic2(n,rot,obj){const v=obj.interface_reserva||'';
- const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(i.nome)} — ${esc(i.ips.join(', ')||'sem IP')}${i.estado!=='up'?' (desconectada)':''}${i.virtual?' · virtual':''}</option>`);
+ const ops=INTERFACES.map(i=>`<option value="${esc(i.nome)}" ${v===i.nome?'selected':''}>${esc(nicOpt(i))}</option>`);
  if(v&&!INTERFACES.some(i=>i.nome===v))ops.push(`<option value="${esc(v)}" selected>${esc(v)} — não encontrada neste computador</option>`);
  return`<label title="Se a placa principal perder o link/IP, ou a conexão não funcionar por ela, o sistema passa sozinho para esta placa e volta quando a principal ficar estável. Precisa escolher a placa principal.">${rot}<select name="${n}">
  <option value="">Nenhuma</option>${ops.join('')}</select></label>`}
@@ -5193,6 +5379,25 @@ $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o 
 $('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim()};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Aparência salva',1)}catch(e){toast(e.message)}};
+let REDE_T=null;
+const fbps=b=>b==null?'—':b>=1e9?(b/1e9).toFixed(2)+' Gb/s':b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(0)+' kb/s';
+const TIPO_NIC={fisica:'física',wifi:'Wi-Fi',bond:'bond',vlan:'VLAN',bridge:'bridge',vpn:'VPN',virtual:'virtual',interna:'interna'};
+async function carregarRede(){try{const r=await api('GET','/api/rede'+($('#redetodas').checked?'?todas=1':''));
+ const fis=r.interfaces.filter(i=>!i.virtual),lig=r.interfaces.filter(i=>i.link&&i.ips.length);
+ $('#redecorpo').innerHTML=`<p class="msg" style="white-space:normal;margin:0 0 10px">${r.interfaces.length} placa(s) reconhecida(s) · ${fis.length} física(s) · ${lig.length} com link e IP. A lista é lida do sistema na hora: placa nova ou cabo reconectado aparecem sozinhos (atualiza a cada 2 s).</p>
+ ${(r.sem_driver||[]).map(p=>`<div class="aviso">Placa detectada no barramento PCI <code>${esc(p.pci)}</code>${p.modelo?` — ${esc(p.modelo)}`:''}, mas <b>sem driver</b>: o sistema não consegue usá-la. Instale o driver/firmware do fabricante e reinicie.</div>`).join('')}
+ <div class="nics">${r.interfaces.map(i=>{const uso=r.uso[i.nome]||[];
+  return`<div class="nic ${i.link?'':'off'}"><div class="nh"><span class="lk ${i.link?'on':i.estado==='down'?'dn':''}" title="${i.link?'link OK':'sem link'}"></span><b>${esc(i.nome)}</b>
+   <span class="tpn ${esc(i.tipo)}">${esc(TIPO_NIC[i.tipo]||i.tipo)}</span><span class="sp" style="flex:1"></span>
+   <span style="font-size:12px;color:${i.link?'#a6e3a1':'var(--mut)'}">${i.link?(i.velocidade_mbps?(i.velocidade_mbps>=1000?i.velocidade_mbps/1000+' Gb/s':i.velocidade_mbps+' Mb/s'):'link OK')+(i.duplex&&i.duplex!=='unknown'?' · '+esc(i.duplex):''):'sem link'}</span></div>
+   <div class="md">${esc(i.modelo||'')}${i.driver?` <span style="opacity:.8">· driver ${esc(i.driver)}</span>`:''}</div>
+   <dl><dt>IPv4</dt><dd>${esc(i.ips.join(', ')||'sem IP')}</dd>${i.ipv6.length?`<dt>IPv6</dt><dd>${esc(i.ipv6.join(', '))}</dd>`:''}
+   <dt>Gateway</dt><dd>${esc(i.gateway||'—')}</dd><dt>MAC</dt><dd>${esc(i.mac||'—')}</dd>${i.mtu?`<dt>MTU</dt><dd>${i.mtu}</dd>`:''}
+   ${i.pci?`<dt>PCI</dt><dd>${esc(i.pci)}</dd>`:''}${i.membros?`<dt>Membros</dt><dd>${esc(i.membros.join(', '))}</dd>`:''}${i.mestre?`<dt>Faz parte de</dt><dd>${esc(i.mestre)}</dd>`:''}</dl>
+   <div class="ntr"><span>↓ recebendo <b>${fbps(i.rx_bps)}</b></span><span>↑ enviando <b>${fbps(i.tx_bps)}</b></span></div>
+   ${uso.length?`<div class="uso">${uso.map(u=>`<span class="${u.papel==='reserva'?'r':''}" title="${u.papel==='reserva'?'placa reserva':'placa principal'}">${esc(u.canal)} · ${esc(u.onde)}${u.papel==='reserva'?' (reserva)':''}</span>`).join('')}</div>`:''}</div>`}).join('')}</div>`}catch(e){$('#redecorpo').innerHTML=`<div class="aviso">${esc(e.message)}</div>`}}
+$('#brede').onclick=async()=>{$('#redecorpo').innerHTML='<p class="msg">lendo as placas…</p>';$('#dlgrede').showModal();await carregarRede();clearInterval(REDE_T);REDE_T=setInterval(carregarRede,2000)};
+$('#dlgrede').addEventListener('close',()=>{clearInterval(REDE_T);REDE_T=null});$('#redetodas').onchange=carregarRede;
 let EU=null;
 const ini=n=>String(n||'?').trim().split(/\s+/).map(x=>x[0]).slice(0,2).join('').toUpperCase();
 function desenharUsr(){if(!EU)return;document.body.classList.toggle('op',EU.papel!=='admin');
