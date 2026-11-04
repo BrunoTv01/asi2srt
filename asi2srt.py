@@ -47,7 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-__version__ = "2.11.2"
+__version__ = "2.12.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -239,7 +239,20 @@ def entrada_de_texto(txt: str) -> dict:
     raise SystemExit(f"entrada inválida: {txt!r}")
 
 
+def _com_servicos(d, url):
+    q = {k: v[-1] for k, v in parse_qs(urlparse(url).query).items()}
+    if q.get("servico"):
+        d["servicos"] = [x for x in q["servico"].split(",") if x.strip()]
+        if d.get("tipo") == "rtmp":  # o parâmetro é nosso: não vai para o servidor RTMP
+            d["url"] = re.sub(r"([?&])servico=[^&]*&?", r"\1", d["url"]).rstrip("?&")
+    return d
+
+
 def saida_de_url(url: str) -> dict:
+    return _com_servicos(_saida_de_url(url), url)
+
+
+def _saida_de_url(url: str) -> dict:
     """srt://host:porta?mode=..&latency=..&passphrase=..&streamid=..  |  udp://IP:PORTA?ttl=..&local=IP"""
     u = urlparse(url)
     if u.scheme == "srt":
@@ -330,9 +343,12 @@ def _args_ffmpeg_rtmp(s: dict, porta_entrada) -> list:
     video, audio = s.get("video", "copiar"), s.get("audio", "aac")
     if video not in ("copiar", "h264") or audio not in ("aac", "copiar"):
         raise ValueError("vídeo deve ser 'copiar' ou 'h264' e áudio 'aac' ou 'copiar'")
-    prog = str(s.get("programa") or "").strip()
+    servs = servicos_da_saida(s)
+    if len(servs) > 1:
+        raise ValueError("a saída RTMP envia um serviço só: escolha apenas um")
+    prog = servs[0] if servs else ""
     if prog and not prog.isdigit():
-        raise ValueError("programa deve ser o número do serviço (ex.: 257) ou vazio")
+        raise ValueError("na saída RTMP informe o número do serviço (ex.: 257), não o nome")
     sel = f"p:{prog}:" if prog else ""
     entrada = (f"udp://127.0.0.1:{porta_entrada or 'PORTA_SAIDA'}?fifo_size=1000000&overrun_nonfatal=1"
                f"&buffer_size=4194304&timeout=10000000")
@@ -439,11 +455,32 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     # e cada saída roda em seu próprio processo (montar_saida), supervisionado separadamente.
     for i, s in enumerate(saidas):
         montar_saida(s, i, tsp_bin)  # valida a configuração de cada saída
-    if so_analise:
+    if so_analise and not porta_dist:
         cmd += ["-O", "drop"]
-    else:
+    else:  # o distribuidor alimenta as saídas e a janela de imagem
         cmd += ["-O", "ip", f"127.0.0.1:{porta_dist or 'PORTA_DIST'}", "--packet-burst", "7"]
     return cmd
+
+
+def servicos_da_saida(s: dict) -> list:
+    """Serviços escolhidos para uma saída (vazio = TS completo). Aceita número (decimal/hex) ou nome."""
+    v = s.get("servicos")
+    if v in (None, "", []):
+        v = [s["programa"]] if str(s.get("programa") or "").strip() else []   # campo antigo do RTMP
+    if isinstance(v, (str, int)):
+        v = [v]
+    out = []
+    for x in v:
+        x = str(x).strip()
+        if not x:
+            continue
+        if len(x) > 64 or not re.match(r"^[\w À-ÿ.+&'()/-]+$", x):
+            raise ValueError(f"serviço inválido: {x!r} (use o número, ex.: 257, ou o nome do serviço)")
+        if x.lower().startswith("0x"):
+            x = str(int(x, 16))
+        if x not in out:
+            out.append(x)
+    return out
 
 
 def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None) -> list:
@@ -453,8 +490,11 @@ def montar_saida(s: dict, indice: int, tsp_bin: str = "tsp", porta_entrada=None)
     cmd = [tsp_bin, "--realtime"]
     if s.get("tipo", "srt") == "srt":
         cmd.append("--verbose")  # mostra "connected to ..." com o endereço do outro lado
-    cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", "4000000",
-            "-P", "bitrate_monitor", "--periodic-bitrate", "2",   # taxa real enviada por esta saída
+    cmd += ["-I", "ip", str(porta_entrada or "PORTA_SAIDA"), "--local-address", "127.0.0.1", "--buffer-size", "4000000"]
+    servs = servicos_da_saida(s)
+    if servs:  # só os serviços escolhidos: zap refaz PAT/PMT/SDT; --ignore-absent não derruba a saída
+        cmd += ["-P", "zap", "--ignore-absent", "--eit"] + servs
+    cmd += ["-P", "bitrate_monitor", "--periodic-bitrate", "2",   # taxa real enviada por esta saída
             "-O"] + _args_saida(s, prefixo=f"SRTOUT{indice}")
     return cmd
 
@@ -1018,6 +1058,16 @@ class AnalisadorTS:
                 "desde": self.desde,
             }
 
+    def servicos_resumo(self):
+        """[{numero, nome, video}] dos serviços presentes na entrada (PAT/PMT/SDT)."""
+        with self.lock:
+            out = []
+            for ppid, num in sorted(self.pmt_pids.items(), key=lambda x: x[1]):
+                sdt = self.servicos_sdt.get(num)
+                out.append({"numero": num, "nome": sdt[0] if sdt and sdt[0] else f"Programa {num}",
+                            "video": any(v[0] == ppid and v[2] == "video" for v in self.es_pids.values())})
+            return out
+
     def _desc_pid(self, pid):
         fixos = {0: "PAT", 1: "CAT", 2: "TSDT", 0x10: "NIT", 0x11: "SDT/BAT", 0x12: "EIT",
                  0x13: "RST", 0x14: "TDT/TOT", 0x1FFF: "Pacotes nulos"}
@@ -1409,6 +1459,124 @@ class ProcSaida(threading.Thread):
                 p.kill()
 
 
+_FFMPEG_RECURSOS = None
+
+
+def recursos_ffmpeg():
+    """Detecta (uma vez) se há ffmpeg e quais opções a versão instalada aceita."""
+    global _FFMPEG_RECURSOS
+    if _FFMPEG_RECURSOS is None:
+        ff = shutil.which("ffmpeg")
+        r = {"ffmpeg": ff, "fps_mode": False, "atomic": False}
+        if ff:
+            try:
+                h = subprocess.run([ff, "-hide_banner", "-h", "full"], capture_output=True, text=True, timeout=15).stdout
+                r["fps_mode"] = "fps_mode" in h
+                m = subprocess.run([ff, "-hide_banner", "-h", "muxer=image2"], capture_output=True, text=True,
+                                   timeout=15).stdout
+                r["atomic"] = "atomic_writing" in m
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _FFMPEG_RECURSOS = r
+    return _FFMPEG_RECURSOS
+
+
+class Previa(threading.Thread):
+    """Janela de imagem: miniatura de cada serviço com vídeo, gerada pelo ffmpeg decodificando
+    só os quadros-chave. Roda só enquanto alguém está olhando (pedidos nos últimos 30 s)."""
+    OCIOSO_S = 30
+    VALIDADE_S = 20
+
+    def __init__(self, canal):
+        super().__init__(daemon=True, name=f"{canal.name}-previa")
+        self.canal = canal
+        self.porta = _porta_udp_livre()
+        self.pasta = tempfile.mkdtemp(prefix="asi2srt-previa-")
+        self.ultimo_pedido = 0.0
+        self.proc = None
+        self.servs = ()
+        self.parar = threading.Event()
+        self.motivo = ""
+        self._proxima = 0.0
+
+    def pedir(self):
+        self.ultimo_pedido = time.monotonic()
+
+    def comando(self, servs):
+        r = recursos_ffmpeg()
+        cmd = [r["ffmpeg"] or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+               "-skip_frame", "nokey", "-fflags", "+discardcorrupt", "-analyzeduration", "4000000",
+               "-probesize", "8000000",
+               "-i", f"udp://127.0.0.1:{self.porta}?fifo_size=1000000&overrun_nonfatal=1&timeout=10000000"]
+        for sid in servs:
+            cmd += ["-map", f"0:p:{sid}:v:0", "-an", "-sn", "-dn", "-vf", "scale=480:-2", "-q:v", "5"]
+            cmd += ["-fps_mode", "vfr"] if r["fps_mode"] else ["-vsync", "vfr"]
+            if r["atomic"]:
+                cmd += ["-atomic_writing", "1"]
+            cmd += ["-update", "1", "-y", os.path.join(self.pasta, f"{sid}.jpg")]
+        return cmd
+
+    def _parar_ffmpeg(self):
+        p = self.proc
+        self.proc = None
+        if p and p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    def run(self):
+        while not self.parar.wait(1):
+            agora = time.monotonic()
+            if agora - self.ultimo_pedido > self.OCIOSO_S:
+                if self.proc:
+                    self._parar_ffmpeg()
+                continue
+            if not recursos_ffmpeg()["ffmpeg"]:
+                self.motivo = "ffmpeg não instalado (sudo apt install ffmpeg)"
+                continue
+            servs = tuple(s["numero"] for s in self.canal.analisador.servicos_resumo() if s["video"])
+            if not servs:
+                self.motivo = "aguardando serviços com vídeo na entrada"
+                continue
+            vivo = self.proc is not None and self.proc.poll() is None
+            if vivo and servs == self.servs:
+                continue
+            if self.proc is not None and not vivo:   # caiu: espera um pouco antes de tentar de novo
+                err = (self.proc.stderr.read() if self.proc.stderr else "") or ""
+                self.motivo = mascarar(err.strip().splitlines()[-1][:200]) if err.strip() else "ffmpeg encerrou"
+                self.proc = None
+                self._proxima = agora + 5
+            if agora < self._proxima:
+                continue
+            self._parar_ffmpeg()
+            self.servs = servs
+            try:
+                self.proc = subprocess.Popen(self.comando(servs), stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                self.motivo = "gerando imagem…"
+            except OSError as e:
+                self.motivo = str(e)
+                self._proxima = agora + 30
+        self._parar_ffmpeg()
+        shutil.rmtree(self.pasta, ignore_errors=True)
+
+    def imagem(self, sid):
+        cam = os.path.join(self.pasta, f"{int(sid)}.jpg")
+        try:
+            if time.time() - os.path.getmtime(cam) > self.VALIDADE_S:
+                return None
+            with open(cam, "rb") as f:
+                d = f.read()
+        except OSError:
+            return None
+        return d if d[:2] == b"\xff\xd8" and d[-2:] == b"\xff\xd9" else None   # JPEG completo
+
+    def encerrar(self):
+        self.parar.set()
+
+
 class Distribuidor:
     """Recebe o TS do processo de entrada e entrega uma cópia a cada saída (UDP local)."""
 
@@ -1465,7 +1633,7 @@ class Canal(threading.Thread):
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
         c0 = normalizar_canal(cfg)
-        self.distribuidor = Distribuidor() if c0["saidas"] else None
+        self.distribuidor = Distribuidor()
         self.cmd = montar_comando(cfg, sup.get("tsp", "tsp"), porta_analise=porta,
                                   porta_dist=self.distribuidor.porta if self.distribuidor else None)
         self.proc = None
@@ -1484,6 +1652,7 @@ class Canal(threading.Thread):
             if s.get("tipo") == "srt":
                 self.srt[f"SRTOUT{i}"] = EstatSRT("saida", s, f"Saída {i + 1}")
         self.procs_saida = [ProcSaida(self, i, s) for i, s in enumerate(c["saidas"])]
+        self.previa = Previa(self)
 
     def srt_status(self):
         rodando = not self.parar.is_set()
@@ -1512,6 +1681,7 @@ class Canal(threading.Thread):
         s["erros_cc"] = s["tr101290"]["contadores"]["cc"]
         s["srt"] = self.srt_status()
         s["saidas"] = [p.status() for p in self.procs_saida]
+        s["servicos"] = self.analisador.servicos_resumo()
         return s
 
     def relatorio(self, motivo):
@@ -1574,9 +1744,10 @@ class Canal(threading.Thread):
         espera_max = self.sup.get("reinicio_max_s", 60)
         espera = espera_min
         if self.distribuidor:
-            self.distribuidor.iniciar([p.porta for p in self.procs_saida])
+            self.distribuidor.iniciar([p.porta for p in self.procs_saida] + [self.previa.porta])
             for p in self.procs_saida:
                 p.start()
+            self.previa.start()
         while not self.parar.is_set():
             self._registrar(logging.INFO, "iniciando: " + comando_para_log(self.cmd))
             with self.analisador.lock:
@@ -1618,6 +1789,7 @@ class Canal(threading.Thread):
                 p.kill()
         for ps in self.procs_saida:
             ps.encerrar()
+        self.previa.encerrar()
         if self.distribuidor:
             self.distribuidor.fechar()
         self.analisador.fechar()
@@ -1689,7 +1861,8 @@ class Gerenciador:
         return {"inicio": rel["inicio"], "fim": rel["fim"], "duracao_s": rel["duracao_s"],
                 "motivo": rel["motivo"], "taxa": rel["taxa"], "totais": rel["totais"],
                 "contadores": a["tr101290"]["contadores"], "n_pids": a["resumo"]["n_pids"],
-                "n_servicos": a["resumo"]["n_servicos"], "servicos": [s["nome"] for s in a["servicos"]]}
+                "n_servicos": a["resumo"]["n_servicos"], "servicos": [s["nome"] for s in a["servicos"]],
+                "servicos_lista": [{"numero": s["numero"], "nome": s["nome"]} for s in a["servicos"]]}
 
     def relatorio_salvo(self, cid, idx=0):
         lista = self.relatorios.get(cid) or []
@@ -2027,6 +2200,22 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar", "zerar"):
                             getattr(ger, acao)(cid)
                             return self._resp(200, {"ok": True})
+                    if len(partes) == 5 and metodo == "GET" and partes[3] == "previa":
+                        t = ger.exec.get(cid)
+                        sid = partes[4].removesuffix(".jpg")
+                        if not t or not sid.isdigit():
+                            return self._resp(404, {"erro": "canal parado"})
+                        t.previa.pedir()
+                        img = t.previa.imagem(sid)
+                        if not img:
+                            return self._resp(404, {"erro": t.previa.motivo or "aguardando imagem"})
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(img)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(img)
+                        return
                 return self._resp(404, {"erro": "rota não encontrada"})
             except ValueError as e:
                 return self._resp(400, {"erro": str(e)})
@@ -2656,6 +2845,20 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .dots small{color:var(--mut);font-size:11px;margin-left:4px}
 .rh .acs{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}.rh .acs button{padding:4px 9px;font-size:12.5px}
 .rl{padding:6px 14px 10px}
+.svs{display:flex;gap:10px;flex-wrap:wrap;padding:8px 0 4px 96px}
+.pv{position:relative;width:176px;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#05070a}
+.pv .im{position:relative;aspect-ratio:16/9;background:#05070a;display:flex;align-items:center;justify-content:center}
+.pv img{width:100%;height:100%;object-fit:contain;display:block}
+.pv .pvm{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:8px;
+ color:var(--mut);font-size:11px;line-height:1.3}
+.pv .pvn{display:flex;gap:6px;align-items:baseline;padding:5px 8px;font-size:12px;background:#11161d;border-top:1px solid var(--line)}
+.pv .pvn b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}.pv .pvn small{color:var(--mut);font-family:ui-monospace,monospace}
+.pv.sai{outline:2px solid #2f81f7;outline-offset:-1px}
+.pv.g{width:240px;flex:none}.serv .sh .pv{margin:-2px 4px -2px -4px}
+.svout{display:inline-flex;align-items:center;gap:6px}.svout img{width:48px;height:27px;object-fit:cover;border-radius:4px;border:1px solid var(--line);background:#05070a}
+.saiem{font-size:12px;color:var(--mut);padding:6px 11px;border-bottom:1px solid var(--line)}.saiem b{color:var(--txt);font-weight:500}
+.servsel{display:flex;flex-wrap:wrap;gap:6px 14px;margin:2px 0 6px}
+@media(max-width:760px){.svs{padding-left:0}.pv{width:calc(50% - 5px)}}
 .ind{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:8px 14px;border-bottom:1px solid #20262f;background:#13181f}
 .ic{display:inline-flex;align-items:center;gap:6px;font-size:12px;background:var(--in);border:1px solid var(--line);border-radius:7px;padding:3px 9px;white-space:nowrap}
 .ic i{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 5px var(--ok)}
@@ -2741,14 +2944,14 @@ const CE={
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],['stream_id','Stream ID','text','']],
  arquivo:[['caminho','Arquivo .ts','text',''],['loop','Repetir em loop','chk',true]]};
 const CS={
- srt:[['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
+ srt:[['servicos','Serviços a enviar','serv',[]],['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
       ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25]],
- udp:[['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']],
- rtp:[['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text',''],
+ udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text','']],
+ rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface_local','IP da interface de saída','text',''],
       ['payload_type','Payload type','number',33],['ssrc','SSRC (opcional)','text','']],
  rtmp:[['url','Servidor (ex.: rtmp://a.rtmp.youtube.com/live2)','text',''],['chave','Chave de transmissão','password',''],['video','Vídeo','sel:copiar,h264','copiar'],['audio','Áudio','sel:aac,copiar','aac'],
-      ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['programa','Programa/serviço (vazio = 1º)','text','']]};
+      ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['servicos','Serviço a enviar (RTMP leva um só)','serv1',[]]]};
 const NOMES_E={srt:'SRT',udp:'UDP / Multicast',dektec:'ASI — placa DekTec',linuxasi:'ASI — driver Linux (DVEO)',arquivo:'Arquivo .ts'};
 
 function resE(e){switch(e.tipo){case'dektec':return`DekTec ${e.dispositivo??0}:${e.canal??0}`;case'linuxasi':return`ASI ${e.dispositivo}`;
@@ -2815,14 +3018,38 @@ function chipsSRT(e){if(e.estado!=='conectado')return'';const lat=e.latencia_ms|
  <span class="chip ${e.retransmitidos?'w':''}"><small>Retrans</small>${e.retransmitidos}/s</span><span class="chip"><small>Taxa</small>${(e.taxa_mbps||0).toFixed(2)} Mb/s</span>
  ${e.banda_mbps?`<span class="chip"><small>Banda</small>${e.banda_mbps} Mb/s</span>`:''}<span class="chip"><small>Buffer</small>${e.buffer_ms} ms</span>`}
 const msgCurta=m=>String(m||'').replace(/^\*\s*(Error|Warning):\s*/i,'').replace(/^srt:\s*/,'').replace(/^\[saída \d+\]\s*/,'').slice(0,90);
-function no(rot,x,e,ativo,ps){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
+function no(rot,x,e,ativo,ps,cid,lista){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=x.tipo==='udp'?'udp':(x.tipo==='dektec'||x.tipo==='linuxasi')?'asi':'';
  const falha=ativo&&ps&&ps.estado!=='rodando'&&ps.ultima_msg&&(!e||e.estado!=='conectado')?`<span class="chip w" title="${esc(ps.ultima_msg)}">⚠ ${esc(msgCurta(ps.ultima_msg))}${ps.reinicios?` · ${ps.reinicios} tentativa(s)`:''}</span>`:'';
  let st;if(e){const tx={conectado:'conectado',aguardando:x.modo==='listener'?'aguardando conexão':'conectando…',parado:'parado'}[e.estado];
   st=`<span class="st ${e.estado}"><i></i>${tx}${e.peer?` · <code>${esc(e.peer)}</code>`:''}${e.estado==='conectado'&&e.conectado_s?` · ${dur(e.conectado_s)}`:''}</span>`}
  else if(ps&&ativo){const ok=ps.estado==='rodando';st=`<span class="st ${ok?'conectado':'aguardando'}"><i></i>${ok?'no ar':({conectando:'iniciando…',reiniciando:'tentando de novo'}[ps.estado]||ps.estado)}${ok&&ps.uptime_s?` · ${dur(ps.uptime_s)}`:''}</span>`}
  else st=`<span class="st ${ativo?'ativo':'parado'}"><i></i>${ativo?'ativo':'parado'}</span>`;
+ const sr=rot.startsWith('Destino')?servRotulo(x,lista):null;
+ const chipServ=rot.startsWith('Destino')?(sr?`<span class="chip svout" title="serviços enviados por este destino">${sr.length===1&&sr[0].video&&PREV[cid+':'+sr[0].numero]&&PREV[cid+':'+sr[0].numero].u?`<img data-prev="${cid}:${sr[0].numero}" src="${PREV[cid+':'+sr[0].numero].u}">`:''}<small>Serviço</small>${esc(sr.map(s=>s.nome).join(', '))}</span>`
+  :`<span class="chip"><small>Serviços</small>todos (TS completo)</span>`):'';
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxt(x))}</code></span>
- <span class="chips">${st}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
+ <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
+const PREV={};let prevAlvos=new Set();
+function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
+ const msg=!s.video?'♪ sem vídeo':p.u?'':esc(p.erro||'carregando imagem…');
+ if(s.video)prevAlvos.add(k);
+ return`<div class="pv ${cls||''}" title="${esc(s.nome)} · serviço ${s.numero}"><div class="im">${s.video?`<img data-prev="${k}" ${p.u?`src="${p.u}"`:'hidden'} alt="">`:''}
+ <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b><small>${s.numero}</small></div></div>`}
+let prevOcupado=false;
+async function atualizarPrevias(){if(prevOcupado||document.hidden)return;prevOcupado=true;
+ try{for(const k of [...prevAlvos]){const [cid,sid]=k.split(':');
+  try{const r=await fetch(`/api/canais/${cid}/previa/${sid}.jpg`,{cache:'no-store'});
+   if(r.ok){const u=URL.createObjectURL(await r.blob()),old=PREV[k];PREV[k]={u};
+    document.querySelectorAll(`img[data-prev="${k}"]`).forEach(i=>{i.src=u;i.hidden=false});
+    document.querySelectorAll(`[data-prevmsg="${k}"]`).forEach(m=>m.hidden=true);
+    if(old&&old.u)setTimeout(()=>URL.revokeObjectURL(old.u),5000)}
+   else{const j=await r.json().catch(()=>({}));if(!(PREV[k]||{}).u){PREV[k]={erro:j.erro||'sem imagem'};
+    document.querySelectorAll(`[data-prevmsg="${k}"]`).forEach(m=>m.textContent=PREV[k].erro)}}}catch(e){}}}
+ finally{prevOcupado=false}}
+setInterval(atualizarPrevias,3000);
+function servRotulo(x,lista){const sv=x.servicos||(x.programa?[x.programa]:[]);if(!sv.length)return null;
+ return sv.map(v=>{const n=(lista||[]).find(s=>String(s.numero)===String(v)||s.nome.toLowerCase().replace(/\s/g,'')===String(v).toLowerCase().replace(/\s/g,''));
+  return n?{numero:n.numero,nome:n.nome,video:n.video}:{numero:v,nome:String(v),video:false}})}
 const IND=[['sync_loss','TS sync loss'],['cc','Continuity count'],['pcr_rep','PCR repetition'],['pcr_disc','PCR discontinuity'],['pts','PTS error']];
 function indicadores(t,r){const cont=t?t.contadores:r?r.contadores:null;if(!cont)return'';const rec=t?t.recentes||[]:[];
  const desc=Object.fromEntries(TRI.map(x=>[x[0],x[2]+' '+x[4]]));
@@ -2836,15 +3063,17 @@ function linha(c){const s=c.status||{},ativo=s.estado!=='parado',srt=s.srt||{},t
  const acs=(ativo?`<button data-a="parar" data-id="${c.id}">■ Parar</button><button data-a="reiniciar" data-id="${c.id}">↻</button><button data-a="analise" data-id="${c.id}">Análise</button>`
   :`<button class="ok" data-a="iniciar" data-id="${c.id}">▶ Iniciar</button>${r?`<button data-a="analise" data-id="${c.id}">Relatório</button>`:''}`)
   +`<button data-a="editar" data-id="${c.id}">Editar</button><button data-a="log" data-id="${c.id}">Log</button><button class="perigo" data-a="excluir" data-id="${c.id}">✕</button>`;
- const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i])).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
+ const destinos=c.saidas.length?c.saidas.map((x,i)=>no('Destino '+(i+1),x,srt['SRTOUT'+i],ativo,(s.saidas||[])[i],c.id,s.servicos)).join(''):'<div class="no"><span class="pp">Destino</span><span class="ed" style="color:var(--mut)">somente análise</span><span></span><span></span></div>';
  return`<div class="rota e-${esc(s.estado)}"><div class="rh"><b class="rn" data-ana="${c.id}">${esc(c.nome)}</b><span class="pill ${esc(s.estado)}">${esc((s.estado||'').replace('_',' '))}</span>
  ${dots}<span class="rb">${ativo?`${mb(s.bitrate_bps||0)} <small>Mb/s</small>`:r?`<small>méd.</small> ${mb(r.taxa.media)} <small>Mb/s</small>`:''}</span><span class="acs">${acs}</span></div>
  ${indicadores(ativo?t:null,ativo?null:r)}
- <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}${destinos}
+ <div class="rl">${no('Origem',c.entrada,srt.SRTIN,ativo)}
+ ${ativo&&(s.servicos||[]).length?`<div class="svs">${s.servicos.map(sv=>{const sai=c.saidas.some(x=>{const r=servRotulo(x,s.servicos);return !r||r.some(q=>String(q.numero)===String(sv.numero))});
+   return prevBox(c.id,sv,sai&&c.saidas.length?'sai':'')}).join('')}</div>`:''}${destinos}
  ${!ativo&&r?`<div class="rrel">Última análise ${esc(MOTIVO[r.motivo]||r.motivo)}: <b>${fmtDH(r.inicio)} → ${fmtH(r.fim)}</b> · ${dur(r.duracao_s)} · ${r.n_servicos} serviço(s)${r.servicos.length?': '+esc(r.servicos.join(', ')):''}</div>`:''}
  ${ativo&&s.estado!=='rodando'&&s.ultima_msg?`<div class="rrel" style="color:var(--warn)">${esc(s.ultima_msg)}</div>`:''}</div></div>`}
 document.addEventListener('click',e=>{const b=e.target.closest('[data-vis]');if(!b)return;VIS=b.dataset.vis;try{localStorage.setItem('asi2srt.vis',VIS)}catch(x){}render()});
-function render(){if(anaId)return;document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
+function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
  $('#grid').className=VIS==='rotas'?'rotas':'grid';
  $('#grid').innerHTML=dados.length?dados.map(VIS==='rotas'?linha:card).join(''):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri" onclick="abrir()">+ Criar o primeiro canal</button></div>';
@@ -2854,7 +3083,17 @@ function render(){if(anaId)return;document.querySelectorAll('[data-vis]').forEac
 async function atualizar(){try{dados=await api('GET','/api/canais');render()}catch(e){}}
 
 // ---------- formulário ----------
-function campo(pref,[k,rot,t,pad],obj){const v=obj[k]??pad,n=`${pref}${k}`;
+let servConhecidos=[];
+function campoServ(n,rot,t,v){const sel=(Array.isArray(v)?v:(v||v===0?[v]:[])).map(String),um=t==='serv1';
+ const lista=servConhecidos,outros=sel.filter(x=>!lista.some(s=>String(s.numero)===x));
+ const op=lista.map(s=>`<label class="chk"><input type="${um?'radio':'checkbox'}" name="${n}.cb" value="${s.numero}" ${sel.includes(String(s.numero))?'checked':''}> ${esc(s.nome)} <small style="color:var(--mut)">${s.numero}</small></label>`).join('');
+ return`<div style="grid-column:1/-1"><div style="font-size:12px;color:var(--mut);margin-bottom:4px">${rot}</div>
+ <div class="servsel">${um?`<label class="chk"><input type="radio" name="${n}.cb" value="" ${sel.length?'':'checked'}> o primeiro do TS</label>`
+  :`<span style="font-size:12.5px;color:var(--mut)">${sel.length?'':'nenhum marcado = TS completo'}</span>`}${op}</div>
+ ${lista.length?'':`<p class="msg" style="white-space:normal;margin:0 0 6px">Os serviços da entrada aparecem aqui depois que o canal recebe sinal.</p>`}
+ <label>${lista.length?'Outros (número ou nome, separados por vírgula)':'Número ou nome do serviço (separe por vírgula)'}<input name="${n}.txt" value="${esc(outros.join(', '))}" placeholder="ex.: 257"></label></div>`}
+function campo(pref,[k,rot,t,pad],obj){const v=obj[k]??(k==='servicos'&&obj.programa?[obj.programa]:pad),n=`${pref}${k}`;
+ if(t==='serv'||t==='serv1')return campoServ(n,rot,t,v);
  if(t==='chk')return`<label class="chk"><input type="checkbox" name="${n}" ${v?'checked':''}> ${rot}</label>`;
  if(t.startsWith('sel:'))return`<label>${rot}<select name="${n}">${t.slice(4).split(',').map(o=>`<option ${String(v)===o?'selected':''}>${o}</option>`).join('')}</select></label>`;
  return`<label>${rot}<input type="${t}" name="${n}" value="${esc(v)}" ${t==='password'?'autocomplete="new-password"':''}></label>`}
@@ -2893,10 +3132,14 @@ function coletar(){const f=$('#frm'),c=editando,g=n=>f.elements[n];
  c.processamento={...(c.processamento||{}),remover_nulos:g('p.remover_nulos').checked,analise_tr101290:g('p.analise_tr101290').checked,
   remover_pids:g('p.remover_pids').value.split(/[,\s]+/).filter(Boolean),
   bitrate_min:Math.round(Number(g('p.bitrate_min').value||0)*1e6),bitrate_max:Math.round(Number(g('p.bitrate_max').value||0)*1e6)};
- c.saidas=c.saidas.map((s,i)=>{const o={tipo:s.tipo};CS[s.tipo].forEach(([k,,t])=>{const v=val(g(`s.${i}.${k}`),t);
+ c.saidas=c.saidas.map((s,i)=>{const o={tipo:s.tipo};CS[s.tipo].forEach(([k,,t])=>{
+  if(t==='serv'||t==='serv1'){const n=`s.${i}.${k}`,cb=[...f.querySelectorAll(`[name="${n}.cb"]:checked`)].map(x=>x.value).filter(Boolean),
+   tx=((f.elements[n+'.txt']||{}).value||'').split(',').map(x=>x.trim()).filter(Boolean);o[k]=[...new Set([...cb,...tx])];if(t==='serv1')o[k]=o[k].slice(0,1);return}
+  const v=val(g(`s.${i}.${k}`),t);
   if(v!==undefined)o[k]=t.startsWith('sel:')&&/^\d+$/.test(v)?Number(v):v});return o})}
 
 function abrir(id){const c=id?dados.find(x=>x.id===id):null;
+ servConhecidos=(c&&c.status&&(c.status.servicos||[]).length?c.status.servicos:(c&&c.ultimo_relatorio&&c.ultimo_relatorio.servicos_lista)||[]);
  editando=c?JSON.parse(JSON.stringify(c)):{nome:'Novo canal',ativo:true,entrada:{tipo:'srt',modo:'caller'},
   processamento:{remover_nulos:true,analise_tr101290:true,intervalo_relatorio_s:5},saidas:[]};
  delete editando.status;$('#dtit').textContent=c?'Editar canal':'Novo canal';desenhar();$('#dlg').showModal()}
@@ -2987,12 +3230,17 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   <div class="sk">${k}</div>${g?`<div class="g">${g}</div>`:''}</div>`}).join('');
  // serviços
  $('#anserv').textContent=a.servicos.length+' serviço(s)';
- $('#aserv').innerHTML=a.servicos.map(s=>`<div class="serv"><div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
+ prevAlvos=new Set();const chA=dados.find(x=>x.id===anaId)||{},cfgA=a.saidas_cfg||chA.saidas||[];
+ $('#aserv').innerHTML=a.servicos.map(s=>{const vid=s.componentes.some(c=>c.tipo==='video');
+  const dest=cfgA.map((x,i)=>{const r=servRotulo(x,a.servicos.map(q=>({numero:q.numero,nome:q.nome})));return(!r||r.some(q=>String(q.numero)===String(s.numero)))?`<b>Destino ${i+1}</b> (${esc(resS(x))})`:null}).filter(Boolean);
+  return`<div class="serv">${!a.salvo&&vid?`<div style="display:flex;gap:12px;padding:10px 11px 0">${prevBox(anaId,{numero:s.numero,nome:s.nome,video:true},'g')}</div>`:''}
+  <div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
   ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}<span class="tx">${fmtR(s.taxa)}</span></div>
+  ${cfgA.length?`<div class="saiem">${dest.length?'Sai em: '+dest.join(' · '):'Não sai em nenhum destino'}</div>`:''}
   <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span><span>PCR <b>${s.pcr_pid||'—'}</b></span>
   ${s.pcr?`<span>Intervalo PCR <b>${s.pcr.intervalo_ms} ms</b></span><span>Jitter PCR <b>${s.pcr.jitter_ns} ns</b></span>`:''}</div>
   <div class="tabw"><table class="t"><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>
-  ${s.componentes.map(c=>`<tr><td class="mono">${c.hex}</td><td>${esc(c.desc)}${c.emb?' <span class="badge r">emb</span>':''}</td><td class="mono">${c.stream_type}</td><td class="n">${fmtR(c.taxa)}</td></tr>`).join('')}</table></div></div>`).join('')
+  ${s.componentes.map(c=>`<tr><td class="mono">${c.hex}</td><td>${esc(c.desc)}${c.emb?' <span class="badge r">emb</span>':''}</td><td class="mono">${c.stream_type}</td><td class="n">${fmtR(c.taxa)}</td></tr>`).join('')}</table></div></div>`}).join('')
   ||'<div class="msg">nenhum serviço (aguardando PAT/PMT)</div>';
  rPids()}
 const COLS=[['pid','PID',1],['pid','Dec',1],['desc','Descrição'],['servico','Serviço'],['taxa','Bitrate',1],['pct','%',1],['pacotes','Pacotes',1],['cc','Erros CC',1],['f','Flags']];

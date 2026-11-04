@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -602,7 +603,8 @@ def test_saida_rtmp_comando_e_chave_mascarada():
     ({"tipo": "rtmp", "url": "http://x/y"}, "URL completa"),
     ({"tipo": "rtmp", "url": "rtmp://servidor"}, "URL completa"),
     ({"tipo": "rtmp", "url": "rtmp://s/app/k", "video": "hevc"}, "copiar"),
-    ({"tipo": "rtmp", "url": "rtmp://s/app/k", "programa": "abc"}, "programa"),
+    ({"tipo": "rtmp", "url": "rtmp://s/app/k", "programa": "abc"}, "número do serviço"),
+    ({"tipo": "rtmp", "url": "rtmp://s/app/k", "servicos": ["257", "258"]}, "um serviço só"),
 ])
 def test_saida_rtmp_validacao(cfg, erro):
     with pytest.raises(ValueError, match=erro):
@@ -753,3 +755,97 @@ def test_logo_padrao_junto_da_configuracao():
     assert g.logo_arquivo().endswith("logo-painel.png") and g.aparencia()["logo"] is True
     g.sup["logo"] = "-"
     assert g.logo_arquivo() is None
+
+
+
+# ---------------- seleção de serviços por saída ----------------
+def test_saida_com_servicos_usa_zap():
+    s = a.saida_de_url("srt://172.22.130.200:9090?servico=257,0x103")
+    assert s["servicos"] == ["257", "0x103"]
+    cmd = a.montar_saida(s, 0, porta_entrada=42000)
+    i = cmd.index("zap")
+    assert cmd[i:i + 5] == ["zap", "--ignore-absent", "--eit", "257", "259"]
+    assert i < cmd.index("bitrate_monitor") < cmd.index("-O")
+    todos = a.montar_saida(a.saida_de_url("udp://239.1.1.1:1234"), 0)
+    assert "zap" not in todos                                   # sem escolha = TS completo
+    por_nome = a.montar_saida({"tipo": "udp", "endereco": "239.1.1.1:1", "servicos": ["REDE ALESP HD"]}, 0)
+    assert por_nome[por_nome.index("zap") + 3] == "REDE ALESP HD"
+    with pytest.raises(ValueError, match="serviço inválido"):
+        a.montar_saida({"tipo": "udp", "endereco": "239.1.1.1:1", "servicos": ["; rm -rf /"]}, 0)
+
+
+def test_rtmp_com_servico_e_url_limpa():
+    s = a.saida_de_url("rtmp://servidor/live/chave?servico=258")
+    assert s["url"] == "rtmp://servidor/live/chave" and s["servicos"] == ["258"]
+    cmd = a.montar_saida(s, 0)
+    assert "0:p:258:v:0" in cmd and cmd[-1] == "rtmp://servidor/live/chave"
+
+
+def test_opcoes_zap_existem_no_tsduck():
+    OPCOES_TSDUCK["zap"] = {"--ignore-absent", "--eit"}
+    _verificar_opcoes(a.montar_saida({"tipo": "srt", "modo": "caller", "endereco": "h:1", "servicos": ["257"]}, 0,
+                                     porta_entrada=42000))
+
+
+def test_canal_so_analise_alimenta_distribuidor():
+    cmd = a.montar_comando({"entrada": a.entrada_de_texto("srt://h:6001"), "saidas": []}, porta_dist=41000)
+    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", "7"] and "filter" not in cmd
+
+
+# ---------------- janela de imagem (miniatura por serviço) ----------------
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="precisa do ffmpeg")
+def test_previa_gera_miniatura_por_servico():
+    import socket
+    d = tempfile.mkdtemp()
+    ts = os.path.join(d, "mpts.ts")
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25",
+                    "-f", "lavfi", "-i", "smptehdbars=size=640x360:rate=25", "-t", "10",
+                    "-map", "0:v", "-map", "1:v", "-c:v", "libx264", "-preset", "ultrafast", "-g", "25",
+                    "-program", "program_num=257:st=0", "-program", "program_num=258:st=1",
+                    "-f", "mpegts", ts], check=True)
+
+    class AnalisadorFalso:
+        def servicos_resumo(self):
+            return [{"numero": 257, "nome": "TV1", "video": True}, {"numero": 258, "nome": "TV2", "video": True},
+                    {"numero": 300, "nome": "Rádio", "video": False}]
+
+    class CanalFalso:
+        name = "teste"
+        analisador = AnalisadorFalso()
+
+    pv = a.Previa(CanalFalso())
+    assert pv.imagem(257) is None
+    pv.pedir()
+    pv.start()
+    parar = threading.Event()
+
+    def enviar():
+        dados = open(ts, "rb").read()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        t0, n = time.time(), 0
+        while not parar.is_set():
+            for i in range(0, len(dados) - 1316, 1316):
+                if parar.is_set():
+                    break
+                s.sendto(dados[i:i + 1316], ("127.0.0.1", pv.porta))
+                n += 1316
+                w = n / 400000 - (time.time() - t0)
+                if w > 0:
+                    time.sleep(w)
+
+    th = threading.Thread(target=enviar, daemon=True)
+    th.start()
+    try:
+        for _ in range(40):
+            time.sleep(0.5)
+            if pv.imagem(257) and pv.imagem(258):
+                break
+        img = pv.imagem(257)
+        assert img and img[:2] == b"\xff\xd8" and pv.imagem(258)
+        assert pv.servs == (257, 258)                         # rádio (sem vídeo) fica de fora
+        cmd = " ".join(pv.comando(pv.servs))
+        assert "-skip_frame nokey" in cmd                      # decodifica só quadros-chave
+    finally:
+        parar.set()
+        pv.encerrar()
+        pv.join(10)

@@ -174,6 +174,18 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+## Serviços e janela de imagem
+
+- **Escolher o serviço de cada saída:** no formulário, cada destino lista os serviços que estão
+  chegando na entrada (caixas de seleção). Nenhum marcado = TS completo. Com serviços marcados, o
+  TSDuck (`zap --ignore-absent`) refaz PAT/PMT/SDT só com eles; se o serviço sumir por um momento,
+  a saída continua e volta sozinha. Na saída RTMP vai um serviço só. Linha de comando: `?servico=257,258`.
+- **Janela de imagem:** a rota mostra uma miniatura ao vivo de cada serviço que entra (contorno azul =
+  serviço que está saindo em algum destino) e cada destino mostra o serviço que envia. Na tela de
+  análise cada serviço tem sua janela e a lista "Sai em" com os destinos que o levam.
+  As imagens são geradas pelo ffmpeg decodificando **só os quadros-chave** (cerca de 6% de um núcleo
+  para dois serviços HD) e só enquanto alguém está com o painel aberto.
+
 ## Análise do TS (estilo analisador profissional)
 
 Cada canal analisa o TS **logo depois da entrada**, antes de qualquer filtro. No card aparecem as
@@ -317,7 +329,7 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.11.2 && git push origin v2.11.2
+git tag v2.12.0 && git push origin v2.12.0
 ```
 
 ## Licença
