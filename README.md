@@ -233,6 +233,21 @@ Cada entrada (UDP/SRT) e cada saída (SRT/UDP/RTP) pode ter uma **placa reserva*
 - Alternativa no sistema operacional: *bonding* `active-backup` (duas portas no mesmo switch viram uma
   placa só). Funciona junto, mas só cobre falha de link na mesma rede.
 
+### Comparar sinais
+
+O botão **Comparar** (ao lado de Rotas, Lista e Cards) põe até 6 sinais lado a lado. Clique nos nomes
+para escolher quais entram (rodando = dados ao vivo; parado = última sessão salva).
+
+- **Resumo:** taxa útil, CBR/VBR, nº de serviços e PIDs, total de erros CC e de cada prioridade TR 101 290.
+- **Serviços:** cada serviço (pelo número) com bitrate e erros CC em cada sinal; `ausente` quando
+  um sinal não tem aquele serviço, `≠` quando o nome muda.
+- **PIDs:** Dec, Hex, Descrição e Serviço, com **Erros CC** e bitrate de cada sinal. Linha com
+  barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
+- Filtros **Só diferenças** e **Só com erros CC**, e **Baixar CSV** (abre no Excel).
+
+PIDs fixos do **ISDB-Tb** (0x20 a 0x2F: BIT, SDTT, CDT, EIT M/L etc.) são reconhecidos pelo nome e não
+contam mais como "PID não referenciado".
+
 ### Muitos sinais: visão compacta e Lista
 
 - **Rotas** (padrão compacto): os indicadores TR 101 290 ficam numa linha só por canal, mostrando
@@ -465,7 +480,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.21.1 && git push origin v2.17.1
+git tag v2.22.0 && git push origin v2.17.1
 ```
 
 ## Licença

@@ -385,3 +385,12 @@ def test_cbr_pelo_pcr_mesmo_com_chegada_irregular():
     fluxo(an2, g2, [random.choice([60, 120, 180, 260]) for _ in range(1500)])
     m2 = an2.taxas()["modo_ts"]
     assert m2["fonte"] == "PCR" and m2["modo"] == "VBR", m2
+
+
+def test_pids_isdb_nao_sao_nao_referenciados():
+    an = AnalisadorTS()
+    for pid, nome in ((0x24, "BIT"), (0x27, "EIT"), (0x23, "SDTT"), (0x29, "CDT")):
+        desc, tipo = an._desc_pid(pid)
+        assert nome in desc and "ISDB" in desc and tipo == "psi"
+        assert pid in an._referenciados()
+    assert an._desc_pid(0x0500)[0] == "Não referenciado"

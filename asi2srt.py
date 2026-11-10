@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.21.1"
+__version__ = "2.22.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1046,6 +1046,10 @@ def _texto_dvb(b: bytes) -> str:
     return "".join(ch for ch in s if ch >= " ").strip()
 
 
+# PIDs fixos do ISDB-T/ISDB-Tb (ARIB STD-B10 / ABNT NBR 15603): não são "não referenciados"
+PIDS_ISDB = {0x20: "LIT (ISDB)", 0x21: "ERT (ISDB)", 0x22: "PCAT (ISDB)", 0x23: "SDTT (ISDB)",
+             0x24: "BIT (ISDB)", 0x25: "NBIT/LDT (ISDB)", 0x26: "EIT (ISDB, M-EIT)", 0x27: "EIT (ISDB, L-EIT)",
+             0x28: "SDTT (ISDB)", 0x29: "CDT (ISDB)", 0x2F: "Cabeçalho multiframe (ISDB)"}
 LIMITE_CBR_TS_PCT = 2.0       # TS: taxa total variando menos que isso = CBR
 LIMITE_CBR_SERVICO_PCT = 3.0  # serviço: encoder CBR de verdade fica abaixo de ~3% (janelas de 1 s, pelo PCR)
 
@@ -1565,7 +1569,7 @@ class AnalisadorTS:
                     self._erro("unref", agora)
 
     def _referenciados(self):
-        refs = set(range(0x20)) | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
+        refs = set(range(0x20)) | set(PIDS_ISDB) | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
         refs |= {p["pcr_pid"] for p in self.programas.values()}
         return refs
 
@@ -1659,6 +1663,8 @@ class AnalisadorTS:
             return "ECM/EMM (acesso condicional)", "ca"
         if pid in {p["pcr_pid"] for p in self.programas.values()}:
             return "PCR", "pcr"
+        if pid in PIDS_ISDB:
+            return PIDS_ISDB[pid], "psi"
         if pid < 0x20:
             return "SI reservado", "psi"
         return "Não referenciado", "desconhecido"
@@ -4770,6 +4776,24 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .indc .ic{padding:1px 7px;font-size:11.5px}.indc .sub{color:var(--mut);font-size:11px}
 .bx{padding:4px 8px!important;font-size:12px!important;min-width:30px}
 /* visão Lista: uma linha por sinal */
+/* comparação de sinais */
+.cmpb{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.cmpb .lb{font-size:12px;color:var(--mut);margin-right:2px}
+.cmpb button.sel{display:inline-flex;align-items:center;gap:6px}.cmpb button.sel i{width:8px;height:8px;border-radius:50%;background:#484f58}
+.cmpb button.sel i.on{background:var(--ok)}.cmpb button.sel.on{border-color:var(--acc);background:#1f6feb26;color:#cfe3ff}
+.cmpb .sp{flex:1}
+.cmp{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:auto;margin-bottom:12px}
+.cmp h3{margin:0;padding:10px 12px 8px;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut);border-bottom:1px solid var(--line);
+ display:flex;gap:10px;align-items:baseline}.cmp h3 small{text-transform:none;letter-spacing:0;font-weight:400}
+.cmp table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+.cmp th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;padding:7px 10px;border-bottom:1px solid var(--line);background:#13181f;position:sticky;top:0;white-space:nowrap}
+.cmp th.cn{color:var(--txt);font-size:12px;font-weight:600;border-left:1px solid var(--line);text-align:center}
+.cmp td{padding:5px 10px;border-bottom:1px solid #1c222a;white-space:nowrap}.cmp td.c{border-left:1px solid #1c222a;text-align:center}
+.cmp td.n,.cmp th.n{text-align:right}.cmp tr:last-child td{border-bottom:0}.cmp tr:hover td{background:#ffffff05}
+.cmp tr.dif td:first-child{box-shadow:inset 3px 0 0 var(--warn)}.cmp tr.err td:first-child{box-shadow:inset 3px 0 0 var(--err)}
+.cmp .aus{color:var(--warn);font-size:11.5px}.cmp .cce{color:#ff8f8a;font-weight:700}.cmp .cc0{color:var(--mut)}
+.cmp .sm{color:var(--mut);font-size:11px;margin-left:6px}.cmp .neq{color:var(--warn);font-weight:700;margin-left:4px;cursor:help}
+.cmp .vazio{padding:18px;color:var(--mut);text-align:center}
 .lista{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:auto}
 .lista table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
 .lista th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.04em;padding:8px 10px;
@@ -4870,7 +4894,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
-<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button></div>
+<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button><button data-vis="comparar" title="comparar serviços e PIDs de vários sinais">Comparar</button></div>
 <button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
@@ -5155,9 +5179,76 @@ function linhaLista(c){const s=c.status||{},ativo=s.estado!=='parado',t=s.tr1012
  <td><div class="acs">${acs}</div></td></tr>`}
 function lista(){return`<div class="lista"><table><tr><th></th><th>Canal</th><th>Estado</th><th class="n">Taxa útil</th><th>Tipo</th>
  <th class="n" title="TR 101 290 prioridade 1">P1</th><th class="n" title="prioridade 2">P2</th><th class="n" title="prioridade 3">P3</th><th>Entrada</th><th>Saídas</th><th></th></tr>${dados.map(linhaLista).join('')}</table></div>`}
+// ---------- comparação de sinais ----------
+let CMP_SEL=null,CMP_DADOS={},CMP_SO_DIF=false,CMP_SO_ERR=false,CMP_ULT=0;
+try{const v=JSON.parse(localStorage.getItem('asi2srt.cmp')||'null');if(Array.isArray(v))CMP_SEL=new Set(v)}catch(e){}
+function cmpSalvar(){try{localStorage.setItem('asi2srt.cmp',JSON.stringify([...CMP_SEL]))}catch(e){}}
+function cmpIniciar(){if(!CMP_SEL){CMP_SEL=new Set(dados.filter(c=>(c.status||{}).estado!=='parado').slice(0,3).map(c=>c.id));
+  if(CMP_SEL.size<2)dados.slice(0,2).forEach(c=>CMP_SEL.add(c.id))}
+ [...CMP_SEL].forEach(id=>{if(!dados.some(c=>c.id===id))CMP_SEL.delete(id)})}
+async function cmpBuscar(){if(VIS!=='comparar'||anaId||!CMP_SEL)return;CMP_ULT=Date.now();
+ await Promise.all([...CMP_SEL].map(async id=>{try{const r=await fetch(`/api/canais/${id}/analise`,{headers:H});
+   if(r.status===401){irLogin();return}const j=await r.json().catch(()=>({}));CMP_DADOS[id]=r.ok?j:{erro:j.erro||'sem dados'}}catch(e){CMP_DADOS[id]={erro:'sem conexão'}}}));
+ render()}
+const ccServ=(a,sv)=>(sv.componentes||[]).reduce((s,c)=>s+(((a.pids||[]).find(p=>p.pid===c.pid)||{}).cc||0),0);
+function comparar(){cmpIniciar();const sel=dados.filter(c=>CMP_SEL.has(c.id)),A=sel.map(c=>CMP_DADOS[c.id]||{carregando:true});
+ const OK=A.map(a=>!a.erro&&!a.carregando),semd=i=>`<span class="sm" title="${esc(A[i].erro||'carregando')}">${A[i].carregando?'…':'sem dados'}</span>`;
+ const chips=dados.map(c=>{const on=CMP_SEL.has(c.id),viv=(c.status||{}).estado!=='parado';
+  return`<button class="sel ${on?'on':''}" data-cmp="${c.id}" title="${viv?'rodando: dados ao vivo':'parado: última sessão salva'}"><i class="${viv?'on':''}"></i>${esc(c.nome)}</button>`}).join('');
+ const barra=`<div class="cmpb"><span class="lb">Sinais:</span>${chips}<span class="sp"></span>
+  <button data-cmpf="dif" class="${CMP_SO_DIF?'on':''}" title="mostrar só linhas que diferem entre os sinais">Só diferenças</button>
+  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button>
+  <button data-cmpf="csv">Baixar CSV</button></div>`;
+ if(sel.length<2)return barra+`<div class="cmp"><div class="vazio">Escolha pelo menos 2 sinais acima para comparar.</div></div>`;
+ const cab=sel.map((c,i)=>{const a=A[i];return`<th class="cn" title="${a.salvo?'última sessão salva':a.erro?esc(a.erro):'ao vivo'}">${esc(c.nome)}${a.salvo?' <span class="sm">(salvo)</span>':''}</th>`}).join('');
+ // resumo
+ const tot=a=>a&&a.tr101290?Object.values(a.tr101290.contadores||{}).reduce((x,y)=>x+y,0):null;
+ const prio=(a,p)=>{const c=a&&a.tr101290&&a.tr101290.contadores;return c&&TRI.length?TRI.filter(x=>x[1]===p).reduce((s,[k])=>s+(c[k]||0),0):null};
+ const ccTot=a=>(a.pids||[]).reduce((s,p)=>s+(p.cc||0),0);
+ const lin=(rot,f,cls='')=>`<tr><td>${rot}</td>${A.map(a=>`<td class="c ${cls}">${a.erro?'<span class="aus">'+esc(a.erro)+'</span>':a.carregando?'…':f(a)}</td>`).join('')}</tr>`;
+ const num=v=>v==null?'—':v.toLocaleString('pt-BR'),cor=v=>v?`<span class="cce">${num(v)}</span>`:`<span class="cc0">0</span>`;
+ const resumo=`<div class="cmp"><h3>Resumo</h3><table><tr><th></th>${cab}</tr>
+  ${lin('Taxa útil',a=>{const r=a.resumo||{};return r.taxa_util!=null?mb(r.taxa_util)+' Mb/s':'—'})}
+  ${lin('Tipo do TS',a=>{const m=(a.resumo||{}).modo_taxa;return m&&m.modo?seloModo(m,true):'—'})}
+  ${lin('Serviços',a=>num((a.servicos||[]).length))}${lin('PIDs',a=>num((a.pids||[]).length))}
+  ${lin('Erros CC (total)',a=>cor(ccTot(a)))}${lin('TR 101 290 · P1',a=>cor(prio(a,1)))}${lin('TR 101 290 · P2',a=>cor(prio(a,2)))}${lin('TR 101 290 · P3',a=>cor(prio(a,3)))}
+ </table></div>`;
+ // serviços
+ const nums=[...new Set(A.flatMap(a=>(a.servicos||[]).map(s=>s.numero)))].sort((x,y)=>x-y);
+ let ls=nums.map(n=>{const ss=A.map(a=>(a.servicos||[]).find(s=>s.numero===n));const nomes=new Set(ss.filter(Boolean).map(s=>s.nome));
+  const dif=ss.some((s,i)=>!s&&OK[i])||nomes.size>1,ccs=ss.map((s,i)=>s?ccServ(A[i],s):0),err=ccs.some(x=>x);
+  return{dif,err,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${n}</td><td>${esc((ss.find(Boolean)||{}).nome||'')}${nomes.size>1?`<span class="neq" title="nome diferente entre os sinais">≠</span>`:''}</td>
+  ${ss.map((s,i)=>`<td class="c">${!OK[i]?semd(i):s?`${nomes.size>1?esc(s.nome)+' · ':''}${mb(s.taxa)} Mb/s <span class="sm">CC</span> ${cor(ccs[i])}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+ if(CMP_SO_DIF)ls=ls.filter(x=>x.dif);if(CMP_SO_ERR)ls=ls.filter(x=>x.err);
+ const servs=`<div class="cmp"><h3>Serviços <small>${nums.length} no total · bitrate e erros CC de cada sinal</small></h3><table><tr><th class="n">Nº</th><th>Serviço</th>${cab}</tr>
+  ${ls.map(x=>x.html).join('')||`<tr><td colspan="${2+sel.length}" class="vazio">nenhum serviço ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
+ // PIDs
+ const pids=[...new Set(A.flatMap(a=>(a.pids||[]).map(p=>p.pid)))].sort((x,y)=>x-y);
+ let lp=pids.map(pid=>{const ps=A.map(a=>(a.pids||[]).find(p=>p.pid===pid));const um=ps.find(Boolean)||{};
+  const descs=new Set(ps.filter(Boolean).map(p=>p.desc)),servs=new Set(ps.filter(Boolean).map(p=>p.servico||''));
+  const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||servs.size>1,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
+  return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
+  <td style="${desc?'color:#ff8f8a':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
+  <td>${esc(um.servico||'')}${servs.size>1?`<span class="neq" title="${esc([...servs].join(' / '))}">≠</span>`:''}</td>
+  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+ if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);
+ window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`;
+  const L=[['Dec','Hex','Descrição','Serviço',...sel.flatMap(c=>[c.nome+' - Erros CC',c.nome+' - Bitrate (b/s)'])].map(q).join(';')];
+  lp.forEach(x=>L.push([x.pid,x.um.hex,x.um.desc,x.um.servico,...x.ps.flatMap((p,i)=>!OK[i]?['sem dados','']:p?[p.cc,Math.round(p.taxa||0)]:['ausente',''])].map(q).join(';')));
+  const b=new Blob(['﻿'+L.join('\r\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(b),el=document.createElement('a');
+  el.href=u;el.download='comparacao-pids-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),2000)};
+ const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total · erros de continuidade (CC) e bitrate em cada sinal · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
+  <table><tr><th class="n">Dec</th><th>Hex</th><th>Descrição</th><th>Serviço</th>${cab}</tr>
+  ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+sel.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
+ return barra+resumo+servs+tabp}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-cmp],[data-cmpf]');if(!b)return;
+ if(b.dataset.cmp){const id=b.dataset.cmp;if(CMP_SEL.has(id))CMP_SEL.delete(id);else if(CMP_SEL.size>=6){toast('Compare até 6 sinais por vez');return}else CMP_SEL.add(id);cmpSalvar();render();cmpBuscar();return}
+ const f=b.dataset.cmpf;if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}render()});
+setInterval(()=>{if(VIS==='comparar'&&!anaId&&Date.now()-CMP_ULT>2500)cmpBuscar()},3000);
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
- $('#grid').className=VIS==='rotas'?'rotas':VIS==='lista'?'':'grid';
- $('#grid').innerHTML=dados.length?(VIS==='lista'?lista():dados.map(VIS==='rotas'?linha:card).join('')):
+ if(VIS==='comparar'&&Date.now()-CMP_ULT>2500){CMP_ULT=Date.now();setTimeout(cmpBuscar,30)}
+ $('#grid').className=VIS==='rotas'?'rotas':(VIS==='lista'||VIS==='comparar')?'':'grid';
+ $('#grid').innerHTML=dados.length?(VIS==='comparar'?comparar():VIS==='lista'?lista():dados.map(VIS==='rotas'?linha:card).join('')):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri so-adm" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.estado!=='parado'?taxaTS(c.status).ut:0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}
