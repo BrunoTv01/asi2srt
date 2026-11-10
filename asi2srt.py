@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.21.0"
+__version__ = "2.21.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4204,7 +4204,7 @@ def cmd_verificar(args):
     placas = detectar_dektec()
     if placas or DEKTEC_DISPONIVEL:
         print(f"\nPlacas DekTec no barramento: {len(placas)}"
-              + "".join(f"\n  {p['barramento']} {p['endereco']} (produto 0x{p['produto']})" for p in placas))
+              + "".join(f"\n  {p['barramento']} {p['endereco']} {modelo_dektec(p)}" for p in placas))
         if placas:
             print("Driver DekTec: " + ("carregado ✓" if driver_dektec_carregado()
                                        else "NÃO carregado ✗  ->  sudo asi2srt instalar-dektec"))
@@ -4353,6 +4353,16 @@ DEKTEC_VENDOR = "1a0e"          # ID de fabricante da DekTec (PCI e USB)
 DEKTEC_MODULOS = ("DtPcie", "Dta", "Dtu")
 
 
+def modelo_dektec(p):
+    """O código de produto da DekTec é o número do modelo em hexadecimal (0x0861 = DTA-2145)."""
+    try:
+        n = int(str(p.get("produto")), 16)
+    except (TypeError, ValueError):
+        return f"(produto {p.get('produto')})"
+    tipo = "DTU" if str(p.get("barramento", "")).upper() == "USB" else "DTA"
+    return f"{tipo}-{n} (produto 0x{p['produto']})"
+
+
 def detectar_dektec(raiz="/sys/bus"):
     """Lista placas DekTec presentes (lendo o sysfs, sem depender de lspci/lsusb)."""
     achados = []
@@ -4419,7 +4429,7 @@ def cmd_instalar_dektec(args):
     placas = detectar_dektec()
     if placas:
         for p in placas:
-            print(f"placa DekTec encontrada: {p['barramento']} {p['endereco']} (produto 0x{p['produto']})")
+            print(f"placa DekTec encontrada: {p['barramento']} {p['endereco']} {modelo_dektec(p)}")
     elif args.se_houver_placa:
         print("nenhuma placa DekTec detectada - etapa ignorada")
         return 0
