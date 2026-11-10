@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.22.0"
+__version__ = "2.22.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4777,7 +4777,16 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 .bx{padding:4px 8px!important;font-size:12px!important;min-width:30px}
 /* visão Lista: uma linha por sinal */
 /* comparação de sinais */
-.cmpb{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+.cmpsel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:12px}
+.cmpsel-h{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px}.cmpsel-h span{color:var(--mut);font-size:12px}
+.ccols{display:flex;gap:8px;flex-wrap:wrap;align-items:stretch}
+.ccol{display:flex;gap:8px;align-items:flex-end;background:#11161d;border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.ccol label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.ccol select{min-width:150px;max-width:240px;text-transform:none;letter-spacing:0}
+.cnum{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:#1f6feb33;color:#9ec5ff;font-weight:700;font-size:12px;flex:none}
+.ccol .cnum{align-self:center}
+.cadd{border-style:dashed!important;color:var(--mut)}
+.cmpb{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
 .cmpb .lb{font-size:12px;color:var(--mut);margin-right:2px}
 .cmpb button.sel{display:inline-flex;align-items:center;gap:6px}.cmpb button.sel i{width:8px;height:8px;border-radius:50%;background:#484f58}
 .cmpb button.sel i.on{background:var(--ok)}.cmpb button.sel.on{border-color:var(--acc);background:#1f6feb26;color:#cfe3ff}
@@ -5179,76 +5188,88 @@ function linhaLista(c){const s=c.status||{},ativo=s.estado!=='parado',t=s.tr1012
  <td><div class="acs">${acs}</div></td></tr>`}
 function lista(){return`<div class="lista"><table><tr><th></th><th>Canal</th><th>Estado</th><th class="n">Taxa útil</th><th>Tipo</th>
  <th class="n" title="TR 101 290 prioridade 1">P1</th><th class="n" title="prioridade 2">P2</th><th class="n" title="prioridade 3">P3</th><th>Entrada</th><th>Saídas</th><th></th></tr>${dados.map(linhaLista).join('')}</table></div>`}
-// ---------- comparação de sinais ----------
-let CMP_SEL=null,CMP_DADOS={},CMP_SO_DIF=false,CMP_SO_ERR=false,CMP_ULT=0;
-try{const v=JSON.parse(localStorage.getItem('asi2srt.cmp')||'null');if(Array.isArray(v))CMP_SEL=new Set(v)}catch(e){}
-function cmpSalvar(){try{localStorage.setItem('asi2srt.cmp',JSON.stringify([...CMP_SEL]))}catch(e){}}
-function cmpIniciar(){if(!CMP_SEL){CMP_SEL=new Set(dados.filter(c=>(c.status||{}).estado!=='parado').slice(0,3).map(c=>c.id));
-  if(CMP_SEL.size<2)dados.slice(0,2).forEach(c=>CMP_SEL.add(c.id))}
- [...CMP_SEL].forEach(id=>{if(!dados.some(c=>c.id===id))CMP_SEL.delete(id)})}
-async function cmpBuscar(){if(VIS!=='comparar'||anaId||!CMP_SEL)return;CMP_ULT=Date.now();
- await Promise.all([...CMP_SEL].map(async id=>{try{const r=await fetch(`/api/canais/${id}/analise`,{headers:H});
-   if(r.status===401){irLogin();return}const j=await r.json().catch(()=>({}));CMP_DADOS[id]=r.ok?j:{erro:j.erro||'sem dados'}}catch(e){CMP_DADOS[id]={erro:'sem conexão'}}}));
+// ---------- comparação de sinais (o usuário escolhe as entradas) ----------
+let CMP=null,CMP_DADOS={},CMP_SESS={},CMP_SO_DIF=false,CMP_SO_ERR=false,CMP_ULT=0,CMP_BAR='';
+try{const v=JSON.parse(localStorage.getItem('asi2srt.cmp2')||'null');if(Array.isArray(v))CMP=v.filter(x=>x&&x.id)}catch(e){}
+function cmpSalvar(){try{localStorage.setItem('asi2srt.cmp2',JSON.stringify(CMP))}catch(e){}}
+const vivoC=id=>{const c=dados.find(x=>x.id===id);return!!(c&&(c.status||{}).estado!=='parado')};
+const ckey=x=>`${x.id}|${x.sessao==null?'v':x.sessao}`;
+function cmpIniciar(){if(!CMP){const r=dados.filter(c=>vivoC(c.id)).slice(0,2).map(c=>({id:c.id,sessao:null}));
+  CMP=r.length>=2?r:dados.slice(0,2).map(c=>({id:c.id,sessao:vivoC(c.id)?null:0}));cmpSalvar()}
+ CMP=CMP.filter(x=>dados.some(c=>c.id===x.id))}
+async function cmpSessoes(id){try{CMP_SESS[id]=await api('GET',`/api/canais/${id}/relatorios`)}catch(e){CMP_SESS[id]=[]}}
+async function cmpBuscar(){if(VIS!=='comparar'||anaId||!CMP)return;CMP_ULT=Date.now();
+ await Promise.all(CMP.map(async x=>{if(x.sessao!=null&&CMP_DADOS[ckey(x)]&&!CMP_DADOS[ckey(x)].erro)return;  // sessão salva não muda
+  try{const r=await fetch(`/api/canais/${x.id}/analise`+(x.sessao!=null?`?sessao=${x.sessao}`:''),{headers:H});
+   if(r.status===401){irLogin();return}const j=await r.json().catch(()=>({}));CMP_DADOS[ckey(x)]=r.ok?j:{erro:j.erro||'sem dados'}}catch(e){CMP_DADOS[ckey(x)]={erro:'sem conexão'}}}));
  render()}
 const ccServ=(a,sv)=>(sv.componentes||[]).reduce((s,c)=>s+(((a.pids||[]).find(p=>p.pid===c.pid)||{}).cc||0),0);
-function comparar(){cmpIniciar();const sel=dados.filter(c=>CMP_SEL.has(c.id)),A=sel.map(c=>CMP_DADOS[c.id]||{carregando:true});
+function rotSess(x){if(x.sessao==null)return'ao vivo';const s=(CMP_SESS[x.id]||[]).find(r=>r.sessao===x.sessao);return s?`sessão ${fmtDH(s.inicio)}`:`sessão ${x.sessao+1}`}
+function cmpBarra(){const cols=CMP.map((x,i)=>{const viv=vivoC(x.id),ss=CMP_SESS[x.id]||[];
+  const opC=dados.map(c=>`<option value="${c.id}" ${c.id===x.id?'selected':''}>${esc(c.nome)}${vivoC(c.id)?'':' (parado)'}</option>`).join('');
+  const opS=(viv?[`<option value="v" ${x.sessao==null?'selected':''}>Ao vivo</option>`]:[]).concat(ss.map(r=>`<option value="${r.sessao}" ${x.sessao===r.sessao?'selected':''}>${fmtDH(r.inicio)} → ${fmtH(r.fim)} (${dur(r.duracao_s)})</option>`)).join('')||'<option value="">sem sessões salvas</option>';
+  return`<div class="ccol"><span class="cnum">${String.fromCharCode(65+i)}</span><label>Entrada<select data-cc="${i}" data-k="id">${opC}</select></label>
+   <label>Dados<select data-cc="${i}" data-k="sessao">${opS}</select></label>${CMP.length>2?`<button class="mini" data-ccx="${i}" title="tirar esta entrada da comparação">✕</button>`:''}</div>`}).join('');
+ return`<div class="cmpsel"><div class="cmpsel-h"><b>Entradas comparadas</b><span>Escolha o canal de cada coluna e se quer os dados ao vivo ou de uma sessão salva (dá para comparar o mesmo canal agora × ontem).</span></div>
+  <div class="ccols">${cols}${CMP.length<6?`<button class="cadd" data-ccadd="1">+ Adicionar entrada</button>`:''}</div>
+  <div class="cmpb"><span class="sp"></span><button data-cmpf="dif" class="${CMP_SO_DIF?'on':''}" title="mostrar só linhas que diferem entre as entradas">Só diferenças</button>
+  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button><button data-cmpf="csv">Baixar CSV</button></div></div>`}
+function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),sel=CMP.map(x=>dados.find(c=>c.id===x.id)||{nome:'?'});
  const OK=A.map(a=>!a.erro&&!a.carregando),semd=i=>`<span class="sm" title="${esc(A[i].erro||'carregando')}">${A[i].carregando?'…':'sem dados'}</span>`;
- const chips=dados.map(c=>{const on=CMP_SEL.has(c.id),viv=(c.status||{}).estado!=='parado';
-  return`<button class="sel ${on?'on':''}" data-cmp="${c.id}" title="${viv?'rodando: dados ao vivo':'parado: última sessão salva'}"><i class="${viv?'on':''}"></i>${esc(c.nome)}</button>`}).join('');
- const barra=`<div class="cmpb"><span class="lb">Sinais:</span>${chips}<span class="sp"></span>
-  <button data-cmpf="dif" class="${CMP_SO_DIF?'on':''}" title="mostrar só linhas que diferem entre os sinais">Só diferenças</button>
-  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button>
-  <button data-cmpf="csv">Baixar CSV</button></div>`;
- if(sel.length<2)return barra+`<div class="cmp"><div class="vazio">Escolha pelo menos 2 sinais acima para comparar.</div></div>`;
- const cab=sel.map((c,i)=>{const a=A[i];return`<th class="cn" title="${a.salvo?'última sessão salva':a.erro?esc(a.erro):'ao vivo'}">${esc(c.nome)}${a.salvo?' <span class="sm">(salvo)</span>':''}</th>`}).join('');
- // resumo
- const tot=a=>a&&a.tr101290?Object.values(a.tr101290.contadores||{}).reduce((x,y)=>x+y,0):null;
+ if(CMP.length<2)return`<div class="cmp"><div class="vazio">Adicione pelo menos 2 entradas para comparar.</div></div>`;
+ const cab=CMP.map((x,i)=>`<th class="cn" title="${A[i].erro?esc(A[i].erro):''}"><span class="cnum">${String.fromCharCode(65+i)}</span> ${esc(sel[i].nome)}<div class="sm" style="margin:2px 0 0">${esc(rotSess(x))}</div></th>`).join('');
  const prio=(a,p)=>{const c=a&&a.tr101290&&a.tr101290.contadores;return c&&TRI.length?TRI.filter(x=>x[1]===p).reduce((s,[k])=>s+(c[k]||0),0):null};
  const ccTot=a=>(a.pids||[]).reduce((s,p)=>s+(p.cc||0),0);
- const lin=(rot,f,cls='')=>`<tr><td>${rot}</td>${A.map(a=>`<td class="c ${cls}">${a.erro?'<span class="aus">'+esc(a.erro)+'</span>':a.carregando?'…':f(a)}</td>`).join('')}</tr>`;
+ const lin=(rot,f)=>`<tr><td>${rot}</td>${A.map((a,i)=>`<td class="c">${OK[i]?f(a):a.erro?'<span class="aus">'+esc(a.erro)+'</span>':'…'}</td>`).join('')}</tr>`;
  const num=v=>v==null?'—':v.toLocaleString('pt-BR'),cor=v=>v?`<span class="cce">${num(v)}</span>`:`<span class="cc0">0</span>`;
  const resumo=`<div class="cmp"><h3>Resumo</h3><table><tr><th></th>${cab}</tr>
-  ${lin('Taxa útil',a=>{const r=a.resumo||{};return r.taxa_util!=null?mb(r.taxa_util)+' Mb/s':'—'})}
+  ${lin('Taxa útil',a=>{const r=a.resumo||{},tx=a.salvo&&a.taxa_sessao?a.taxa_sessao.media:r.taxa_util;return tx!=null?mb(tx)+' Mb/s'+(a.salvo?' <span class="sm">média</span>':''):'—'})}
   ${lin('Tipo do TS',a=>{const m=(a.resumo||{}).modo_taxa;return m&&m.modo?seloModo(m,true):'—'})}
   ${lin('Serviços',a=>num((a.servicos||[]).length))}${lin('PIDs',a=>num((a.pids||[]).length))}
   ${lin('Erros CC (total)',a=>cor(ccTot(a)))}${lin('TR 101 290 · P1',a=>cor(prio(a,1)))}${lin('TR 101 290 · P2',a=>cor(prio(a,2)))}${lin('TR 101 290 · P3',a=>cor(prio(a,3)))}
  </table></div>`;
- // serviços
  const nums=[...new Set(A.flatMap(a=>(a.servicos||[]).map(s=>s.numero)))].sort((x,y)=>x-y);
  let ls=nums.map(n=>{const ss=A.map(a=>(a.servicos||[]).find(s=>s.numero===n));const nomes=new Set(ss.filter(Boolean).map(s=>s.nome));
   const dif=ss.some((s,i)=>!s&&OK[i])||nomes.size>1,ccs=ss.map((s,i)=>s?ccServ(A[i],s):0),err=ccs.some(x=>x);
-  return{dif,err,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${n}</td><td>${esc((ss.find(Boolean)||{}).nome||'')}${nomes.size>1?`<span class="neq" title="nome diferente entre os sinais">≠</span>`:''}</td>
+  return{dif,err,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${n}</td><td>${esc((ss.find(Boolean)||{}).nome||'')}${nomes.size>1?`<span class="neq" title="nome diferente entre as entradas">≠</span>`:''}</td>
   ${ss.map((s,i)=>`<td class="c">${!OK[i]?semd(i):s?`${nomes.size>1?esc(s.nome)+' · ':''}${mb(s.taxa)} Mb/s <span class="sm">CC</span> ${cor(ccs[i])}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  if(CMP_SO_DIF)ls=ls.filter(x=>x.dif);if(CMP_SO_ERR)ls=ls.filter(x=>x.err);
- const servs=`<div class="cmp"><h3>Serviços <small>${nums.length} no total · bitrate e erros CC de cada sinal</small></h3><table><tr><th class="n">Nº</th><th>Serviço</th>${cab}</tr>
-  ${ls.map(x=>x.html).join('')||`<tr><td colspan="${2+sel.length}" class="vazio">nenhum serviço ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
- // PIDs
+ const servs=`<div class="cmp"><h3>Serviços <small>${nums.length} no total · bitrate e erros CC de cada entrada</small></h3><table><tr><th class="n">Nº</th><th>Serviço</th>${cab}</tr>
+  ${ls.map(x=>x.html).join('')||`<tr><td colspan="${2+CMP.length}" class="vazio">nenhum serviço ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
  const pids=[...new Set(A.flatMap(a=>(a.pids||[]).map(p=>p.pid)))].sort((x,y)=>x-y);
  let lp=pids.map(pid=>{const ps=A.map(a=>(a.pids||[]).find(p=>p.pid===pid));const um=ps.find(Boolean)||{};
-  const descs=new Set(ps.filter(Boolean).map(p=>p.desc)),servs=new Set(ps.filter(Boolean).map(p=>p.servico||''));
-  const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||servs.size>1,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
+  const descs=new Set(ps.filter(Boolean).map(p=>p.desc)),svs=new Set(ps.filter(Boolean).map(p=>p.servico||''));
+  const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||svs.size>1,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
   return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
   <td style="${desc?'color:#ff8f8a':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
-  <td>${esc(um.servico||'')}${servs.size>1?`<span class="neq" title="${esc([...servs].join(' / '))}">≠</span>`:''}</td>
+  <td>${esc(um.servico||'')}${svs.size>1?`<span class="neq" title="${esc([...svs].join(' / '))}">≠</span>`:''}</td>
   ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);
- window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`;
-  const L=[['Dec','Hex','Descrição','Serviço',...sel.flatMap(c=>[c.nome+' - Erros CC',c.nome+' - Bitrate (b/s)'])].map(q).join(';')];
+ window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`,nm=CMP.map((x,i)=>`${String.fromCharCode(65+i)} ${sel[i].nome} (${rotSess(x)})`);
+  const L=[['Dec','Hex','Descrição','Serviço',...nm.flatMap(n=>[n+' - Erros CC',n+' - Bitrate (b/s)'])].map(q).join(';')];
   lp.forEach(x=>L.push([x.pid,x.um.hex,x.um.desc,x.um.servico,...x.ps.flatMap((p,i)=>!OK[i]?['sem dados','']:p?[p.cc,Math.round(p.taxa||0)]:['ausente',''])].map(q).join(';')));
   const b=new Blob(['﻿'+L.join('\r\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(b),el=document.createElement('a');
   el.href=u;el.download='comparacao-pids-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),2000)};
- const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total · erros de continuidade (CC) e bitrate em cada sinal · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
+ const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total · erros de continuidade (CC) e bitrate em cada entrada · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
   <table><tr><th class="n">Dec</th><th>Hex</th><th>Descrição</th><th>Serviço</th>${cab}</tr>
-  ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+sel.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
- return barra+resumo+servs+tabp}
-document.addEventListener('click',e=>{const b=e.target.closest('[data-cmp],[data-cmpf]');if(!b)return;
- if(b.dataset.cmp){const id=b.dataset.cmp;if(CMP_SEL.has(id))CMP_SEL.delete(id);else if(CMP_SEL.size>=6){toast('Compare até 6 sinais por vez');return}else CMP_SEL.add(id);cmpSalvar();render();cmpBuscar();return}
- const f=b.dataset.cmpf;if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}render()});
+  ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+CMP.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
+ return resumo+servs+tabp}
+async function cmpMudou(){cmpSalvar();CMP_BAR='';await Promise.all([...new Set(CMP.map(x=>x.id))].map(cmpSessoes));CMP_BAR='';render();cmpBuscar()}
+document.addEventListener('change',e=>{const s=e.target.closest('[data-cc]');if(!s)return;const i=+s.dataset.cc,x=CMP[i];
+ if(s.dataset.k==='id'){x.id=s.value;x.sessao=vivoC(x.id)?null:0}else x.sessao=s.value==='v'||s.value===''?null:+s.value;cmpMudou()});
+document.addEventListener('click',e=>{const b=e.target.closest('[data-ccx],[data-ccadd],[data-cmpf]');if(!b)return;
+ if(b.dataset.ccx!=null){CMP.splice(+b.dataset.ccx,1);cmpMudou();return}
+ if(b.dataset.ccadd){const usados=new Set(CMP.map(x=>x.id)),c=dados.find(c=>!usados.has(c.id))||dados[0];if(c){CMP.push({id:c.id,sessao:vivoC(c.id)?null:0});cmpMudou()}return}
+ const f=b.dataset.cmpf;if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}CMP_BAR='';render()});
 setInterval(()=>{if(VIS==='comparar'&&!anaId&&Date.now()-CMP_ULT>2500)cmpBuscar()},3000);
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
- if(VIS==='comparar'&&Date.now()-CMP_ULT>2500){CMP_ULT=Date.now();setTimeout(cmpBuscar,30)}
- $('#grid').className=VIS==='rotas'?'rotas':(VIS==='lista'||VIS==='comparar')?'':'grid';
- $('#grid').innerHTML=dados.length?(VIS==='comparar'?comparar():VIS==='lista'?lista():dados.map(VIS==='rotas'?linha:card).join('')):
+ if(VIS==='comparar'&&dados.length){cmpIniciar();const g=$('#grid');g.className='';
+  // a barra de escolha só é redesenhada quando muda (senão a lista aberta fecharia a cada atualização)
+  const bar=cmpBarra();if(bar!==CMP_BAR||!document.getElementById('cmpcorpo')){CMP_BAR=bar;g.innerHTML=bar+'<div id="cmpcorpo"></div>';
+   CMP.forEach(x=>{if(!CMP_SESS[x.id])cmpSessoes(x.id).then(()=>{CMP_BAR='';render()})})}
+  $('#cmpcorpo').innerHTML=comparar();if(Date.now()-CMP_ULT>2500){CMP_ULT=Date.now();setTimeout(cmpBuscar,30)}return}
+ $('#grid').className=VIS==='rotas'?'rotas':VIS==='lista'?'':'grid';
+ $('#grid').innerHTML=dados.length?(VIS==='lista'?lista():dados.map(VIS==='rotas'?linha:card).join('')):
  '<div class="vazio" style="grid-column:1/-1">Nenhum canal configurado.<br><br><button class="pri so-adm" onclick="abrir()">+ Criar o primeiro canal</button></div>';
  const rod=dados.filter(c=>c.status.estado==='rodando').length,tot=dados.reduce((a,c)=>a+(c.status.estado!=='parado'?taxaTS(c.status).ut:0),0);
  $('#resumo').innerHTML=`<span><b>${rod}</b>/${dados.length} no ar</span><span><b>${mb(tot)}</b> Mb/s total</span>`}

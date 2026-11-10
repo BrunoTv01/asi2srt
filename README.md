@@ -235,8 +235,10 @@ Cada entrada (UDP/SRT) e cada saída (SRT/UDP/RTP) pode ter uma **placa reserva*
 
 ### Comparar sinais
 
-O botão **Comparar** (ao lado de Rotas, Lista e Cards) põe até 6 sinais lado a lado. Clique nos nomes
-para escolher quais entram (rodando = dados ao vivo; parado = última sessão salva).
+O botão **Comparar** (ao lado de Rotas, Lista e Cards) põe até 6 entradas lado a lado (colunas A, B, C…).
+Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**: *Ao vivo* ou uma
+**sessão salva** (data e hora). Assim dá para comparar canais diferentes ou o mesmo canal agora × ontem.
+**+ Adicionar entrada** cria mais uma coluna; **✕** tira a coluna. A escolha fica salva no navegador.
 
 - **Resumo:** taxa útil, CBR/VBR, nº de serviços e PIDs, total de erros CC e de cada prioridade TR 101 290.
 - **Serviços:** cada serviço (pelo número) com bitrate e erros CC em cada sinal; `ausente` quando
@@ -480,7 +482,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.22.0 && git push origin v2.17.1
+git tag v2.22.1 && git push origin v2.17.1
 ```
 
 ## Licença
