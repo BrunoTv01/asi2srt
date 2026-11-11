@@ -1313,3 +1313,11 @@ def test_api_rede(gateway):
     base, _ = gateway
     cod, r = _req(base, "GET", "/api/rede")
     assert cod == 200 and {"interfaces", "sem_driver", "uso"} <= set(r)
+
+
+def test_favicon_publico(gateway):
+    base, _ = gateway
+    cod, hd, corpo = _http(base, "GET", "/favicon.ico", csrf=False)
+    assert cod == 200 and hd["Content-Type"].startswith("image/") and len(corpo) > 50
+    cod, _, pag = _http(base, "GET", "/login")
+    assert b'rel="icon"' in pag

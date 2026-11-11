@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.24.1"
+__version__ = "2.24.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -3770,8 +3770,17 @@ class Acesso:
             log.error("não foi possível salvar as sessões: %s", e)
 
 
+# ícone da aba do navegador quando não há logo: antena transmitindo, nas cores do painel
+ICONE_PADRAO = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0b0f14"/>'
+    '<g fill="none" stroke="#00a859" stroke-width="4.5" stroke-linecap="round">'
+    '<path d="M20 22a17 17 0 0 0 0 20"/><path d="M44 22a17 17 0 0 1 0 20"/>'
+    '<path d="M12 15a28 28 0 0 0 0 34" opacity=".6"/><path d="M52 15a28 28 0 0 1 0 34" opacity=".6"/></g>'
+    '<circle cx="32" cy="32" r="6" fill="#00a859"/><path d="M32 38l-7 18h14z" fill="#2f81f7"/></svg>')
+
 LOGIN_HTML = r"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar · __TITULO__</title>
+<link rel="icon" href="/favicon.ico?v=__ICONV__">
 <meta name="robots" content="noindex">
 <style>
 :root{--bg:#0b0f14;--card:#121821;--line:#232c37;--txt:#e6edf3;--mut:#8b96a3;--acc:#2f81f7;--err:#f85149;--ok:#00a859}
@@ -3903,6 +3912,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
             ap = ger.aparencia()
             logo = f'<img src="/logo?v={ap.get("logo_v", "")}" alt="">' if ger.logo_arquivo() else ""
             pag = (LOGIN_HTML.replace("__TITULO__", html.escape(ap["titulo"])).replace("__LOGO__", logo)
+                   .replace("__ICONV__", str(ap.get("logo_v", 0)))
                    .replace("__VERSAO__", "v" + __version__).replace("__MSG__", ""))
             return self._resp(200, pag.encode(), "text/html; charset=utf-8",
                               cab={"X-Frame-Options": "DENY", "Content-Security-Policy":
@@ -3971,6 +3981,15 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     return self._pagina_login()
                 if metodo == "POST" and caminho == "/api/login":
                     return self._login()
+                if metodo == "GET" and caminho == "/favicon.ico":
+                    cam = ger.logo_arquivo()
+                    if cam:
+                        ext = os.path.splitext(cam)[1].lower()
+                        tipo = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                                ".svg": "image/svg+xml", ".webp": "image/webp"}.get(ext, "image/png")
+                        with open(cam, "rb") as f:
+                            return self._resp(200, f.read(), tipo, cab={"Cache-Control": "max-age=86400"})
+                    return self._resp(200, ICONE_PADRAO.encode(), "image/svg+xml", cab={"Cache-Control": "max-age=86400"})
                 u = None if (metodo == "GET" and caminho == "/logo") else self._quem()
                 if u is None and caminho != "/logo":
                     if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
@@ -4009,7 +4028,9 @@ def servidor_web(ger: Gerenciador, endereco: str):
                 if metodo == "GET" and (caminho == "/" or caminho.startswith("/analise")):
                     titulo = html.escape(ger.aparencia()["titulo"])
                     return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__)
-                                      .replace("__TITULO__", titulo).encode(), "text/html; charset=utf-8")
+                                      .replace("__TITULO__", titulo)
+                                      .replace("__ICONV__", str(ger.aparencia().get("logo_v", 0))).encode(),
+                                      "text/html; charset=utf-8")
                 if metodo == "GET" and caminho == "/logo":
                     cam = ger.logo_arquivo()
                     if not cam:
@@ -4710,6 +4731,7 @@ PAINEL_HTML = r"""<!doctype html>
 <html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITULO__</title>
+<link rel="icon" id="fav" href="/favicon.ico?v=__ICONV__">
 <style>
 :root{--bg:#0e1116;--card:#161b22;--line:#2a313c;--txt:#e6edf3;--mut:#8b949e;--acc:#2f81f7;
 --ok:#3fb950;--warn:#d29922;--err:#f85149;--in:#0d1117}
@@ -5593,6 +5615,7 @@ $('#dlglog').addEventListener('close',()=>logId=null);
 $('#novo').onclick=()=>abrir();
 
 function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title=ap.titulo;const im=$('#mlogo');
+ const fv=document.getElementById('fav');if(fv)fv.href='/favicon.ico?v='+(ap.logo?ap.logo_v:0);
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
 $('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);apNovo=null;apRem=false;
