@@ -261,7 +261,7 @@ Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**:
 - **Resumo:** taxa útil, CBR/VBR, nº de serviços e PIDs, total de erros CC e de cada prioridade TR 101 290.
 - **Serviços:** cada serviço (pelo número) com bitrate e erros CC em cada sinal; `ausente` quando
   um sinal não tem aquele serviço, `≠` quando o nome muda.
-- **PIDs:** Dec, Hex, Descrição e Serviço, com **Erros CC** e bitrate de cada sinal. Linha com
+- **PIDs:** Dec, Hex, Descrição e Serviço, com os **Erros CC** de cada entrada. Linha com
   barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
 - Filtros **Só diferenças**, **Só com erros CC** e **Ocultar não referenciados**, e **Baixar CSV** (abre no Excel).
 
@@ -509,7 +509,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.26.1 && git push origin v2.17.1
+git tag v2.26.2 && git push origin v2.17.1
 ```
 
 ## Licença

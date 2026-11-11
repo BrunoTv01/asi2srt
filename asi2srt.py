@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.26.1"
+__version__ = "2.26.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -5643,15 +5643,15 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
   return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
   <td style="${desc?'color:#ff8f8a':um.tipo==='ignorado'?'color:var(--mut);font-style:italic':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
   <td>${esc(um.servico||'')}${svs.size>1?`<span class="neq" title="${esc([...svs].join(' / '))}">≠</span>`:''}</td>
-  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mbps(p.taxa)}</span>${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  const nNref=lp.filter(x=>x.um.tipo==='desconhecido').length;
  if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);if(CMP_SEM_NREF)lp=lp.filter(x=>x.um.tipo!=='desconhecido');
  window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`,nm=CMP.map((x,i)=>`${String.fromCharCode(65+i)} ${sel[i].nome} (${rotSess(x)})`);
-  const L=[['Dec','Hex','Descrição','Serviço',...nm.flatMap(n=>[n+' - Erros CC',n+' - Bitrate (b/s)'])].map(q).join(';')];
-  lp.forEach(x=>L.push([x.pid,x.um.hex,x.um.desc,x.um.servico,...x.ps.flatMap((p,i)=>!OK[i]?['sem dados','']:p?[p.cc,Math.round(p.taxa||0)]:['ausente',''])].map(q).join(';')));
+  const L=[['Dec','Hex','Descrição','Serviço',...nm.map(n=>n+' - Erros CC')].map(q).join(';')];
+  lp.forEach(x=>L.push([x.pid,x.um.hex,x.um.desc,x.um.servico,...x.ps.map((p,i)=>!OK[i]?'sem dados':p?p.cc:'ausente')].map(q).join(';')));
   const b=new Blob(['﻿'+L.join('\r\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(b),el=document.createElement('a');
   el.href=u;el.download='comparacao-pids-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),2000)};
- const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total${nNref?` · <span style="color:#ff8f8a">${nNref} não referenciado(s)</span>`:''} · erros de continuidade (CC) e bitrate em cada entrada · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
+ const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total${nNref?` · <span style="color:#ff8f8a">${nNref} não referenciado(s)</span>`:''} · erros de continuidade (CC) em cada entrada · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
   <table><tr><th class="n">Dec</th><th>Hex</th><th>Descrição</th><th>Serviço</th>${cab}</tr>
   ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+CMP.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
  return resumo+servs+tabp}
