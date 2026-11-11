@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.26.4"
+__version__ = "2.27.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -2179,9 +2179,15 @@ _FFMPEG_RECURSOS = None
 
 
 def _prioridade_baixa():
-    """A janela de imagem é acessória: roda com prioridade baixa para nunca atrasar o fluxo."""
+    """A janela de imagem é acessória: roda com prioridade baixa para nunca atrasar o fluxo, e é a
+    primeira que o Linux encerra se a memória acabar (oom_score_adj 1000)."""
     try:
         os.nice(15)
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
     except OSError:
         pass
 
@@ -2259,6 +2265,11 @@ class Previa(threading.Thread):
             if agora - self.ultimo_pedido > self.OCIOSO_S:
                 if self.proc:
                     self._parar_ffmpeg()
+                continue
+            if PROTECAO["ativa"]:
+                if self.proc:
+                    self._parar_ffmpeg()
+                self.motivo = f"imagens pausadas para proteger o sinal: {PROTECAO['motivo']}"
                 continue
             if not recursos_ffmpeg()["ffmpeg"]:
                 self.motivo = "ffmpeg não instalado (sudo apt install ffmpeg)"
@@ -2842,7 +2853,8 @@ class Gerenciador:
         aplicar_lim_pcr_texto(ms)
         return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
                 "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign,
-                "pcr_repeticao_ms": ms, "previa": self.sup.get("previa", True) is not False}
+                "pcr_repeticao_ms": ms, "previa": self.sup.get("previa", True) is not False,
+                "protecao": self.sup.get("protecao_automatica", True) is not False}
 
     def salvar_aparencia(self, dados):
         titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
@@ -2861,6 +2873,8 @@ class Gerenciador:
             self.sup["titulo"] = titulo
             if "previa" in dados:
                 self.sup["previa"] = bool(dados["previa"])
+            if "protecao" in dados:
+                self.sup["protecao_automatica"] = bool(dados["protecao"])
             if pcr_ms is not None:
                 self.sup["pcr_repeticao_ms"] = pcr_ms
                 for c in list(self.exec.values()):
@@ -3529,12 +3543,37 @@ def relatorio_pdf(d, logo=None) -> bytes:
 # ======================================================================
 # Status da máquina (CPU, memória, disco, temperatura, processos) - só /proc e /sys, sem dependências
 # ======================================================================
+# Proteção contra sobrecarga: quando a máquina aperta, o que é acessório (janela de imagem) pausa sozinho
+# para o sinal, a análise e as saídas continuarem estáveis.
+PROTECAO = {"ativa": False, "motivo": "", "desde": None}
+
+
+def ajustar_cpu_desempenho():
+    """Governador 'performance': a CPU não baixa a frequência e não atrasa pacotes (precisa de root)."""
+    mudou = []
+    for g in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor"):
+        try:
+            disp = open(g.replace("scaling_governor", "scaling_available_governors")).read().split()
+            atual = open(g).read().strip()
+            if "performance" in disp and atual != "performance":
+                with open(g, "w") as f:
+                    f.write("performance")
+                mudou.append(g.split("/")[5])
+        except OSError:
+            continue
+    return mudou
+
+
 class MonitorMaquina:
     """Amostra o servidor a cada 2 s numa thread; a API devolve a última amostra + 5 min de histórico."""
 
     INTERVALO = 2.0
 
-    def __init__(self):
+    def __init__(self, sup=None):
+        self.sup = sup if sup is not None else {}
+        self._alta_desde = None        # CPU alta contínua desde
+        self._normal_desde = None
+        self._swap_hist = collections.deque(maxlen=30)
         self.lock = threading.Lock()
         self._cpu_ant = None
         self._proc_ant = {}
@@ -3711,10 +3750,52 @@ class MonitorMaquina:
                          "kernel": platform.release(), "arquitetura": platform.machine(), "ligado_s": up,
                          "versao": __version__},
              "em": time.time()}
+        self._protecao(total, mem)
+        a["protecao"] = dict(PROTECAO)
         with self.lock:
             self.atual = a
             if total is not None:
                 self.hist.append({"t": int(a["em"]), "cpu": total, "mem": mem["pct"], "temp": temp["cpu_c"]})
+
+    def _protecao(self, cpu, mem):
+        """Liga a economia com CPU >= 90% por 30 s, memória livre < 8% (ou < 150 MB) ou swap crescendo
+        rápido; desliga com CPU < 70% e memória livre > 15% por 60 s."""
+        if self.sup.get("protecao_automatica", True) is False:
+            if PROTECAO["ativa"]:
+                PROTECAO.update(ativa=False, motivo="", desde=None)
+            return
+        agora = time.monotonic()
+        livre = (mem["total"] - mem["usada"]) if mem.get("total") else None
+        self._swap_hist.append((agora, mem.get("swap_usada") or 0))
+        motivo = ""
+        if cpu is not None and cpu >= 90:
+            if self._alta_desde is None:
+                self._alta_desde = agora
+            if agora - self._alta_desde >= 30:
+                motivo = f"CPU em {cpu:.0f}% há mais de 30 s"
+        else:
+            self._alta_desde = None
+        if livre is not None and mem["total"] and (livre < 0.08 * mem["total"] or livre < 150e6):
+            motivo = motivo or f"pouca memória livre ({livre / 1e6:.0f} MB)"
+        if len(self._swap_hist) >= 2:
+            t0, s0 = self._swap_hist[0]
+            if self._swap_hist[-1][1] - s0 > 100e6 and agora - t0 <= 70:
+                motivo = motivo or "o sistema está passando memória para o swap"
+        if motivo:
+            self._normal_desde = None
+            if not PROTECAO["ativa"]:
+                PROTECAO.update(ativa=True, motivo=motivo, desde=time.time())
+                log.warning("proteção: %s - imagens dos serviços pausadas para preservar o sinal", motivo)
+        elif PROTECAO["ativa"]:
+            ok = (cpu is None or cpu < 70) and (livre is None or not mem["total"] or livre > 0.15 * mem["total"])
+            if ok:
+                if self._normal_desde is None:
+                    self._normal_desde = agora
+                if agora - self._normal_desde >= 60:
+                    PROTECAO.update(ativa=False, motivo="", desde=None)
+                    log.info("proteção: servidor normal de novo - imagens retomadas")
+            else:
+                self._normal_desde = None
 
     def status(self):
         with self.lock:
@@ -4100,7 +4181,7 @@ f.onsubmit=async ev=>{ev.preventDefault();b.disabled=true;e.textContent='';
 def servidor_web(ger: Gerenciador, endereco: str):
     host, _, porta = endereco.rpartition(":")
     acesso = ger.garantir_senha()
-    monitor = MonitorMaquina()
+    monitor = MonitorMaquina(ger.sup)
     monitor.iniciar()
 
     class H(BaseHTTPRequestHandler):
@@ -4489,6 +4570,11 @@ def executar_gateway(cfg: dict, caminho=None):
             log.warning("placa de rede no PCI %s (%s) sem driver: não aparece para o sistema", pl["pci"], pl.get("modelo"))
     except Exception:  # noqa: BLE001
         log.exception("listar placas de rede")
+    if sup.get("cpu_desempenho", True) is not False and hasattr(os, "geteuid") and os.geteuid() == 0:
+        mud = ajustar_cpu_desempenho()
+        if mud:
+            log.info("CPU em modo desempenho (%d núcleo(s)): frequência fixa, sem atrasos por economia de energia",
+                     len(mud))
     if sup.get("rotas_por_placa"):
         for c in aplicar_rotas_por_placa():
             log.info("rotas por placa: %s", c)
@@ -4891,6 +4977,8 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=0
 LimitNOFILE=65536
 LimitMEMLOCK=infinity
+# se a memória acabar, o Linux encerra outros programas (e a janela de imagem) antes do sinal
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
@@ -4905,6 +4993,8 @@ net.core.rmem_default = 4194304
 net.core.netdev_max_backlog = 10000
 # multicast com várias placas: modo "solto" do filtro de origem (o estrito descarta multicast vindo
 # de uma rede que o Linux esperaria por outra placa)
+# pouca memória: evita mandar os processos do sinal para o swap
+vm.swappiness = 10
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 """
@@ -5299,6 +5389,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
 <fieldset><legend>Janela de imagem</legend><label class="chk"><input type="checkbox" name="previa"> Mostrar as imagens dos serviços no painel</label>
 <p class="msg" style="white-space:normal;margin:8px 0 0">As imagens usam um ffmpeg que decodifica os vídeos (CPU e memória). Em máquinas modestas, desligue para economizar; o sinal, a análise e as saídas não mudam. O ffmpeg também para sozinho quando ninguém está com o painel aberto.</p></fieldset>
+<fieldset><legend>Proteção contra sobrecarga</legend><label class="chk"><input type="checkbox" name="protecao"> Pausar as imagens automaticamente quando o servidor apertar</label>
+<p class="msg" style="white-space:normal;margin:8px 0 0">Com CPU acima de 90% por 30 s, pouca memória livre ou swap crescendo, as imagens pausam sozinhas para o sinal, a análise e as saídas não sofrerem. Voltam quando o servidor fica normal por 1 minuto.</p></fieldset>
 <fieldset><legend>Repetição do PCR (TR 101 290 · 2.3a)</legend><label>Limite<select name="pcr_ms">
 <option value="100">100 ms — ISO/IEC 13818-1, ISDB-Tb e recomendação atual da TR 101 290</option>
 <option value="40">40 ms — critério antigo do DVB (TR 101 290 até 2005)</option></select></label>
@@ -5910,13 +6002,13 @@ function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title
  const fv=document.getElementById('fav');if(fv)fv.href='/favicon.ico?v='+(ap.logo?ap.logo_v:0);
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
-$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);$('#frmap').elements.previa.checked=ap.previa!==false;apNovo=null;apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);$('#frmap').elements.previa.checked=ap.previa!==false;$('#frmap').elements.protecao.checked=ap.protecao!==false;apNovo=null;apRem=false;
  $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
 $('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
  const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
   $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
 $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
-$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value,previa:$('#frmap').elements.previa.checked};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value,previa:$('#frmap').elements.previa.checked,protecao:$('#frmap').elements.protecao.checked};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1);
   api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render()})}catch(e){toast(e.message)}};
@@ -5925,7 +6017,8 @@ const nv=(v,a=70,e=85)=>v==null?'':v>=e?'e':v>=a?'w':'';
 const gb=b=>b==null?'—':b>=1e12?(b/1e12).toFixed(2)+' TB':b>=1e9?(b/1e9).toFixed(1)+' GB':(b/1e6).toFixed(0)+' MB';
 const tempo=s=>{if(s==null)return'—';s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+' d ':'')+h+' h '+m+' min'};
 function sisResumo(){const s=SIS;if(!s||!s.cpu)return;const c=s.cpu.uso,m=(s.memoria||{}).pct,tp=(s.temperatura||{}).cpu_c;
- $('#sisres').innerHTML=`<small>CPU</small><b class="${nv(c)}">${c==null?'—':Math.round(c)+'%'}</b><small>RAM</small><b class="${nv(m,80,90)}">${m==null?'—':Math.round(m)+'%'}</b>${tp!=null?`<b class="${nv(tp,75,85)}">${Math.round(tp)}°C</b>`:''}`}
+ $('#sisres').innerHTML=`<small>CPU</small><b class="${nv(c)}">${c==null?'—':Math.round(c)+'%'}</b><small>RAM</small><b class="${nv(m,80,90)}">${m==null?'—':Math.round(m)+'%'}</b>${tp!=null?`<b class="${nv(tp,75,85)}">${Math.round(tp)}°C</b>`:''}${s.protecao&&s.protecao.ativa?`<b class="w" title="${esc(s.protecao.motivo)}">⚠ economia</b>`:''}`;
+ $('#bsis').title=s.protecao&&s.protecao.ativa?`Proteção ativa: ${s.protecao.motivo}. Imagens pausadas para preservar o sinal.`:'Status do servidor (CPU, memória, temperatura)'}
 function sisGraf(h){if(!h||h.length<2)return'<p class="msg">juntando dados para o gráfico…</p>';const W=600,H=110,n=h.length,X=i=>(i/(n-1)*W).toFixed(1),Y=v=>(H-v/100*H).toFixed(1);
  const ln=k=>h.map((p,i)=>p[k]==null?'':`${X(i)},${Y(Math.min(100,p[k]))}`).filter(Boolean).join(' ');const tm=h.some(p=>p.temp!=null);
  return`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${[25,50,75].map(v=>`<line x1="0" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1d242d" vector-effect="non-scaling-stroke"/>`).join('')}
@@ -5937,7 +6030,7 @@ function sisCorpo(){const s=SIS;if(!s||!s.cpu){$('#siscorpo').innerHTML='<p clas
  const barra=(v,a,e)=>`<div class="sbar"><i class="${nv(v,a,e)}" style="width:${Math.max(0,Math.min(100,v||0))}%"></i></div>`;
  const tot=Object.values(pr).reduce((x,g)=>({cpu:x.cpu+g.cpu,mem:x.mem+g.mem}),{cpu:0,mem:0});
  $('#sisatu').textContent='atualizado '+new Date(s.em*1000).toLocaleTimeString('pt-BR');
- $('#siscorpo').innerHTML=`<div class="siscards">
+ $('#siscorpo').innerHTML=(s.protecao&&s.protecao.ativa?`<div class="aviso">Proteção ativa: <b>${esc(s.protecao.motivo)}</b>. As imagens dos serviços estão pausadas para o sinal, a análise e as saídas não sofrerem. Voltam sozinhas quando o servidor ficar normal por 1 minuto.</div>`:'')+`<div class="siscards">
  <div class="sc"><h4>Processador <span>${c.nucleos} núcleos</span></h4><div class="big ${nv(c.uso)}">${c.uso==null?'—':c.uso.toFixed(0)+'%'}<small>uso total</small></div>${barra(c.uso)}
   <div class="cores">${(c.por_nucleo||[]).map((v,i)=>`<div class="core"><span>núcleo ${i} · <b class="${nv(v)}">${Math.round(v)}%</b></span>${barra(v)}</div>`).join('')}</div>
   <dl><dt>Modelo</dt><dd>${esc(c.modelo||'—')}</dd>${c.carga?`<dt>Carga média</dt><dd title="1, 5 e 15 min; acima de ${c.nucleos} = fila de processos esperando CPU" class="${c.carga[0]>c.nucleos?'e':c.carga[0]>c.nucleos*.7?'w':''}">${c.carga.join(' · ')}</dd>`:''}</dl></div>

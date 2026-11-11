@@ -1348,3 +1348,60 @@ def test_explicar_erro_tsp():
     assert "outro canal" in a.explicar_erro_tsp("error attaching ... DTAPI_E_IN_USE (DTAPI status 4104)")
     assert a.explicar_erro_tsp("qualquer coisa") == "qualquer coisa"
     assert "rp_filter = 2" in a.SYSCTL_ASI2SRT
+
+
+# ---------------- 2.27: proteção contra sobrecarga em máquinas fracas ----------------
+def _mem(total, livre, swap=0):
+    return {"total": total, "usada": total - livre, "swap_usada": swap}
+
+
+def test_protecao_liga_com_pouca_memoria_e_desliga(monkeypatch):
+    a.PROTECAO.update(ativa=False, motivo="", desde=None)
+    m = a.MonitorMaquina({})
+    t = [1000.0]
+    monkeypatch.setattr(a.time, "monotonic", lambda: t[0])
+    m._protecao(40, _mem(1.6e9, 100e6))
+    assert a.PROTECAO["ativa"] and "memória" in a.PROTECAO["motivo"]
+    m._protecao(40, _mem(1.6e9, 800e6))
+    assert a.PROTECAO["ativa"]            # precisa ficar normal por 60 s
+    t[0] += 61
+    m._protecao(40, _mem(1.6e9, 800e6))
+    assert not a.PROTECAO["ativa"]
+
+
+def test_protecao_cpu_alta_so_depois_de_30s(monkeypatch):
+    a.PROTECAO.update(ativa=False, motivo="", desde=None)
+    m = a.MonitorMaquina({})
+    t = [0.0]
+    monkeypatch.setattr(a.time, "monotonic", lambda: t[0])
+    m._protecao(95, _mem(4e9, 2e9))
+    assert not a.PROTECAO["ativa"]
+    t[0] = 31
+    m._protecao(95, _mem(4e9, 2e9))
+    assert a.PROTECAO["ativa"] and "CPU" in a.PROTECAO["motivo"]
+    a.PROTECAO.update(ativa=False, motivo="", desde=None)
+
+
+def test_protecao_swap_crescendo(monkeypatch):
+    a.PROTECAO.update(ativa=False, motivo="", desde=None)
+    m = a.MonitorMaquina({})
+    t = [0.0]
+    monkeypatch.setattr(a.time, "monotonic", lambda: t[0])
+    m._protecao(30, _mem(4e9, 2e9, 50e6))
+    t[0] = 30
+    m._protecao(30, _mem(4e9, 2e9, 200e6))
+    assert a.PROTECAO["ativa"] and "swap" in a.PROTECAO["motivo"]
+    a.PROTECAO.update(ativa=False, motivo="", desde=None)
+
+
+def test_protecao_desligada_na_config():
+    a.PROTECAO.update(ativa=True, motivo="x", desde=1)
+    m = a.MonitorMaquina({"protecao_automatica": False})
+    m._protecao(99, _mem(1e9, 10e6))
+    assert not a.PROTECAO["ativa"]
+
+
+def test_sistema_ajustes_maquina_fraca():
+    assert "vm.swappiness = 10" in a.SYSCTL_ASI2SRT
+    assert "OOMScoreAdjust=-500" in a.UNIDADE_SYSTEMD
+    assert callable(a.ajustar_cpu_desempenho)

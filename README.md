@@ -479,6 +479,11 @@ Painel em `http://127.0.0.1:8088` (admin / admin).
 
 ## Estabilidade e robustez
 
+### Máquinas modestas (ex.: i3 com 2 GB de RAM)
+- **Proteção automática contra sobrecarga** (⚙ → Proteção contra sobrecarga, ligada por padrão): com CPU ≥ 90% por 30 s, memória livre < 8% (ou < 150 MB) ou swap crescendo mais de 100 MB em 1 minuto, as imagens dos serviços pausam sozinhas. O topo mostra **⚠ economia**. Voltam quando o servidor fica normal por 1 minuto. Sinal, análise e saídas nunca são pausados.
+- **Memória:** o serviço tem `OOMScoreAdjust=-500` e as imagens `oom_score_adj=1000`, então, se a RAM acabar, o Linux encerra as imagens antes do sinal. `vm.swappiness = 10` evita jogar o processamento para o swap.
+- **CPU:** ao iniciar como root, o governador vai para `performance` (sem queda de frequência atrasando pacotes). Desative com `"cpu_desempenho": false` em `supervisor`.
+
 O sistema se protege sozinho dos problemas mais comuns de campo:
 
 - **Entrada muda:** se a entrada para de mandar pacotes mas continua "conectada" (ex.: SRT ativo com
@@ -512,7 +517,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.26.4 && git push origin v2.17.1
+git tag v2.27.0 && git push origin v2.27.0
 ```
 
 ## Licença
