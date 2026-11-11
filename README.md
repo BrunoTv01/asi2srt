@@ -247,6 +247,11 @@ Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**:
   barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
 - Filtros **Só diferenças**, **Só com erros CC** e **Ocultar não referenciados**, e **Baixar CSV** (abre no Excel).
 
+**PIDs fora do pacote:** em **⚙ → PIDs fora do pacote** fica a lista de PIDs que vêm no TS mas não
+pertencem a nenhum serviço (padrão: 5000, 5016, 5017, 8184). Eles continuam aparecendo nas tabelas, em
+cinza ("Fora do pacote"), mas não geram erro: nem "PID não referenciado", nem continuidade (CC). Vale para
+todos os canais na hora; aceita decimal ou hexadecimal (`5000, 0x1398`).
+
 PIDs fixos do **ISDB-Tb** (0x20 a 0x2F: BIT, SDTT, CDT, EIT M/L etc.; 0x1FF0 IIP do SFN; 0x1FC8–0x1FCF PMT 1-seg) são reconhecidos pelo nome e não
 contam mais como "PID não referenciado".
 
@@ -482,7 +487,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.22.2 && git push origin v2.17.1
+git tag v2.23.0 && git push origin v2.17.1
 ```
 
 ## Licença

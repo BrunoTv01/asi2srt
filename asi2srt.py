@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.22.2"
+__version__ = "2.23.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1052,6 +1052,26 @@ PIDS_ISDB = {0x20: "LIT (ISDB)", 0x21: "ERT (ISDB)", 0x22: "PCAT (ISDB)", 0x23: 
              0x28: "SDTT (ISDB)", 0x29: "CDT (ISDB)", 0x2F: "Cabeçalho multiframe (ISDB)",
              0x1FF0: "IIP (ISDB, sincronismo SFN)"}
 PIDS_ISDB.update({p: "PMT 1-seg (ISDB)" for p in range(0x1FC8, 0x1FD0)})
+# PIDs que vêm no TS mas ficam "fora do pacote" (dados privados do multiplexador): aparecem nas tabelas,
+# mas não geram erro (nem "não referenciado", nem continuidade). Lista editável no painel (⚙).
+PIDS_FORA_PADRAO = [5000, 5016, 5017, 8184]
+
+
+def ler_pids(v):
+    """'5000, 0x1398 5017' ou [5000, "0x1399"] -> lista ordenada de PIDs válidos (0 a 8191)."""
+    itens = re.split(r"[\s,;]+", v.strip()) if isinstance(v, str) else list(v or [])
+    out = set()
+    for x in itens:
+        if x in ("", None):
+            continue
+        try:
+            n = int(str(x), 0)
+        except ValueError:
+            raise ValueError(f"PID inválido: {x!r} (use números como 5000 ou 0x1388)")
+        if not 0 <= n <= 0x1FFF:
+            raise ValueError(f"PID fora da faixa 0 a 8191: {n}")
+        out.add(n)
+    return sorted(out)
 LIMITE_CBR_TS_PCT = 2.0       # TS: taxa total variando menos que isso = CBR
 LIMITE_CBR_SERVICO_PCT = 3.0  # serviço: encoder CBR de verdade fica abaixo de ~3% (janelas de 1 s, pelo PCR)
 
@@ -1076,6 +1096,7 @@ class AnalisadorTS:
     RECENTE_S = 10.0
 
     def __init__(self):
+        self.pids_ignorados = set()      # PIDs fora do pacote: não geram erro
         self.lock = threading.Lock()
         self.zerar()
         self.reiniciar_estado()
@@ -1220,7 +1241,7 @@ class AnalisadorTS:
                     disc = flags & 0x80
                     if flags & 0x10 and alen >= 7:
                         self._pcr(pid, d, i, idx0 + k, disc, agora)
-            if afc & 1:
+            if afc & 1 and pid not in self.pids_ignorados:
                 cc = b3 & 0x0F
                 ant = cc_est.get(pid)
                 if ant is None or disc:
@@ -1571,7 +1592,7 @@ class AnalisadorTS:
                     self._erro("unref", agora)
 
     def _referenciados(self):
-        refs = set(range(0x20)) | set(PIDS_ISDB) | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
+        refs = set(range(0x20)) | set(PIDS_ISDB) | self.pids_ignorados | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
         refs |= {p["pcr_pid"] for p in self.programas.values()}
         return refs
 
@@ -1667,6 +1688,8 @@ class AnalisadorTS:
             return "PCR", "pcr"
         if pid in PIDS_ISDB:
             return PIDS_ISDB[pid], "psi"
+        if pid in self.pids_ignorados:
+            return "Fora do pacote (ignorado)", "ignorado"
         if pid < 0x20:
             return "SI reservado", "psi"
         return "Não referenciado", "desconhecido"
@@ -2302,6 +2325,10 @@ class Canal(threading.Thread):
         self._troca = False
         montar_comando(self._cfg_rede(), sup.get("tsp", "tsp"))  # valida antes de abrir recursos
         self.analisador = AnalisadorTS()
+        try:
+            self.analisador.pids_ignorados = set(ler_pids(sup.get("pids_ignorados", PIDS_FORA_PADRAO)))
+        except ValueError:
+            self.analisador.pids_ignorados = set(PIDS_FORA_PADRAO)
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
         c0 = normalizar_canal(cfg)
@@ -2709,8 +2736,11 @@ class Gerenciador:
         rel = lista[idx]
         analise = dict(rel["analise"])
         # sessões salvas antes de o sistema conhecer os PIDs do ISDB-Tb: corrige a descrição ao exibir
+        ign = set(self.aparencia()["pids_ignorados"])
         analise["pids"] = [{**p, "desc": PIDS_ISDB[p["pid"]], "tipo": "psi"}
-                           if p.get("tipo") == "desconhecido" and p.get("pid") in PIDS_ISDB else p
+                           if p.get("tipo") == "desconhecido" and p.get("pid") in PIDS_ISDB else
+                           {**p, "desc": "Fora do pacote (ignorado)", "tipo": "ignorado"}
+                           if p.get("tipo") == "desconhecido" and p.get("pid") in ign else p
                            for p in analise.get("pids") or []]
         return {**analise, "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
@@ -2739,15 +2769,25 @@ class Gerenciador:
 
     def aparencia(self):
         cam = self.logo_arquivo()
+        try:
+            ign = ler_pids(self.sup.get("pids_ignorados", PIDS_FORA_PADRAO))
+        except ValueError:
+            ign = list(PIDS_FORA_PADRAO)
         return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
-                "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0}
+                "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign}
 
     def salvar_aparencia(self, dados):
         titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
         if not titulo or len(titulo) > 80:
             raise ValueError("o nome deve ter entre 1 e 80 caracteres")
+        ign = ler_pids(dados["pids_ignorados"]) if "pids_ignorados" in dados else None
         with self.lock:
             self.sup["titulo"] = titulo
+            if ign is not None:
+                self.sup["pids_ignorados"] = ign
+                for c in list(self.exec.values()):
+                    with c.analisador.lock:
+                        c.analisador.pids_ignorados = set(ign)
             if dados.get("remover_logo"):
                 antigo = self.logo_arquivo()
                 self.sup["logo"] = "-"
@@ -4735,7 +4775,7 @@ table.t{border-collapse:collapse;width:100%;font-size:12.5px;font-variant-numeri
 table.t th{text-align:left;color:var(--mut);font-weight:500;font-size:11.5px;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap;cursor:pointer;user-select:none}
 table.t th.n,table.t td.n{text-align:right}table.t td{padding:5px 8px;border-bottom:1px solid #20262f;white-space:nowrap}
 table.t tr:hover td{background:#1b222c}table.t .mono{font-family:ui-monospace,monospace}
-table.t tr.unref td{color:var(--err)}table.t tr.aus td{opacity:.45}table.t td.ruim{color:var(--err);font-weight:600}
+table.t tr.unref td{color:var(--err)}table.t tr.ign td{color:var(--mut);font-style:italic}table.t tr.aus td{opacity:.45}table.t td.ruim{color:var(--err);font-weight:600}
 .bar{display:inline-block;height:7px;border-radius:4px;background:var(--acc);vertical-align:middle;margin-right:6px;opacity:.85}
 .graf .gw{position:relative}.graf .gw span{position:absolute;left:4px;transform:translateY(-110%);font-size:10.5px;color:var(--mut)}
 .graf svg{width:100%;height:150px;display:block}.graf .gl{stroke:#232a34;stroke-width:1}.graf text{fill:var(--mut);font-size:10px}
@@ -4911,14 +4951,16 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button><button data-vis="comparar" title="comparar serviços e PIDs de vários sinais">Comparar</button></div>
-<button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência: nome e logo">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
+<button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência (nome e logo) e PIDs fora do pacote">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
-<div class="dh"><h3>Aparência</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="dh"><h3>Aparência e análise</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><fieldset><legend>Nome do painel</legend><label>Nome<input name="titulo" maxlength="80" required></label></fieldset>
 <fieldset><legend>Logo</legend><div class="prev" id="apprev"></div>
 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
 <button type="button" id="aprem" class="perigo">Remover logo</button></div>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
+<fieldset><legend>PIDs fora do pacote</legend><label>PIDs (separados por vírgula; decimal ou 0x…)<input name="pids_ign" placeholder="5000, 5016, 5017, 8184" spellcheck="false"></label>
+<p class="msg" style="white-space:normal;margin:8px 0 0">PIDs que vêm no TS mas não pertencem a nenhum serviço (dados do multiplexador). Continuam aparecendo nas tabelas, em cinza, mas <b>não geram erro</b>: nem "PID não referenciado", nem erro de continuidade (CC). Vale para todos os canais, na hora.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
 <dialog id="dlgrede" style="width:min(980px,96vw)"><div class="dh"><h3>Placas de rede do servidor</h3>
@@ -5250,7 +5292,7 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
   const nref=ps.map(p=>!!p&&p.tipo==='desconhecido'),algumNref=nref.some(Boolean)&&um.tipo!=='desconhecido';
   const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||svs.size>1||algumNref,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
   return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
-  <td style="${desc?'color:#ff8f8a':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
+  <td style="${desc?'color:#ff8f8a':um.tipo==='ignorado'?'color:var(--mut);font-style:italic':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
   <td>${esc(um.servico||'')}${svs.size>1?`<span class="neq" title="${esc([...svs].join(' / '))}">≠</span>`:''}</td>
   ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  const nNref=lp.filter(x=>x.um.tipo==='desconhecido').length;
@@ -5473,7 +5515,7 @@ const COLS=[['pid','PID',1],['pid','Dec',1],['desc','Descrição'],['servico','S
 function rPids(){if(!ana)return;const l=[...ana.pids].sort((x,y)=>{const k=ordem.k,a=x[k],b=y[k];return(typeof a==='string'?a.localeCompare(b):a-b)*ordem.d});
  $('#anpid').textContent=l.length+' PIDs';
  $('#apids').innerHTML=`<tr>${COLS.map(([k,n,num])=>`<th class="${num?'n':''}" data-ord="${k}">${n}${ordem.k===k&&n!=='Dec'?(ordem.d>0?' ▲':' ▼'):''}</th>`).join('')}</tr>`
- +l.map(p=>`<tr class="${p.tipo==='desconhecido'?'unref':''} ${p.ausente?'aus':''}"><td class="mono n">${p.hex}</td><td class="n">${p.pid}</td><td>${esc(p.desc)}</td>
+ +l.map(p=>`<tr class="${p.tipo==='desconhecido'?'unref':p.tipo==='ignorado'?'ign':''} ${p.ausente?'aus':''}" title="${p.tipo==='ignorado'?'PID fora do pacote: aparece, mas não gera erro (lista em ⚙)':''}"><td class="mono n">${p.hex}</td><td class="n">${p.pid}</td><td>${esc(p.desc)}</td>
  <td>${esc(p.servico)}</td><td class="n">${fmtR(p.taxa)}</td><td class="n"><span class="bar" style="width:${Math.max(1,Math.min(60,p.pct*0.6))}px"></span>${p.pct.toFixed(1)}</td>
  <td class="n">${p.pacotes.toLocaleString('pt-BR')}</td><td class="n ${p.cc?'ruim':''}">${p.cc}</td>
  <td>${p.pcr?'<span class="badge">PCR</span> ':''}${p.emb?'<span class="badge r">emb</span>':''}${p.ausente?'<span class="badge r">ausente</span>':''}</td></tr>`).join('')}
@@ -5502,15 +5544,15 @@ $('#novo').onclick=()=>abrir();
 function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title=ap.titulo;const im=$('#mlogo');
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
-$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';apNovo=null;apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');apNovo=null;apRem=false;
  $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
 $('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
  const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
   $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
 $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
-$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim()};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
- try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Aparência salva',1)}catch(e){toast(e.message)}};
+ try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1)}catch(e){toast(e.message)}};
 let REDE_T=null;
 const fbps=b=>b==null?'—':b>=1e9?(b/1e9).toFixed(2)+' Gb/s':b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(0)+' kb/s';
 const TIPO_NIC={fisica:'física',wifi:'Wi-Fi',bond:'bond',vlan:'VLAN',bridge:'bridge',vpn:'VPN',virtual:'virtual',interna:'interna'};

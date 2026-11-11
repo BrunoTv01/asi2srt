@@ -400,3 +400,23 @@ def test_pid_iip_isdb():
     an = AnalisadorTS()
     assert "IIP" in an._desc_pid(0x1FF0)[0] and 0x1FF0 in an._referenciados()
     assert "1-seg" in an._desc_pid(0x1FC8)[0]
+
+
+def test_pids_fora_do_pacote_nao_geram_erro():
+    import asi2srt as a
+    assert a.ler_pids("5000, 0x1398 5017;8184") == [5000, 5016, 5017, 8184]
+    for ruim in ("abc", "9000"):
+        try:
+            a.ler_pids(ruim)
+            assert False
+        except ValueError:
+            pass
+    an = AnalisadorTS()
+    an.pids_ignorados = {5000}
+    assert an._desc_pid(5000) == ("Fora do pacote (ignorado)", "ignorado") and 5000 in an._referenciados()
+    # pacotes do PID 5000 com contador de continuidade quebrado: nenhum erro de CC
+    pid = 5000
+    pkts = b"".join(bytes([0x47, 0x40 | (pid >> 8), pid & 0xFF, 0x10 | cc]) + bytes(184) for cc in (0, 5, 9, 2, 7, 1, 3))
+    an.processar(pkts, 1.0)
+    an.processar(pkts, 1.1)
+    assert an.cont["cc"] == 0 and an.cc_pid.get(5000, 0) == 0
