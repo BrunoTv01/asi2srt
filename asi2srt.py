@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.24.0"
+__version__ = "2.24.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1744,7 +1744,8 @@ class AnalisadorTS:
             for epid, v in self.es_pids.items():
                 prog_de_pid[epid] = self.pmt_pids.get(v[0])
             for ppid, pr in self.programas.items():
-                prog_de_pid.setdefault(pr["pcr_pid"], self.pmt_pids.get(ppid))
+                if pr["pcr_pid"] != 0x1FFF:      # 0x1FFF = sem PCR: os nulos não pertencem ao serviço
+                    prog_de_pid.setdefault(pr["pcr_pid"], self.pmt_pids.get(ppid))
 
             def nome_serv(num):
                 if num is None:
@@ -1775,13 +1776,14 @@ class AnalisadorTS:
                          for e, v in sorted(self.es_pids.items()) if v[0] == ppid]
                 pcr_pid = pr["pcr_pid"]
                 tx = sum(c["taxa"] for c in comps) + (int(self.taxa.get(ppid, 0)) if fluindo else 0)
-                if pcr_pid is not None and pcr_pid not in self.es_pids:
+                # PCR_PID 0x1FFF = "serviço sem PCR" (comum em rádio no ISDB-Tb): não somar os pacotes nulos
+                if pcr_pid is not None and pcr_pid != 0x1FFF and pcr_pid not in self.es_pids:
                     tx += int(self.taxa.get(pcr_pid, 0)) if fluindo else 0
                 servicos.append({
                     "modo": self._modo_serv(num),
                     "numero": num, "nome": sdt[0] or f"Programa {num}", "provedor": sdt[1],
                     "tipo": TIPOS_SERVICO.get(sdt[2], f"0x{sdt[2]:02X}" if sdt[2] is not None else ""),
-                    "pmt": f"0x{ppid:04X}", "pcr_pid": f"0x{pcr_pid:04X}" if pcr_pid is not None else "",
+                    "pmt": f"0x{ppid:04X}", "pcr_pid": f"0x{pcr_pid:04X}" if pcr_pid not in (None, 0x1FFF) else "",
                     "pcr": self.pcr_info.get(pcr_pid) if pcr_pid is not None else None,
                     "embaralhado": bool(pr["ca"]) or any(c["emb"] for c in comps),
                     "taxa": tx, "componentes": comps,
@@ -2759,6 +2761,16 @@ class Gerenciador:
                            {**p, "desc": "Fora do pacote (ignorado)", "tipo": "ignorado"}
                            if p.get("tipo") == "desconhecido" and p.get("pid") in ign else p
                            for p in analise.get("pids") or []]
+        # sessões salvas antes da 2.24.1: serviço sem PCR (0x1FFF) somava os pacotes nulos na taxa
+        tx_pid = {p.get("pid"): p.get("taxa") or 0 for p in analise["pids"]}
+        servs = []
+        for s in analise.get("servicos") or []:
+            if s.get("pcr_pid") == "0x1FFF":
+                pmt = int(str(s.get("pmt") or "0"), 16)
+                s = {**s, "pcr_pid": "", "taxa": sum(c.get("taxa") or 0 for c in s.get("componentes") or []) + tx_pid.get(pmt, 0)}
+            servs.append(s)
+        analise["servicos"] = servs
+        analise["pids"] = [{**p, "servico": ""} if p.get("pid") == 0x1FFF else p for p in analise["pids"]]
         return {**analise, "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
                 "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {},
@@ -5177,7 +5189,7 @@ function no(rot,x,e,ativo,ps,cid,lista,fo){const tp=TIPO_TXT[x.tipo]||x.tipo,cl=
  return`<div class="no"><span class="pp">${rot}</span><span class="ed"><span class="tp ${cl}">${tp}</span><code title="${esc(endTxt(x))}">${esc(endTxtBase(x))}</code>${nicBadge(x,fo,ativo)}</span>
  <span class="chips">${st}${chipServ}${e?chipsSRT(e):''}${ps&&ps.estado==='rodando'?`${!e&&ps.info&&ps.info.taxa_kbps?`<span class="chip"><small>Taxa</small>${(ps.info.taxa_kbps/1000).toFixed(2)} Mb/s</span>`:''}<span class="chip"><small>Enviado</small>${fmtB(ps.enviado_conexao_bytes)}</span>${ps.info&&ps.info.velocidade?`<span class="chip"><small>Veloc.</small>${esc(ps.info.velocidade)}</span>`:''}${ps.reinicios?`<span class="chip w" title="vezes que a saída caiu e reconectou"><small>Quedas</small>${ps.reinicios}</span>`:''}`:''}${falha}</span>${rot==='Origem'?'<span></span>':e&&e.estado==='conectado'?mspark(e.hist):ps&&ps.estado==='rodando'&&ps.hist&&ps.hist.length>1?mspark(ps.hist.map(v=>[v,0,0])):'<span></span>'}</div>`}
 const PREV={};let prevAlvos=new Set();
-const mbps=b=>(b/1e6).toFixed(2)+' Mb/s';
+const mbps=b=>b>0&&b<1e6?(b/1e3).toFixed(b<1e4?1:0)+' kb/s':(b/1e6).toFixed(2)+' Mb/s';
 function seloModo(m,curto){if(!m)return'';const ehTS=!curto||true;if(!m.modo)return curto?'':`<span class="modo med" title="medindo a variação da taxa (${m.amostras||0} s)">medindo…</span>`;
  const tip=`${m.modo==='CBR'?'Taxa constante':'Taxa variável'} — variação ${m.variacao_pct}% nos últimos ${m.amostras} s`+(m.min?` (mín ${mbps(m.min)}, máx ${mbps(m.max)})`:'')
   +(m.modo==='CBR'?'. No TS, CBR costuma significar enchimento com pacotes nulos (removidos nas saídas).':'');
@@ -5321,7 +5333,7 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
  let ls=nums.map(n=>{const ss=A.map(a=>(a.servicos||[]).find(s=>s.numero===n));const nomes=new Set(ss.filter(Boolean).map(s=>s.nome));
   const dif=ss.some((s,i)=>!s&&OK[i])||nomes.size>1,ccs=ss.map((s,i)=>s?ccServ(A[i],s):0),err=ccs.some(x=>x);
   return{dif,err,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${n}</td><td>${esc((ss.find(Boolean)||{}).nome||'')}${nomes.size>1?`<span class="neq" title="nome diferente entre as entradas">≠</span>`:''}</td>
-  ${ss.map((s,i)=>`<td class="c">${!OK[i]?semd(i):s?`${nomes.size>1?esc(s.nome)+' · ':''}${mb(s.taxa)} Mb/s <span class="sm">CC</span> ${cor(ccs[i])}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+  ${ss.map((s,i)=>`<td class="c">${!OK[i]?semd(i):s?`${nomes.size>1?esc(s.nome)+' · ':''}${mbps(s.taxa)} <span class="sm">CC</span> ${cor(ccs[i])}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  if(CMP_SO_DIF)ls=ls.filter(x=>x.dif);if(CMP_SO_ERR)ls=ls.filter(x=>x.err);
  const servs=`<div class="cmp"><h3>Serviços <small>${nums.length} no total · bitrate e erros CC de cada entrada</small></h3><table><tr><th class="n">Nº</th><th>Serviço</th>${cab}</tr>
   ${ls.map(x=>x.html).join('')||`<tr><td colspan="${2+CMP.length}" class="vazio">nenhum serviço ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
@@ -5333,7 +5345,7 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
   return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
   <td style="${desc?'color:#ff8f8a':um.tipo==='ignorado'?'color:var(--mut);font-style:italic':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
   <td>${esc(um.servico||'')}${svs.size>1?`<span class="neq" title="${esc([...svs].join(' / '))}">≠</span>`:''}</td>
-  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mbps(p.taxa)}</span>${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
  const nNref=lp.filter(x=>x.um.tipo==='desconhecido').length;
  if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);if(CMP_SEM_NREF)lp=lp.filter(x=>x.um.tipo!=='desconhecido');
  window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`,nm=CMP.map((x,i)=>`${String.fromCharCode(65+i)} ${sel[i].nome} (${rotSess(x)})`);
@@ -5453,7 +5465,7 @@ $('#frm').onsubmit=async ev=>{ev.preventDefault();coletar();
 
 // ---------- análise ----------
 const fmtB=b=>{b=+b||0;return b>=1e9?(b/1e9).toFixed(2)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':(b/1e3).toFixed(0)+' kB'};
-const fmtR=b=>b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(1)+' kb/s';
+const fmtR=b=>b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(b<1e4?1:0)+' kb/s';
 const fmtHa=s=>s<60?Math.round(s)+'s':s<3600?Math.round(s/60)+'min':(s/3600).toFixed(1)+'h';
 let sessSel=null;
 async function carregarSess(){if(!anaId)return;try{const l=await api('GET',`/api/canais/${anaId}/relatorios`),

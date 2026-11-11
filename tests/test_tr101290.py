@@ -424,3 +424,20 @@ def test_pids_fora_do_pacote_nao_geram_erro():
     an.processar(pkts, 1.0)
     an.processar(pkts, 1.1)
     assert an.cont["cc"] == 0 and an.cc_pid.get(5000, 0) == 0
+
+
+def test_servico_sem_pcr_nao_soma_nulos():
+    """Rádio ISDB-Tb com PCR_PID = 0x1FFF: a taxa do serviço não pode incluir os pacotes nulos."""
+    an = AnalisadorTS()
+    an.pmt_pids = {0x100: 1}
+    an.programas = {0x100: {"pcr_pid": 0x1FFF, "ca": set()}}
+    an.es_pids = {0x101: (0x100, 0x0F, "audio", "AAC áudio")}
+    an.taxa = {0x100: 6000, 0x101: 200_000, 0x1FFF: 7_000_000}
+    an.taxa_total = sum(an.taxa.values())
+    an.n_pid = {0x100: 10, 0x101: 100, 0x1FFF: 5000}
+    import time as _t
+    an.ultimo_pacote = _t.monotonic()
+    a = an.analise()
+    sv = a["servicos"][0]
+    assert sv["taxa"] == 206_000 and sv["pcr_pid"] == ""
+    assert next(p for p in a["pids"] if p["pid"] == 0x1FFF)["servico"] == ""
