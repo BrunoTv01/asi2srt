@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.25.1"
+__version__ = "2.26.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -794,6 +794,7 @@ def _args_ip_entrada(endereco, interface_local="") -> list:
     return [porta] + (["--local-address", local] if local else [])
 
 
+LOTE_INTERNO = 28   # pacotes por datagrama/lote entre os processos locais (as saídas para a rede continuam com 7)
 BUFFER_UDP = 16 * 1024 * 1024   # buffer de recepção UDP (o kernel limita a net.core.rmem_max; ver instalar-servico)
 
 
@@ -833,7 +834,9 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     saidas = canal.get("saidas") or []
     so_analise = not saidas  # sem saídas: o canal só recebe e analisa
 
-    cmd = [tsp_bin, "--realtime", "--buffer-size-mb", "8", "--max-flushed-packets", "7"]
+    # lotes internos de 28 pacotes (~5 KB): bem menos trocas de contexto e chamadas de sistema que 7,
+    # com atraso desprezível (28 pacotes a 2 Mb/s = 21 ms; a 25 Mb/s = 1,7 ms)
+    cmd = [tsp_bin, "--realtime", "--buffer-size-mb", "8", "--max-flushed-packets", str(LOTE_INTERNO)]
 
     tipo = ent.get("tipo")
     if tipo == "dektec":
@@ -862,8 +865,8 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
 
     # cópia do TS bruto (logo após a entrada, antes de filtros) para o analisador TR 101 290
     if porta_analise and proc.get("analise_tr101290", True):
-        filho = [tsp_bin, "-O", "ip", f"127.0.0.1:{porta_analise}", "--packet-burst", "7"]
-        cmd += ["-P", "fork", "--nowait", "--ignore-abort", "--buffered-packets", "7",
+        filho = [tsp_bin, "-O", "ip", f"127.0.0.1:{porta_analise}", "--packet-burst", str(LOTE_INTERNO)]
+        cmd += ["-P", "fork", "--nowait", "--ignore-abort", "--buffered-packets", str(LOTE_INTERNO),
                 " ".join(shlex.quote(a) for a in filho)]
 
     pids =[_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
@@ -889,7 +892,7 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     if so_analise and not porta_dist:
         cmd += ["-O", "drop"]
     else:  # o distribuidor alimenta as saídas e a janela de imagem
-        cmd += ["-O", "ip", f"127.0.0.1:{porta_dist or 'PORTA_DIST'}", "--packet-burst", "7"]
+        cmd += ["-O", "ip", f"127.0.0.1:{porta_dist or 'PORTA_DIST'}", "--packet-burst", str(LOTE_INTERNO)]
     return cmd
 
 
@@ -2210,12 +2213,15 @@ class Previa(threading.Thread):
 
     def comando(self, servs):
         r = recursos_ffmpeg()
+        # leve: 1 thread por decodificador (cada thread a mais guarda quadros HD inteiros na memória),
+        # só quadros-chave, uma imagem a cada 2 s, 320 px de largura
         cmd = [r["ffmpeg"] or "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-skip_frame", "nokey", "-fflags", "+discardcorrupt", "-analyzeduration", "4000000",
-               "-probesize", "8000000",
-               "-i", f"udp://127.0.0.1:{self.porta}?fifo_size=1000000&overrun_nonfatal=1&timeout=10000000"]
+               "-threads", "1", "-filter_threads", "1",
+               "-skip_frame", "nokey", "-fflags", "+discardcorrupt+nobuffer", "-analyzeduration", "3000000",
+               "-probesize", "5000000",
+               "-i", f"udp://127.0.0.1:{self.porta}?fifo_size=500000&overrun_nonfatal=1&timeout=10000000"]
         for sid in servs:
-            cmd += ["-map", f"0:p:{sid}:v:0", "-an", "-sn", "-dn", "-vf", "scale=480:-2", "-q:v", "5"]
+            cmd += ["-map", f"0:p:{sid}:v:0", "-an", "-sn", "-dn", "-vf", "fps=0.5,scale=320:-2", "-q:v", "6"]
             cmd += ["-fps_mode", "vfr"] if r["fps_mode"] else ["-vsync", "vfr"]
             if r["atomic"]:
                 cmd += ["-atomic_writing", "1"]
@@ -2821,7 +2827,7 @@ class Gerenciador:
         aplicar_lim_pcr_texto(ms)
         return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
                 "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign,
-                "pcr_repeticao_ms": ms}
+                "pcr_repeticao_ms": ms, "previa": self.sup.get("previa", True) is not False}
 
     def salvar_aparencia(self, dados):
         titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
@@ -2838,6 +2844,8 @@ class Gerenciador:
                 raise ValueError("limite de repetição do PCR: 40 ou 100 ms")
         with self.lock:
             self.sup["titulo"] = titulo
+            if "previa" in dados:
+                self.sup["previa"] = bool(dados["previa"])
             if pcr_ms is not None:
                 self.sup["pcr_repeticao_ms"] = pcr_ms
                 for c in list(self.exec.values()):
@@ -4373,6 +4381,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         sid = partes[4].removesuffix(".jpg")
                         if not t or not sid.isdigit():
                             return self._resp(404, {"erro": "canal parado"})
+                        if ger.sup.get("previa", True) is False:
+                            return self._resp(404, {"erro": "imagens desligadas (⚙)"})
                         t.previa.pedir()
                         img = t.previa.imagem(sid)
                         if not img:
@@ -5258,6 +5268,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
 <button type="button" id="aprem" class="perigo">Remover logo</button></div>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
+<fieldset><legend>Janela de imagem</legend><label class="chk"><input type="checkbox" name="previa"> Mostrar as imagens dos serviços no painel</label>
+<p class="msg" style="white-space:normal;margin:8px 0 0">As imagens usam um ffmpeg que decodifica os vídeos (CPU e memória). Em máquinas modestas, desligue para economizar; o sinal, a análise e as saídas não mudam. O ffmpeg também para sozinho quando ninguém está com o painel aberto.</p></fieldset>
 <fieldset><legend>Repetição do PCR (TR 101 290 · 2.3a)</legend><label>Limite<select name="pcr_ms">
 <option value="100">100 ms — ISO/IEC 13818-1, ISDB-Tb e recomendação atual da TR 101 290</option>
 <option value="40">40 ms — critério antigo do DVB (TR 101 290 até 2005)</option></select></label>
@@ -5456,7 +5468,11 @@ function prevBox(cid,s,cls){const k=`${cid}:${s.numero}`,p=PREV[k]||{};
  return`<div class="pv ${cls||''}" title="${esc(s.nome)} · serviço ${s.numero}"><div class="im">${s.video?`<img data-prev="${k}" ${p.u?`src="${p.u}"`:'hidden'} alt="">`:''}
  <div class="pvm" data-prevmsg="${k}" ${p.u?'hidden':''}>${msg}</div></div><div class="pvn"><b>${esc(s.nome)}</b>${s.taxa?`<span class="pvt" title="taxa deste serviço (vídeo + áudio + dados do programa)">${mbps(s.taxa)}</span>${seloModo(s.modo,true)}`:''}<small>${s.numero}</small></div></div>`}
 let prevOcupado=false;
-async function atualizarPrevias(){if(prevOcupado||document.hidden)return;prevOcupado=true;
+async function atualizarPrevias(){if(prevOcupado||document.hidden)return;
+ if(INFO.aparencia&&INFO.aparencia.previa===false){for(const k of prevAlvos){if(!(PREV[k]||{}).off){PREV[k]={erro:'imagens desligadas (⚙)',off:1};
+   document.querySelectorAll(`img[data-prev="${k}"]`).forEach(i=>i.hidden=true);
+   document.querySelectorAll(`[data-prevmsg="${k}"]`).forEach(m=>{m.hidden=false;m.textContent=PREV[k].erro})}}return}
+ prevOcupado=true;
  try{for(const k of [...prevAlvos]){const [cid,sid]=k.split(':');
   try{const r=await fetch(`/api/canais/${cid}/previa/${sid}.jpg`,{cache:'no-store'});
    if(r.ok){const u=URL.createObjectURL(await r.blob()),old=PREV[k];PREV[k]={u};
@@ -5850,13 +5866,13 @@ function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title
  const fv=document.getElementById('fav');if(fv)fv.href='/favicon.ico?v='+(ap.logo?ap.logo_v:0);
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
-$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);apNovo=null;apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);$('#frmap').elements.previa.checked=ap.previa!==false;apNovo=null;apRem=false;
  $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
 $('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
  const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
   $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
 $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
-$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value,previa:$('#frmap').elements.previa.checked};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1);
   api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render()})}catch(e){toast(e.message)}};

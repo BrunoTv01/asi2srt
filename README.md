@@ -199,6 +199,11 @@ sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo 
 
 ### Status do servidor
 
+**Máquinas modestas:** a janela de imagem é o que mais gasta (o ffmpeg decodifica os vídeos). Ela já
+roda leve (1 thread por vídeo, só quadros-chave, uma imagem a cada 2 s, 320 px) e para sozinha quando
+ninguém está com o painel aberto; em **⚙ → Janela de imagem** dá para desligá-la de vez. Com pouca
+memória (menos de 4 GB) e o swap em uso, o mais eficaz é aumentar a memória.
+
 No topo do painel fica sempre visível o uso de **CPU**, **memória** e a **temperatura** do processador
 (amarelo acima de 70%/75 °C, vermelho acima de 85%). Clicando nele abre **Status do servidor**:
 
@@ -504,7 +509,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.25.1 && git push origin v2.17.1
+git tag v2.26.0 && git push origin v2.17.1
 ```
 
 ## Licença

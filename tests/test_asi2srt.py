@@ -58,7 +58,7 @@ def test_comando_dektec_srt():
     linha = " ".join(cmd)
     assert "-I dektec --device 0 --channel 0" in linha
     assert "--pid 0x0012 --pid 0x1FFF" in linha and "--min 1000" in linha
-    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", "7"]   # entrega ao distribuidor local
+    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", str(a.LOTE_INTERNO)]   # entrega ao distribuidor local
     assert "srt" not in cmd                                                # a saída não fica neste processo
     sai = a.montar_saida(canal["saidas"][0], 0, porta_entrada=42000)
     assert "-I ip 42000 --local-address 127.0.0.1" in " ".join(sai) and "-O srt --caller h:1" in " ".join(sai)
@@ -790,7 +790,7 @@ def test_opcoes_zap_existem_no_tsduck():
 
 def test_canal_so_analise_alimenta_distribuidor():
     cmd = a.montar_comando({"entrada": a.entrada_de_texto("srt://h:6001"), "saidas": []}, porta_dist=41000)
-    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", "7"] and "filter" not in cmd
+    assert cmd[-4:] == ["ip", "127.0.0.1:41000", "--packet-burst", str(a.LOTE_INTERNO)] and "filter" not in cmd
 
 
 # ---------------- janela de imagem (miniatura por serviço) ----------------
