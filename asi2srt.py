@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.26.3"
+__version__ = "2.26.4"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -5612,12 +5612,12 @@ function cmpBarra(){const cols=CMP.map((x,i)=>{const viv=vivoC(x.id),ss=CMP_SESS
  return`<div class="cmpsel"><div class="cmpsel-h"><b>Entradas comparadas</b><span>Escolha o canal de cada coluna e se quer os dados ao vivo ou de uma sessão salva (dá para comparar o mesmo canal agora × ontem).</span></div>
   <div class="ccols">${cols}${CMP.length<6?`<button class="cadd" data-ccadd="1">+ Adicionar entrada</button>`:''}</div>
   <div class="cmpb"><span class="sp"></span><button data-cmpf="dif" class="${CMP_SO_DIF?'on':''}" title="mostrar só linhas que diferem entre as entradas">Só diferenças</button>
-  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button><button data-cmpf="zerar" title="zera os contadores de erro (CC e TR 101 290) de todas as entradas ao vivo desta comparação">↺ Zerar contadores</button><button data-cmpf="nref" class="${CMP_SEM_NREF?'on':''}" title="esconder PIDs que não aparecem em nenhuma PMT (dados privados do multiplexador)">Ocultar não referenciados</button><button data-cmpf="csv">Baixar CSV</button></div></div>`}
+  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button><button data-cmpf="zerar" title="zera os erros só nesta comparação (passa a contar a partir de agora); os contadores do canal, a Análise e os relatórios não mudam">↺ Zerar comparação</button><button data-cmpf="nref" class="${CMP_SEM_NREF?'on':''}" title="esconder PIDs que não aparecem em nenhuma PMT (dados privados do multiplexador)">Ocultar não referenciados</button><button data-cmpf="csv">Baixar CSV</button></div></div>`}
 const melhor=ps=>{const v=ps.filter(Boolean);return v.find(p=>p.tipo!=='desconhecido')||v[0]||{}};
-function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),sel=CMP.map(x=>dados.find(c=>c.id===x.id)||{nome:'?'});
+function comparar(){const A=CMP.map(x=>cmpComBase(ckey(x),CMP_DADOS[ckey(x)]||{carregando:true})),sel=CMP.map(x=>dados.find(c=>c.id===x.id)||{nome:'?'});
  const OK=A.map(a=>!a.erro&&!a.carregando),semd=i=>`<span class="sm" title="${esc(A[i].erro||'carregando')}">${A[i].carregando?'…':'sem dados'}</span>`;
  if(CMP.length<2)return`<div class="cmp"><div class="vazio">Adicione pelo menos 2 entradas para comparar.</div></div>`;
- const cab=CMP.map((x,i)=>`<th class="cn" title="${A[i].erro?esc(A[i].erro):''}"><span class="cnum">${String.fromCharCode(65+i)}</span> ${esc(sel[i].nome)}${x.sessao==null&&vivoC(x.id)?` <button class="mini zc" data-cmpz="${x.id}" title="zerar os contadores de erro de ${esc(sel[i].nome)}">↺</button>`:''}<div class="sm" style="margin:2px 0 0">${esc(rotSess(x))}</div></th>`).join('');
+ const cab=CMP.map((x,i)=>`<th class="cn" title="${A[i].erro?esc(A[i].erro):''}"><span class="cnum">${String.fromCharCode(65+i)}</span> ${esc(sel[i].nome)} <button class="mini zc" data-cmpz="${ckey(x)}" title="zerar os erros desta coluna só na comparação">↺</button><div class="sm" style="margin:2px 0 0">${esc(rotSess(x))}${CMP_BASE[ckey(x)]?` · <span title="contando a partir deste horário; clique para voltar ao total" data-cmpdes="${ckey(x)}" style="color:var(--warn);cursor:pointer">desde ${new Date(CMP_BASE[ckey(x)].em).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit',second:'2-digit'})} ✕</span>`:''}</div></th>`).join('');
  const prio=(a,p)=>{const c=a&&a.tr101290&&a.tr101290.contadores;return c&&TRI.length?TRI.filter(x=>x[1]===p).reduce((s,[k])=>s+(c[k]||0),0):null};
  const ccTot=a=>(a.pids||[]).reduce((s,p)=>s+(p.cc||0),0);
  const lin=(rot,f)=>`<tr><td>${rot}</td>${A.map((a,i)=>`<td class="c">${OK[i]?f(a):a.erro?'<span class="aus">'+esc(a.erro)+'</span>':'…'}</td>`).join('')}</tr>`;
@@ -5656,18 +5656,27 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
   <table><tr><th class="n">Dec</th><th>Hex</th><th>Descrição</th><th>Serviço</th>${cab}</tr>
   ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+CMP.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
  return resumo+servs+tabp}
-async function cmpZerar(ids){try{await Promise.all(ids.map(id=>api('POST',`/api/canais/${id}/zerar`)));
-  ids.forEach(id=>CMP.forEach(x=>{if(x.id===id&&x.sessao==null)delete CMP_DADOS[ckey(x)]}));
-  toast(ids.length>1?`Contadores zerados em ${ids.length} entradas`:'Contadores zerados',1);await cmpBuscar()}catch(e){toast(e.message)}}
+// "Zerar" da comparação é só desta tela: guarda os valores atuais como ponto de partida e mostra a diferença.
+// Os contadores do canal (Rotas, Análise, relatórios) não mudam.
+let CMP_BASE={};try{CMP_BASE=JSON.parse(localStorage.getItem('asi2srt.cmpbase')||'{}')||{}}catch(e){}
+function cmpZerar(chaves){let n=0;chaves.forEach(k=>{const a=CMP_DADOS[k];if(!a||a.erro)return;n++;
+  CMP_BASE[k]={em:Date.now(),pids:Object.fromEntries((a.pids||[]).map(p=>[p.pid,p.cc||0])),tr:{...((a.tr101290||{}).contadores||{})}}});
+ try{localStorage.setItem('asi2srt.cmpbase',JSON.stringify(CMP_BASE))}catch(e){}
+ toast(n?(n>1?`Comparação zerada em ${n} entradas (só nesta tela)`:'Comparação zerada (só nesta tela)'):'Aguarde os dados carregarem',!!n);CMP_BAR='';render()}
+function cmpDesfazer(k){delete CMP_BASE[k];try{localStorage.setItem('asi2srt.cmpbase',JSON.stringify(CMP_BASE))}catch(e){}CMP_BAR='';render()}
+function cmpComBase(k,a){const b=CMP_BASE[k];if(!b||!a||a.erro||a.carregando)return a;
+ const pids=(a.pids||[]).map(p=>{const v=b.pids[p.pid]||0;return{...p,cc:Math.max(0,(p.cc||0)-(p.cc>=v?v:0))}});
+ const c=(a.tr101290||{}).contadores,tr=c?Object.fromEntries(Object.entries(c).map(([q,v])=>[q,Math.max(0,v-((b.tr[q]||0)<=v?(b.tr[q]||0):0))])):c;
+ return{...a,pids,tr101290:a.tr101290?{...a.tr101290,contadores:tr}:a.tr101290}}
 async function cmpMudou(){cmpSalvar();CMP_BAR='';await Promise.all([...new Set(CMP.map(x=>x.id))].map(cmpSessoes));CMP_BAR='';render();cmpBuscar()}
 document.addEventListener('change',e=>{const s=e.target.closest('[data-cc]');if(!s)return;const i=+s.dataset.cc,x=CMP[i];
  if(s.dataset.k==='id'){x.id=s.value;x.sessao=vivoC(x.id)?null:0}else x.sessao=s.value==='v'||s.value===''?null:+s.value;cmpMudou()});
-document.addEventListener('click',e=>{const b=e.target.closest('[data-ccx],[data-ccadd],[data-cmpf],[data-cmpz]');if(!b)return;
+document.addEventListener('click',e=>{const b=e.target.closest('[data-ccx],[data-ccadd],[data-cmpf],[data-cmpz],[data-cmpdes]');if(!b)return;
  if(b.dataset.cmpz){cmpZerar([b.dataset.cmpz]);return}
+ if(b.dataset.cmpdes){cmpDesfazer(b.dataset.cmpdes);return}
  if(b.dataset.ccx!=null){CMP.splice(+b.dataset.ccx,1);cmpMudou();return}
  if(b.dataset.ccadd){const usados=new Set(CMP.map(x=>x.id)),c=dados.find(c=>!usados.has(c.id))||dados[0];if(c){CMP.push({id:c.id,sessao:vivoC(c.id)?null:0});cmpMudou()}return}
- const f=b.dataset.cmpf;if(f==='zerar'){const ids=[...new Set(CMP.filter(x=>x.sessao==null&&vivoC(x.id)).map(x=>x.id))];
-  if(!ids.length){toast('Nenhuma entrada ao vivo para zerar (sessões salvas não mudam)');return}cmpZerar(ids);return}
+ const f=b.dataset.cmpf;if(f==='zerar'){cmpZerar(CMP.map(ckey));return}
  if(f==='nref')CMP_SEM_NREF=!CMP_SEM_NREF;else if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}CMP_BAR='';render()});
 setInterval(()=>{if(VIS==='comparar'&&!anaId&&Date.now()-CMP_ULT>2500)cmpBuscar()},3000);
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));

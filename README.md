@@ -264,8 +264,9 @@ Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**:
 - **PIDs:** Dec, Hex, Descrição e Serviço, com os **Erros CC** de cada entrada. Linha com
   barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
 - Filtros **Só diferenças**, **Só com erros CC** e **Ocultar não referenciados**, e **Baixar CSV** (abre no Excel).
-- **↺ Zerar contadores** zera os erros de todas as entradas ao vivo da comparação; o **↺** ao lado do nome
-  de cada coluna zera só aquela entrada (sessões salvas não mudam).
+- **↺ Zerar comparação** zera os erros **só nesta tela** (passa a contar a partir daquele momento); o **↺**
+  ao lado do nome de cada coluna zera só aquela entrada. Os contadores do canal (Rotas, Análise e relatórios)
+  não mudam. A coluna mostra "desde HH:MM:SS ✕"; clicando no ✕ volta ao total.
 
 **Repetição do PCR (2.3a):** o limite padrão é **100 ms** (ISO/IEC 13818-1, usado no ISDB-Tb e recomendado
 pela própria TR 101 290 desde 2005, nota 2 da tabela 5.0b). O critério antigo de **40 ms** do DVB pode ser
@@ -511,7 +512,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.26.3 && git push origin v2.17.1
+git tag v2.26.4 && git push origin v2.17.1
 ```
 
 ## Licença
