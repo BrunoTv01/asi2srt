@@ -1321,3 +1321,21 @@ def test_favicon_publico(gateway):
     assert cod == 200 and hd["Content-Type"].startswith("image/") and len(corpo) > 50
     cod, _, pag = _http(base, "GET", "/login")
     assert b'rel="icon"' in pag
+
+
+def test_monitor_maquina():
+    m = a.MonitorMaquina()
+    m._amostrar()
+    time.sleep(0.3)
+    m._amostrar()
+    s = m.status()
+    assert s["cpu"]["nucleos"] >= 1 and s["cpu"]["uso"] is not None and 0 <= s["cpu"]["uso"] <= 100
+    assert s["memoria"]["total"] > 0 and 0 <= s["memoria"]["pct"] <= 100
+    assert s["discos"] and s["sistema"]["versao"] == a.__version__
+    assert "asi2srt" in s["processos"] and len(s["historico"]) >= 1
+
+
+def test_api_sistema(gateway):
+    base, _ = gateway
+    cod, r = _req(base, "GET", "/api/sistema")
+    assert cod == 200 and {"cpu", "memoria", "discos", "temperatura", "processos", "sistema", "historico"} <= set(r)

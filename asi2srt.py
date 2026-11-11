@@ -27,6 +27,7 @@ import argparse
 import base64
 import collections
 import copy
+import glob
 import hashlib
 import hmac
 import html
@@ -49,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.24.2"
+__version__ = "2.25.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -3490,6 +3491,201 @@ def relatorio_pdf(d, logo=None) -> bytes:
 
 
 # ======================================================================
+# Status da máquina (CPU, memória, disco, temperatura, processos) - só /proc e /sys, sem dependências
+# ======================================================================
+class MonitorMaquina:
+    """Amostra o servidor a cada 2 s numa thread; a API devolve a última amostra + 5 min de histórico."""
+
+    INTERVALO = 2.0
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._cpu_ant = None
+        self._proc_ant = {}
+        self._t_proc = None
+        self.atual = {}
+        self.hist = collections.deque(maxlen=150)     # 150 x 2 s = 5 min
+        self._modelo = None
+        self._parar = threading.Event()
+
+    def iniciar(self):
+        self._amostrar()
+        threading.Thread(target=self._loop, daemon=True, name="monitor-maquina").start()
+
+    def _loop(self):
+        while not self._parar.wait(self.INTERVALO):
+            try:
+                self._amostrar()
+            except Exception:  # noqa: BLE001 - monitoramento nunca derruba o sistema
+                log.exception("monitor da máquina")
+
+    @staticmethod
+    def _ler(caminho):
+        try:
+            with open(caminho) as f:
+                return f.read()
+        except OSError:
+            return ""
+
+    def _cpu(self):
+        linhas = [ln.split() for ln in self._ler("/proc/stat").splitlines() if ln.startswith("cpu")]
+        agora = {ln[0]: [int(x) for x in ln[1:9]] for ln in linhas}
+        ant, self._cpu_ant = self._cpu_ant, agora
+        if not ant:
+            return None, []
+
+        def uso(a, b):
+            ocioso = (b[3] + b[4]) - (a[3] + a[4])
+            total = sum(b) - sum(a)
+            return round(100 * (1 - ocioso / total), 1) if total > 0 else 0.0
+        total = uso(ant["cpu"], agora["cpu"]) if "cpu" in ant else None
+        nucleos = [uso(ant[k], agora[k]) for k in sorted((k for k in agora if k != "cpu" and k in ant),
+                                                           key=lambda k: int(k[3:]))]
+        return total, nucleos
+
+    def _modelo_cpu(self):
+        if self._modelo is None:
+            txt = self._ler("/proc/cpuinfo")
+            m = re.search(r"^(?:model name|Model|Hardware)\s*:\s*(.+)$", txt, re.M)
+            self._modelo = re.sub(r"\s+", " ", m.group(1)).strip() if m else platform.processor() or platform.machine()
+        return self._modelo
+
+    def _memoria(self):
+        mi = {}
+        for ln in self._ler("/proc/meminfo").splitlines():
+            k, _, v = ln.partition(":")
+            try:
+                mi[k] = int(v.split()[0]) * 1024
+            except (ValueError, IndexError):
+                pass
+        tot, disp = mi.get("MemTotal", 0), mi.get("MemAvailable", mi.get("MemFree", 0))
+        st, sf = mi.get("SwapTotal", 0), mi.get("SwapFree", 0)
+        return {"total": tot, "usada": tot - disp, "pct": round(100 * (tot - disp) / tot, 1) if tot else None,
+                "swap_total": st, "swap_usada": st - sf, "swap_pct": round(100 * (st - sf) / st, 1) if st else 0}
+
+    @staticmethod
+    def _disco():
+        out = []
+        for rot, cam in (("Sistema (/)", "/"), ("Configuração (/etc/asi2srt)", "/etc/asi2srt")):
+            try:
+                u = shutil.disk_usage(cam)
+            except OSError:
+                continue
+            if out and out[0]["total"] == u.total and out[0]["livre"] == u.free:
+                continue      # mesmo disco
+            out.append({"nome": rot, "total": u.total, "usado": u.used, "livre": u.free,   # como o df: usado/(usado+livre)
+                        "pct": round(100 * u.used / (u.used + u.free), 1) if u.used + u.free else None})
+        return out
+
+    def _temperaturas(self):
+        sens = []
+        for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            nome = self._ler(f"{d}/name").strip()
+            for arq in sorted(glob.glob(f"{d}/temp*_input")):
+                try:
+                    c = int(self._ler(arq).strip()) / 1000
+                except ValueError:
+                    continue
+                if not -20 < c < 150:
+                    continue
+                rot = self._ler(arq.replace("_input", "_label")).strip()
+                sens.append({"sensor": f"{nome} {rot}".strip(), "c": round(c, 1),
+                             "cpu": nome in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "soc_thermal")})
+        if not sens:
+            for d in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+                try:
+                    c = int(self._ler(f"{d}/temp").strip()) / 1000
+                except ValueError:
+                    continue
+                tipo = self._ler(f"{d}/type").strip()
+                if -20 < c < 150:
+                    sens.append({"sensor": tipo, "c": round(c, 1), "cpu": "cpu" in tipo.lower() or "x86_pkg" in tipo})
+        cpu = [s["c"] for s in sens if s["cpu"]] or [s["c"] for s in sens]
+        return {"sensores": sens[:16], "cpu_c": max(cpu) if cpu else None}
+
+    def _processos(self, dt):
+        """CPU e memória do asi2srt e dos processos tsp/ffmpeg que ele abriu."""
+        meu = os.getpid()
+        pag = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        filhos, info = {}, {}
+        for d in glob.glob("/proc/[0-9]*"):
+            pid = int(d[6:])
+            st = self._ler(f"{d}/stat")
+            if not st:
+                continue
+            fim = st.rfind(")")
+            nome, campos = st[st.find("(") + 1:fim], st[fim + 2:].split()
+            try:
+                ppid, ut, stt, rss = int(campos[1]), int(campos[11]), int(campos[12]), int(campos[21]) * pag
+            except (IndexError, ValueError):
+                continue
+            filhos.setdefault(ppid, []).append(pid)
+            info[pid] = (nome, ut + stt, rss)
+        # árvore a partir do próprio processo
+        nossos, fila = [], [meu]
+        while fila:
+            p = fila.pop()
+            nossos.append(p)
+            fila += filhos.get(p, [])
+        grupos = {"asi2srt": [0, 0.0, 0], "tsp": [0, 0.0, 0], "ffmpeg": [0, 0.0, 0], "outros": [0, 0.0, 0]}
+        ant, novo = self._proc_ant, {}
+        for p in nossos:
+            if p not in info:
+                continue
+            nome, ticks, rss = info[p]
+            novo[p] = ticks
+            g = "asi2srt" if p == meu else nome if nome in ("tsp", "ffmpeg") else "outros"
+            cpu = 100 * (ticks - ant[p]) / hz / dt if dt and p in ant and ticks >= ant[p] else 0.0
+            grupos[g][0] += 1
+            grupos[g][1] += cpu
+            grupos[g][2] += rss
+        self._proc_ant = novo
+        return {k: {"qtd": v[0], "cpu": round(v[1], 1), "mem": v[2]} for k, v in grupos.items() if v[0]}
+
+    def _amostrar(self):
+        agora = time.monotonic()
+        dt = agora - self._t_proc if self._t_proc else None
+        self._t_proc = agora
+        total, nucleos = self._cpu()
+        mem = self._memoria()
+        temp = self._temperaturas()
+        try:
+            carga = [round(x, 2) for x in os.getloadavg()]
+        except OSError:
+            carga = None
+        try:
+            up = float(self._ler("/proc/uptime").split()[0])
+        except (ValueError, IndexError):
+            up = None
+        rede = []
+        try:
+            for i in listar_interfaces():
+                rede.append({"nome": i["nome"], "link": i["link"], "rx_bps": i["rx_bps"], "tx_bps": i["tx_bps"],
+                             "velocidade_mbps": i["velocidade_mbps"]})
+        except Exception:  # noqa: BLE001
+            pass
+        osr = self._ler("/etc/os-release")
+        m = re.search(r'^PRETTY_NAME="?([^"\n]+)', osr, re.M)
+        a = {"cpu": {"modelo": self._modelo_cpu(), "nucleos": os.cpu_count(), "uso": total, "por_nucleo": nucleos,
+                     "carga": carga},
+             "memoria": mem, "discos": self._disco(), "temperatura": temp, "rede": rede,
+             "processos": self._processos(dt),
+             "sistema": {"maquina": platform.node(), "os": m.group(1) if m else platform.system(),
+                         "kernel": platform.release(), "arquitetura": platform.machine(), "ligado_s": up,
+                         "versao": __version__},
+             "em": time.time()}
+        with self.lock:
+            self.atual = a
+            if total is not None:
+                self.hist.append({"t": int(a["em"]), "cpu": total, "mem": mem["pct"], "temp": temp["cpu_c"]})
+
+    def status(self):
+        with self.lock:
+            return {**self.atual, "historico": list(self.hist)}
+
+
+# ======================================================================
 # Usuários do painel e sessões (tela de login)
 # ======================================================================
 PAPEIS = {"admin": "Administrador", "operador": "Operador"}
@@ -3868,6 +4064,8 @@ f.onsubmit=async ev=>{ev.preventDefault();b.disabled=true;e.textContent='';
 def servidor_web(ger: Gerenciador, endereco: str):
     host, _, porta = endereco.rpartition(":")
     acesso = ger.garantir_senha()
+    monitor = MonitorMaquina()
+    monitor.iniciar()
 
     class H(BaseHTTPRequestHandler):
         server_version = "asi2srt/" + __version__
@@ -4052,6 +4250,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     return
                 if metodo == "GET" and caminho == "/api/interfaces":
                     return self._resp(200, listar_interfaces())
+                if metodo == "GET" and caminho == "/api/sistema":
+                    return self._resp(200, monitor.status())
                 if metodo == "GET" and caminho == "/api/rede":
                     uso = {}
                     for c in ger.defs.values():
@@ -4777,6 +4977,23 @@ table.us td{padding:7px 8px;border-bottom:1px solid #20262f}table.us td:last-chi
 .nic .ntr{display:flex;gap:14px;font-variant-numeric:tabular-nums;font-size:12px;border-top:1px solid #1c222a;padding-top:6px}.nic .ntr span b{color:var(--txt)}.nic .ntr span{color:var(--mut);white-space:nowrap}
 .nic .uso{display:flex;flex-wrap:wrap;gap:4px}.nic .uso span{font-size:11px;background:var(--in);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
 .nic .uso span.r{border-style:dashed;color:var(--mut)}
+/* status do servidor */
+button.sis{font-variant-numeric:tabular-nums;font-size:12.5px}#sisres{display:inline-flex;gap:5px;align-items:baseline}#sisres small{margin-left:5px}#sisres small:first-child{margin-left:0}
+button.sis b{font-weight:600}button.sis .w{color:var(--warn)}button.sis .e{color:var(--err)}button.sis small{color:var(--mut)}
+.siscards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+.sc{border:1px solid var(--line);border-radius:10px;background:#11161d;padding:10px 12px;display:flex;flex-direction:column;gap:8px;font-size:12.5px}
+.sc h4{margin:0;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);font-weight:600;display:flex;justify-content:space-between}
+.sc .big{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}.sc .big small{font-size:12px;color:var(--mut);font-weight:400;margin-left:4px}
+.sc .w{color:var(--warn)}.sc .e{color:var(--err)}.sc .ok{color:#7ee2a8}
+.sbar{display:block;width:100%;height:8px;border-radius:99px;background:#1b2129;overflow:hidden}.sbar i{display:block;height:100%;border-radius:99px;background:var(--acc)}
+.sbar i.w{background:var(--warn)}.sbar i.e{background:var(--err)}
+.cores{display:grid;grid-template-columns:repeat(auto-fill,minmax(84px,1fr));gap:6px 10px}.sc .nota{color:var(--mut);font-size:11.5px;white-space:normal;margin:0}
+.core{font-size:10.5px;color:var(--mut);display:flex;flex-direction:column;gap:3px}.core .sbar{height:5px}
+.sc dl{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;margin:0}.sc dt{color:var(--mut)}.sc dd{margin:0;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.sc table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.sc th{text-align:left;color:var(--mut);font-weight:500;font-size:11px;padding:3px 4px;border-bottom:1px solid var(--line)}
+.sc td{padding:4px;border-bottom:1px solid #1c222a}.sc td.n,.sc th.n{text-align:right}.sc tr:last-child td{border-bottom:0}
+.sc.larga{grid-column:1/-1}.sisg svg{width:100%;height:120px;display:block}.sisg .lg{display:flex;gap:14px;font-size:11.5px;color:var(--mut)}
+.sisg .lg i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
 .aviso{background:#3b2e00;border:1px solid #6b5300;padding:8px 12px;border-radius:8px;margin-bottom:14px;color:#f0d67a}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:10px}
@@ -5020,7 +5237,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
 <div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button><button data-vis="comparar" title="comparar serviços e PIDs de vários sinais">Comparar</button></div>
-<button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência (nome e logo) e PIDs fora do pacote">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
+<button id="bsis" class="sis" title="Status do servidor (CPU, memória, temperatura)"><span id="sisres">Servidor</span></button><button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência (nome e logo) e PIDs fora do pacote">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência e análise</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><fieldset><legend>Nome do painel</legend><label>Nome<input name="titulo" maxlength="80" required></label></fieldset>
@@ -5036,6 +5253,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <p class="msg" style="white-space:normal;margin:8px 0 0">PIDs que vêm no TS mas não pertencem a nenhum serviço (dados do multiplexador). Continuam aparecendo nas tabelas, em cinza, mas <b>não geram erro</b>: nem "PID não referenciado", nem erro de continuidade (CC). Vale para todos os canais, na hora.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Salvar</button></div></form></dialog>
+<dialog id="dlgsis" style="width:min(1040px,96vw)"><div class="dh"><h3>Status do servidor</h3><span id="sisatu" class="msg" style="margin-left:auto;margin-right:12px"></span><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db" id="siscorpo"></div></dialog>
 <dialog id="dlgrede" style="width:min(980px,96vw)"><div class="dh"><h3>Placas de rede do servidor</h3>
 <label class="chk" style="margin-right:12px;font-size:12px"><input type="checkbox" id="redetodas"> mostrar internas (Docker/VM)</label><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db" id="redecorpo"></div></dialog>
@@ -5628,6 +5847,43 @@ $('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1);
   api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render()})}catch(e){toast(e.message)}};
+let SIS=null,SIS_T=null;
+const nv=(v,a=70,e=85)=>v==null?'':v>=e?'e':v>=a?'w':'';
+const gb=b=>b==null?'—':b>=1e12?(b/1e12).toFixed(2)+' TB':b>=1e9?(b/1e9).toFixed(1)+' GB':(b/1e6).toFixed(0)+' MB';
+const tempo=s=>{if(s==null)return'—';s=Math.floor(s);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(d?d+' d ':'')+h+' h '+m+' min'};
+function sisResumo(){const s=SIS;if(!s||!s.cpu)return;const c=s.cpu.uso,m=(s.memoria||{}).pct,tp=(s.temperatura||{}).cpu_c;
+ $('#sisres').innerHTML=`<small>CPU</small><b class="${nv(c)}">${c==null?'—':Math.round(c)+'%'}</b><small>RAM</small><b class="${nv(m,80,90)}">${m==null?'—':Math.round(m)+'%'}</b>${tp!=null?`<b class="${nv(tp,75,85)}">${Math.round(tp)}°C</b>`:''}`}
+function sisGraf(h){if(!h||h.length<2)return'<p class="msg">juntando dados para o gráfico…</p>';const W=600,H=110,n=h.length,X=i=>(i/(n-1)*W).toFixed(1),Y=v=>(H-v/100*H).toFixed(1);
+ const ln=k=>h.map((p,i)=>p[k]==null?'':`${X(i)},${Y(Math.min(100,p[k]))}`).filter(Boolean).join(' ');const tm=h.some(p=>p.temp!=null);
+ return`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${[25,50,75].map(v=>`<line x1="0" x2="${W}" y1="${Y(v)}" y2="${Y(v)}" stroke="#1d242d" vector-effect="non-scaling-stroke"/>`).join('')}
+ <polyline points="${ln('mem')}" fill="none" stroke="#d2a8ff" stroke-width="1.5" vector-effect="non-scaling-stroke"/>${tm?`<polyline points="${ln('temp')}" fill="none" stroke="#f2cc60" stroke-width="1.2" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>`:''}
+ <polyline points="${ln('cpu')}" fill="none" stroke="var(--acc)" stroke-width="1.8" vector-effect="non-scaling-stroke"/></svg>
+ <div class="lg"><span><i style="background:var(--acc)"></i>CPU %</span><span><i style="background:#d2a8ff"></i>Memória %</span>${tm?'<span><i style="background:#f2cc60"></i>Temperatura °C</span>':''}<span style="margin-left:auto">últimos ${Math.round((n-1)*2/60*10)/10} min · escala 0–100</span></div>`}
+function sisCorpo(){const s=SIS;if(!s||!s.cpu){$('#siscorpo').innerHTML='<p class="msg">lendo o servidor…</p>';return}
+ const c=s.cpu,m=s.memoria,tp=s.temperatura,sy=s.sistema,pr=s.processos||{};
+ const barra=(v,a,e)=>`<div class="sbar"><i class="${nv(v,a,e)}" style="width:${Math.max(0,Math.min(100,v||0))}%"></i></div>`;
+ const tot=Object.values(pr).reduce((x,g)=>({cpu:x.cpu+g.cpu,mem:x.mem+g.mem}),{cpu:0,mem:0});
+ $('#sisatu').textContent='atualizado '+new Date(s.em*1000).toLocaleTimeString('pt-BR');
+ $('#siscorpo').innerHTML=`<div class="siscards">
+ <div class="sc"><h4>Processador <span>${c.nucleos} núcleos</span></h4><div class="big ${nv(c.uso)}">${c.uso==null?'—':c.uso.toFixed(0)+'%'}<small>uso total</small></div>${barra(c.uso)}
+  <div class="cores">${(c.por_nucleo||[]).map((v,i)=>`<div class="core"><span>núcleo ${i} · <b class="${nv(v)}">${Math.round(v)}%</b></span>${barra(v)}</div>`).join('')}</div>
+  <dl><dt>Modelo</dt><dd>${esc(c.modelo||'—')}</dd>${c.carga?`<dt>Carga média</dt><dd title="1, 5 e 15 min; acima de ${c.nucleos} = fila de processos esperando CPU" class="${c.carga[0]>c.nucleos?'e':c.carga[0]>c.nucleos*.7?'w':''}">${c.carga.join(' · ')}</dd>`:''}</dl></div>
+ <div class="sc"><h4>Memória</h4><div class="big ${nv(m.pct,80,90)}">${m.pct==null?'—':m.pct.toFixed(0)+'%'}<small>${gb(m.usada)} de ${gb(m.total)}</small></div>${barra(m.pct,80,90)}
+  <dl><dt>Livre</dt><dd>${gb(m.total-m.usada)}</dd><dt>Swap</dt><dd class="${nv(m.swap_pct,20,50)}">${m.swap_total?`${gb(m.swap_usada)} de ${gb(m.swap_total)} (${m.swap_pct}%)`:'sem swap'}</dd></dl></div>
+ <div class="sc"><h4>Temperatura</h4>${tp.cpu_c!=null?`<div class="big ${nv(tp.cpu_c,75,85)}">${tp.cpu_c.toFixed(0)}°C<small>processador</small></div>`:'<p class="nota">Sem sensores de temperatura disponíveis (comum em máquina virtual).</p>'}
+  ${tp.sensores.length?`<table><tr><th>Sensor</th><th class="n">°C</th></tr>${tp.sensores.map(x=>`<tr><td>${esc(x.sensor)}</td><td class="n ${nv(x.c,75,85)}">${x.c.toFixed(1)}</td></tr>`).join('')}</table>`:''}</div>
+ <div class="sc"><h4>Disco</h4>${(s.discos||[]).map(d=>`<div><div style="display:flex;justify-content:space-between"><span>${esc(d.nome)}</span><b class="${nv(d.pct,80,90)}">${d.pct}%</b></div>${barra(d.pct,80,90)}<p class="nota">${gb(d.livre)} livres de ${gb(d.total)}</p></div>`).join('')}</div>
+ <div class="sc"><h4>Rede</h4><table><tr><th>Placa</th><th class="n">↓ recebe</th><th class="n">↑ envia</th></tr>${(s.rede||[]).map(r=>`<tr><td><span style="color:${r.link?'#7ee2a8':'var(--err)'}">●</span> ${esc(r.nome)}</td><td class="n">${fbps(r.rx_bps)}</td><td class="n">${fbps(r.tx_bps)}</td></tr>`).join('')}</table></div>
+ <div class="sc"><h4>Sistema</h4><dl><dt>Máquina</dt><dd>${esc(sy.maquina||'—')}</dd><dt>Sistema</dt><dd>${esc(sy.os||'')}</dd><dt>Kernel</dt><dd>${esc(sy.kernel||'')} · ${esc(sy.arquitetura||'')}</dd><dt>Ligado há</dt><dd>${tempo(sy.ligado_s)}</dd><dt>asi2srt</dt><dd>v${esc(sy.versao||'')}</dd></dl></div>
+ <div class="sc"><h4>Consumo do asi2srt</h4><table><tr><th>Processo</th><th class="n">Qtd.</th><th class="n">CPU</th><th class="n">Memória</th></tr>
+  ${[['asi2srt','Supervisor, análise e painel'],['tsp','TSDuck (entradas e saídas)'],['ffmpeg','ffmpeg (RTMP e imagens)'],['outros','Outros']].filter(([k])=>pr[k]).map(([k,r])=>`<tr><td title="${r}">${k}</td><td class="n">${pr[k].qtd}</td><td class="n ${nv(pr[k].cpu/(c.nucleos||1))}">${pr[k].cpu.toFixed(1)}%</td><td class="n">${gb(pr[k].mem)}</td></tr>`).join('')}
+  <tr><td><b>Total</b></td><td></td><td class="n"><b>${tot.cpu.toFixed(1)}%</b></td><td class="n"><b>${gb(tot.mem)}</b></td></tr></table>
+  <p class="nota">CPU em % de um núcleo (100% = um núcleo inteiro; o máximo é ${c.nucleos*100}%).</p></div>
+ <div class="sc larga sisg"><h4>Últimos minutos</h4>${sisGraf(s.historico)}</div></div>`}
+async function sisAtualizar(){try{SIS=await api('GET','/api/sistema');sisResumo();if($('#dlgsis').open)sisCorpo()}catch(e){}}
+sisAtualizar();setInterval(()=>{if(!$('#dlgsis').open)sisAtualizar()},5000);
+$('#bsis').onclick=async()=>{sisCorpo();$('#dlgsis').showModal();await sisAtualizar();clearInterval(SIS_T);SIS_T=setInterval(sisAtualizar,2000)};
+$('#dlgsis').addEventListener('close',()=>{clearInterval(SIS_T);SIS_T=null});
 let REDE_T=null;
 const fbps=b=>b==null?'—':b>=1e9?(b/1e9).toFixed(2)+' Gb/s':b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(0)+' kb/s';
 const TIPO_NIC={fisica:'física',wifi:'Wi-Fi',bond:'bond',vlan:'VLAN',bridge:'bridge',vpn:'VPN',virtual:'virtual',interna:'interna'};

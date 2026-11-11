@@ -197,6 +197,19 @@ processo que entrega o TS a um distribuidor local, e o distribuidor manda uma c�
 Se um destino falhar (servidor SRT fora do ar, firewall, porta errada), só ele fica tentando de novo
 sozinho — a entrada, a análise e as outras saídas continuam no ar. O motivo da falha aparece na rota.
 
+### Status do servidor
+
+No topo do painel fica sempre visível o uso de **CPU**, **memória** e a **temperatura** do processador
+(amarelo acima de 70%/75 °C, vermelho acima de 85%). Clicando nele abre **Status do servidor**:
+
+- processador (modelo, uso total e por núcleo, carga média), memória e swap, disco;
+- temperaturas dos sensores (em máquina virtual normalmente não há sensores);
+- tráfego de cada placa de rede, nome da máquina, sistema, kernel e há quanto tempo está ligada;
+- **consumo do próprio asi2srt** (supervisor, processos tsp e ffmpeg: quantidade, CPU e memória);
+- gráfico dos últimos 5 minutos de CPU, memória e temperatura.
+
+Tudo é lido de `/proc` e `/sys`, sem instalar nada. API: `GET /api/sistema`.
+
 ### Placas de rede reconhecidas
 
 O botão **Rede** (no topo do painel) mostra todas as placas que o servidor reconhece, lidas do sistema
@@ -491,7 +504,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.24.2 && git push origin v2.17.1
+git tag v2.25.0 && git push origin v2.17.1
 ```
 
 ## Licença
