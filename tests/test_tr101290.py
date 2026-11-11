@@ -394,3 +394,9 @@ def test_pids_isdb_nao_sao_nao_referenciados():
         assert nome in desc and "ISDB" in desc and tipo == "psi"
         assert pid in an._referenciados()
     assert an._desc_pid(0x0500)[0] == "Não referenciado"
+
+
+def test_pid_iip_isdb():
+    an = AnalisadorTS()
+    assert "IIP" in an._desc_pid(0x1FF0)[0] and 0x1FF0 in an._referenciados()
+    assert "1-seg" in an._desc_pid(0x1FC8)[0]

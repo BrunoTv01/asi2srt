@@ -245,9 +245,9 @@ Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**:
   um sinal não tem aquele serviço, `≠` quando o nome muda.
 - **PIDs:** Dec, Hex, Descrição e Serviço, com **Erros CC** e bitrate de cada sinal. Linha com
   barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
-- Filtros **Só diferenças** e **Só com erros CC**, e **Baixar CSV** (abre no Excel).
+- Filtros **Só diferenças**, **Só com erros CC** e **Ocultar não referenciados**, e **Baixar CSV** (abre no Excel).
 
-PIDs fixos do **ISDB-Tb** (0x20 a 0x2F: BIT, SDTT, CDT, EIT M/L etc.) são reconhecidos pelo nome e não
+PIDs fixos do **ISDB-Tb** (0x20 a 0x2F: BIT, SDTT, CDT, EIT M/L etc.; 0x1FF0 IIP do SFN; 0x1FC8–0x1FCF PMT 1-seg) são reconhecidos pelo nome e não
 contam mais como "PID não referenciado".
 
 ### Muitos sinais: visão compacta e Lista
@@ -482,7 +482,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.22.1 && git push origin v2.17.1
+git tag v2.22.2 && git push origin v2.17.1
 ```
 
 ## Licença

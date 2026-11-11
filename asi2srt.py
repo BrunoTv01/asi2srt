@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.22.1"
+__version__ = "2.22.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1049,7 +1049,9 @@ def _texto_dvb(b: bytes) -> str:
 # PIDs fixos do ISDB-T/ISDB-Tb (ARIB STD-B10 / ABNT NBR 15603): não são "não referenciados"
 PIDS_ISDB = {0x20: "LIT (ISDB)", 0x21: "ERT (ISDB)", 0x22: "PCAT (ISDB)", 0x23: "SDTT (ISDB)",
              0x24: "BIT (ISDB)", 0x25: "NBIT/LDT (ISDB)", 0x26: "EIT (ISDB, M-EIT)", 0x27: "EIT (ISDB, L-EIT)",
-             0x28: "SDTT (ISDB)", 0x29: "CDT (ISDB)", 0x2F: "Cabeçalho multiframe (ISDB)"}
+             0x28: "SDTT (ISDB)", 0x29: "CDT (ISDB)", 0x2F: "Cabeçalho multiframe (ISDB)",
+             0x1FF0: "IIP (ISDB, sincronismo SFN)"}
+PIDS_ISDB.update({p: "PMT 1-seg (ISDB)" for p in range(0x1FC8, 0x1FD0)})
 LIMITE_CBR_TS_PCT = 2.0       # TS: taxa total variando menos que isso = CBR
 LIMITE_CBR_SERVICO_PCT = 3.0  # serviço: encoder CBR de verdade fica abaixo de ~3% (janelas de 1 s, pelo PCR)
 
@@ -2705,7 +2707,12 @@ class Gerenciador:
         if not 0 <= idx < len(lista):
             return None
         rel = lista[idx]
-        return {**rel["analise"], "estado": "parado", "salvo": True, "sessao": idx,
+        analise = dict(rel["analise"])
+        # sessões salvas antes de o sistema conhecer os PIDs do ISDB-Tb: corrige a descrição ao exibir
+        analise["pids"] = [{**p, "desc": PIDS_ISDB[p["pid"]], "tipo": "psi"}
+                           if p.get("tipo") == "desconhecido" and p.get("pid") in PIDS_ISDB else p
+                           for p in analise.get("pids") or []]
+        return {**analise, "estado": "parado", "salvo": True, "sessao": idx,
                 "periodo": {k: rel[k] for k in ("inicio", "fim", "duracao_s", "motivo")},
                 "taxa_sessao": rel["taxa"], "totais": rel["totais"], "srt": rel.get("srt") or {},
                 "saidas": rel.get("saidas") or [], "saidas_cfg": rel.get("saidas_cfg") or [], "rede": rel.get("rede")}
@@ -5189,7 +5196,7 @@ function linhaLista(c){const s=c.status||{},ativo=s.estado!=='parado',t=s.tr1012
 function lista(){return`<div class="lista"><table><tr><th></th><th>Canal</th><th>Estado</th><th class="n">Taxa útil</th><th>Tipo</th>
  <th class="n" title="TR 101 290 prioridade 1">P1</th><th class="n" title="prioridade 2">P2</th><th class="n" title="prioridade 3">P3</th><th>Entrada</th><th>Saídas</th><th></th></tr>${dados.map(linhaLista).join('')}</table></div>`}
 // ---------- comparação de sinais (o usuário escolhe as entradas) ----------
-let CMP=null,CMP_DADOS={},CMP_SESS={},CMP_SO_DIF=false,CMP_SO_ERR=false,CMP_ULT=0,CMP_BAR='';
+let CMP=null,CMP_DADOS={},CMP_SESS={},CMP_SO_DIF=false,CMP_SO_ERR=false,CMP_SEM_NREF=false,CMP_ULT=0,CMP_BAR='';
 try{const v=JSON.parse(localStorage.getItem('asi2srt.cmp2')||'null');if(Array.isArray(v))CMP=v.filter(x=>x&&x.id)}catch(e){}
 function cmpSalvar(){try{localStorage.setItem('asi2srt.cmp2',JSON.stringify(CMP))}catch(e){}}
 const vivoC=id=>{const c=dados.find(x=>x.id===id);return!!(c&&(c.status||{}).estado!=='parado')};
@@ -5213,7 +5220,8 @@ function cmpBarra(){const cols=CMP.map((x,i)=>{const viv=vivoC(x.id),ss=CMP_SESS
  return`<div class="cmpsel"><div class="cmpsel-h"><b>Entradas comparadas</b><span>Escolha o canal de cada coluna e se quer os dados ao vivo ou de uma sessão salva (dá para comparar o mesmo canal agora × ontem).</span></div>
   <div class="ccols">${cols}${CMP.length<6?`<button class="cadd" data-ccadd="1">+ Adicionar entrada</button>`:''}</div>
   <div class="cmpb"><span class="sp"></span><button data-cmpf="dif" class="${CMP_SO_DIF?'on':''}" title="mostrar só linhas que diferem entre as entradas">Só diferenças</button>
-  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button><button data-cmpf="csv">Baixar CSV</button></div></div>`}
+  <button data-cmpf="err" class="${CMP_SO_ERR?'on':''}" title="mostrar só PIDs/serviços com erro de continuidade">Só com erros CC</button><button data-cmpf="nref" class="${CMP_SEM_NREF?'on':''}" title="esconder PIDs que não aparecem em nenhuma PMT (dados privados do multiplexador)">Ocultar não referenciados</button><button data-cmpf="csv">Baixar CSV</button></div></div>`}
+const melhor=ps=>{const v=ps.filter(Boolean);return v.find(p=>p.tipo!=='desconhecido')||v[0]||{}};
 function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),sel=CMP.map(x=>dados.find(c=>c.id===x.id)||{nome:'?'});
  const OK=A.map(a=>!a.erro&&!a.carregando),semd=i=>`<span class="sm" title="${esc(A[i].erro||'carregando')}">${A[i].carregando?'…':'sem dados'}</span>`;
  if(CMP.length<2)return`<div class="cmp"><div class="vazio">Adicione pelo menos 2 entradas para comparar.</div></div>`;
@@ -5237,20 +5245,22 @@ function comparar(){const A=CMP.map(x=>CMP_DADOS[ckey(x)]||{carregando:true}),se
  const servs=`<div class="cmp"><h3>Serviços <small>${nums.length} no total · bitrate e erros CC de cada entrada</small></h3><table><tr><th class="n">Nº</th><th>Serviço</th>${cab}</tr>
   ${ls.map(x=>x.html).join('')||`<tr><td colspan="${2+CMP.length}" class="vazio">nenhum serviço ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
  const pids=[...new Set(A.flatMap(a=>(a.pids||[]).map(p=>p.pid)))].sort((x,y)=>x-y);
- let lp=pids.map(pid=>{const ps=A.map(a=>(a.pids||[]).find(p=>p.pid===pid));const um=ps.find(Boolean)||{};
-  const descs=new Set(ps.filter(Boolean).map(p=>p.desc)),svs=new Set(ps.filter(Boolean).map(p=>p.servico||''));
-  const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||svs.size>1,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
+ let lp=pids.map(pid=>{const ps=A.map(a=>(a.pids||[]).find(p=>p.pid===pid));const um=melhor(ps);
+  const descs=new Set(ps.filter(p=>p&&p.tipo!=='desconhecido').map(p=>p.desc)),svs=new Set(ps.filter(Boolean).map(p=>p.servico||''));
+  const nref=ps.map(p=>!!p&&p.tipo==='desconhecido'),algumNref=nref.some(Boolean)&&um.tipo!=='desconhecido';
+  const dif=ps.some((p,i)=>!p&&OK[i])||descs.size>1||svs.size>1||algumNref,err=ps.some(p=>p&&p.cc),desc=um.tipo==='desconhecido';
   return{dif,err,pid,ps,um,html:`<tr class="${err?'err':dif?'dif':''}"><td class="n">${pid}</td><td><code>${esc(um.hex||'')}</code></td>
   <td style="${desc?'color:#ff8f8a':''}">${esc(um.desc||'')}${descs.size>1?`<span class="neq" title="${esc([...descs].join(' / '))}">≠</span>`:''}</td>
   <td>${esc(um.servico||'')}${svs.size>1?`<span class="neq" title="${esc([...svs].join(' / '))}">≠</span>`:''}</td>
-  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
- if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);
+  ${ps.map((p,i)=>`<td class="c">${!OK[i]?semd(i):p?`${cor(p.cc)}<span class="sm">${mb(p.taxa)} Mb/s</span>${nref[i]&&algumNref?'<span class="neq" title="nesta entrada o PID não está em nenhuma PMT">não ref.</span>':''}`:'<span class="aus">ausente</span>'}</td>`).join('')}</tr>`}});
+ const nNref=lp.filter(x=>x.um.tipo==='desconhecido').length;
+ if(CMP_SO_DIF)lp=lp.filter(x=>x.dif);if(CMP_SO_ERR)lp=lp.filter(x=>x.err);if(CMP_SEM_NREF)lp=lp.filter(x=>x.um.tipo!=='desconhecido');
  window._cmpCsv=()=>{const q=v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`,nm=CMP.map((x,i)=>`${String.fromCharCode(65+i)} ${sel[i].nome} (${rotSess(x)})`);
   const L=[['Dec','Hex','Descrição','Serviço',...nm.flatMap(n=>[n+' - Erros CC',n+' - Bitrate (b/s)'])].map(q).join(';')];
   lp.forEach(x=>L.push([x.pid,x.um.hex,x.um.desc,x.um.servico,...x.ps.flatMap((p,i)=>!OK[i]?['sem dados','']:p?[p.cc,Math.round(p.taxa||0)]:['ausente',''])].map(q).join(';')));
   const b=new Blob(['﻿'+L.join('\r\n')],{type:'text/csv;charset=utf-8'}),u=URL.createObjectURL(b),el=document.createElement('a');
   el.href=u;el.download='comparacao-pids-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';document.body.appendChild(el);el.click();el.remove();setTimeout(()=>URL.revokeObjectURL(u),2000)};
- const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total · erros de continuidade (CC) e bitrate em cada entrada · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
+ const tabp=`<div class="cmp"><h3>PIDs <small>${pids.length} no total${nNref?` · <span style="color:#ff8f8a">${nNref} não referenciado(s)</span>`:''} · erros de continuidade (CC) e bitrate em cada entrada · <span style="color:var(--warn)">▌</span> difere · <span style="color:var(--err)">▌</span> com erro CC</small></h3>
   <table><tr><th class="n">Dec</th><th>Hex</th><th>Descrição</th><th>Serviço</th>${cab}</tr>
   ${lp.map(x=>x.html).join('')||`<tr><td colspan="${4+CMP.length}" class="vazio">nenhum PID ${CMP_SO_DIF||CMP_SO_ERR?'com esse filtro':''}</td></tr>`}</table></div>`;
  return resumo+servs+tabp}
@@ -5260,7 +5270,7 @@ document.addEventListener('change',e=>{const s=e.target.closest('[data-cc]');if(
 document.addEventListener('click',e=>{const b=e.target.closest('[data-ccx],[data-ccadd],[data-cmpf]');if(!b)return;
  if(b.dataset.ccx!=null){CMP.splice(+b.dataset.ccx,1);cmpMudou();return}
  if(b.dataset.ccadd){const usados=new Set(CMP.map(x=>x.id)),c=dados.find(c=>!usados.has(c.id))||dados[0];if(c){CMP.push({id:c.id,sessao:vivoC(c.id)?null:0});cmpMudou()}return}
- const f=b.dataset.cmpf;if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}CMP_BAR='';render()});
+ const f=b.dataset.cmpf;if(f==='nref')CMP_SEM_NREF=!CMP_SEM_NREF;else if(f==='dif')CMP_SO_DIF=!CMP_SO_DIF;else if(f==='err')CMP_SO_ERR=!CMP_SO_ERR;else if(f==='csv'){window._cmpCsv&&window._cmpCsv();return}CMP_BAR='';render()});
 setInterval(()=>{if(VIS==='comparar'&&!anaId&&Date.now()-CMP_ULT>2500)cmpBuscar()},3000);
 function render(){if(anaId)return;prevAlvos=new Set();document.querySelectorAll('[data-vis]').forEach(b=>b.classList.toggle('on',b.dataset.vis===VIS));
  if(VIS==='comparar'&&dados.length){cmpIniciar();const g=$('#grid');g.className='';
