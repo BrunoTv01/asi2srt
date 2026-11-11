@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.27.0"
+__version__ = "2.27.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1147,6 +1147,7 @@ class AnalisadorTS:
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
         self.cc_pid = {}
+        self.pmt_err = {}      # PID da PMT -> {n, motivo}: mostra QUAL serviço gerou o erro 1.5
         self.desde = time.time()
 
     def reiniciar_estado(self):
@@ -1208,6 +1209,12 @@ class AnalisadorTS:
     def _erro(self, tipo, agora):
         self.cont[tipo] += 1
         self.ultimo_erro[tipo] = agora
+
+    def _erro_pmt(self, pid, motivo, agora):
+        self._erro("pmt", agora)
+        e = self.pmt_err.setdefault(pid, {"n": 0, "motivo": ""})
+        e["n"] += 1
+        e["motivo"] = motivo
 
     def _retomar(self, agora):
         self.cc.clear()
@@ -1302,7 +1309,10 @@ class AnalisadorTS:
                     self._pes(pid, d, i, afc, agora)
             if pid < 0x20 or pid in pmt_pids:
                 if scr and (pid == 0 or pid in pmt_pids):
-                    self._erro("pat" if pid == 0 else "pmt", agora)
+                    if pid == 0:
+                        self._erro("pat", agora)
+                    else:
+                        self._erro_pmt(pid, "PMT embaralhada", agora)
                 elif afc & 1 and not scr:
                     self._psi(pid, d[i:i + 188], afc, agora)
 
@@ -1463,7 +1473,7 @@ class AnalisadorTS:
 
     def _pmt(self, pid, sec, agora):
         if sec[0] != 0x02:
-            self._erro("pmt", agora)
+            self._erro_pmt(pid, f"table_id 0x{sec[0]:02X} (esperado 0x02)", agora)
             return
         if len(sec) < 16:
             return
@@ -1606,7 +1616,10 @@ class AnalisadorTS:
         def ausente(chave, lim, tipo, desde):
             ult = self.visto.get(chave, desde) if isinstance(chave, int) else desde
             if agora - ult > lim and agora - self.reportado.get((tipo, chave), -1e9) > lim:
-                self._erro(tipo, agora)
+                if tipo == "pmt":
+                    self._erro_pmt(chave, f"ausente por {agora - ult:.1f} s (limite 0,5 s)", agora)
+                else:
+                    self._erro(tipo, agora)
                 self.reportado[(tipo, chave)] = agora
 
         ausente(0, self.LIM_PAT, "pat", self.inicio_fluxo)
@@ -1819,6 +1832,8 @@ class AnalisadorTS:
                     "pcr": self.pcr_info.get(pcr_pid) if pcr_pid is not None else None,
                     "embaralhado": bool(pr["ca"]) or any(c["emb"] for c in comps),
                     "taxa": tx, "componentes": comps,
+                    "pmt_erros": self.pmt_err.get(ppid, {}).get("n", 0),
+                    "pmt_motivo": self.pmt_err.get(ppid, {}).get("motivo", ""),
                 })
             na = []
             if self.taxa.get(0x1FFF, 0) <= 0:
@@ -3178,6 +3193,8 @@ def relatorio_txt(d) -> str:
         pcr = s.get("pcr") or {}
         L.append(f"    PMT {s.get('pmt')}  PCR {s.get('pcr_pid') or '—'}"
                  + (f"  intervalo PCR {pcr.get('intervalo_ms')} ms  jitter {pcr.get('jitter_ns')} ns" if pcr else ""))
+        if s.get("pmt_erros"):
+            L.append(f"    Erro PMT (1.5): {s['pmt_erros']} - último: {s.get('pmt_motivo') or ''}")
         for c in s.get("componentes", []):
             L.append(f"      {c['hex']}  {c['desc']:<26} {c['stream_type']}  {_f_taxa(c['taxa'])}")
     if not d["servicos"]:
@@ -3283,6 +3300,7 @@ footer{{margin-top:26px;color:#8a949e;font-size:11px;border-top:1px solid #e3e7e
                  f'<div class="meta">{e(s.get("provedor") or "")} {e(s.get("tipo") or "")} · PMT <span class="mono">{e(s.get("pmt") or "")}</span> · '
                  f'PCR <span class="mono">{e(s.get("pcr_pid") or "—")}</span>'
                  + (f' · intervalo PCR {pcr.get("intervalo_ms")} ms · jitter {pcr.get("jitter_ns")} ns' if pcr else "")
+                 + (f' · <b style="color:#c62828">Erro PMT (1.5): {s["pmt_erros"]} – {e(s.get("pmt_motivo") or "")}</b>' if s.get("pmt_erros") else "")
                  + '</div><table><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>'
                  + "".join(f'<tr><td class="mono">{e(c["hex"])}</td><td>{e(c["desc"])}</td><td class="mono">{e(c["stream_type"])}</td>'
                            f'<td class="n">{_f_taxa(c["taxa"])}</td></tr>' for c in s.get("componentes", []))
@@ -3465,7 +3483,8 @@ def relatorio_pdf(d, logo=None) -> bytes:
         md = (s.get("modo") or {}).get("modo")
         meta = (f'{s.get("provedor") or ""} {s.get("tipo") or ""} · PMT {s.get("pmt") or ""} · '
                 f'PCR {s.get("pcr_pid") or "—"}'
-                + (f' · intervalo PCR {pcr.get("intervalo_ms")} ms · jitter {pcr.get("jitter_ns")} ns' if pcr else ""))
+                + (f' · intervalo PCR {pcr.get("intervalo_ms")} ms · jitter {pcr.get("jitter_ns")} ns' if pcr else "")
+                + (f' · Erro PMT (1.5): {s["pmt_erros"]} - {s.get("pmt_motivo") or ""}' if s.get("pmt_erros") else ""))
         titulo = Table([[Paragraph(f'{html.escape(tx(s["nome"]))} <font size="8" color="#2f5fb3">programa {s["numero"]}'
                                    + (f" · {html.escape(md)}" if md else "") + "</font>", s_h3),
                          Paragraph(_f_taxa(s.get("taxa")), ParagraphStyle("tr", parent=s_h3, alignment=2))]],
@@ -5962,7 +5981,7 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   <div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
   ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}${seloModo(s.modo)}<span class="tx">${fmtR(s.taxa)}</span></div>
   ${cfgA.length?`<div class="saiem">${dest.length?'Sai em: '+dest.join(' · '):'Não sai em nenhum destino'}</div>`:''}
-  <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span><span>PCR <b>${s.pcr_pid||'—'}</b></span>
+  <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span>${s.pmt_erros?`<span class="badge r" title="Último: ${esc(s.pmt_motivo||'')}">Erro PMT (1.5): ${s.pmt_erros} · ${esc(s.pmt_motivo||'')}</span>`:''}<span>PCR <b>${s.pcr_pid||'—'}</b></span>
   ${s.pcr?`<span>Intervalo PCR <b>${s.pcr.intervalo_ms} ms</b></span><span>Jitter PCR <b>${s.pcr.jitter_ns} ns</b></span>`:''}</div>
   <div class="tabw"><table class="t"><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>
   ${s.componentes.map(c=>`<tr><td class="mono">${c.hex}</td><td>${esc(c.desc)}${c.emb?' <span class="badge r">emb</span>':''}</td><td class="mono">${c.stream_type}</td><td class="n">${fmtR(c.taxa)}</td></tr>`).join('')}</table></div></div>`}).join('')

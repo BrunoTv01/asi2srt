@@ -452,3 +452,12 @@ def test_pid_raro_nao_fica_ausente_a_toa():
         an.processar(video * 7 + (pk if k % 16 == 0 else b""), 100.0 + 0.5 * k)
     assert 7.5 < an.intervalo_pid[0x24] < 8.5
     assert an._lim_pid(0x24) >= 19 and an._lim_pid(0x100) == an.LIM_PID
+
+
+def test_erro_pmt_por_servico_com_motivo():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    an._erro_pmt(0x0100, "ausente por 0.8 s (limite 0,5 s)", 1.0)
+    an._erro_pmt(0x0100, "table_id 0x00 (esperado 0x02)", 2.0)
+    assert an.cont["pmt"] == 2
+    assert an.pmt_err[0x0100] == {"n": 2, "motivo": "table_id 0x00 (esperado 0x02)"}
