@@ -220,12 +220,16 @@ def test_pcr_repeticao_descontinuidade_e_jitter():
         an.processar(b, k * 0.03)
         an.verificar(k * 0.03)
     assert an.cont["pcr_rep"] == an.cont["pcr_disc"] == an.cont["pcr_acc"] == 0
-    # intervalo de 60 ms -> repetition error
+    # intervalo de 60 ms: dentro do limite padrão de 100 ms (ISO/IEC 13818-1, ISDB-Tb) -> sem erro
     ult = 79 * clk * 30 // 1000
     an.processar(pkt_pcr(g, VIDEO, ult + clk * 60 // 1000), 2.5)
+    assert an.cont["pcr_rep"] == 0
+    # com o critério antigo de 40 ms, outro intervalo de 60 ms -> repetition error
+    an.pcr_rep_ticks = int(0.040 * clk)
+    an.processar(pkt_pcr(g, VIDEO, ult + clk * 120 // 1000), 2.56)
     assert an.cont["pcr_rep"] == 1
     # salto de 500 ms sem discontinuity_indicator -> discontinuity error
-    an.processar(pkt_pcr(g, VIDEO, ult + clk * 560 // 1000), 2.6)
+    an.processar(pkt_pcr(g, VIDEO, ult + clk * 620 // 1000), 2.6)
     assert an.cont["pcr_disc"] == 1
     # com discontinuity_indicator não conta
     an.processar(pkt_pcr(g, VIDEO, 5, disc=True), 2.7)

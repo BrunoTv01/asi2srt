@@ -247,6 +247,10 @@ Em **Entradas comparadas**, escolha para cada coluna o **canal** e os **dados**:
   barra amarela = difere entre os sinais; vermelha = tem erro de continuidade.
 - Filtros **Só diferenças**, **Só com erros CC** e **Ocultar não referenciados**, e **Baixar CSV** (abre no Excel).
 
+**Repetição do PCR (2.3a):** o limite padrão é **100 ms** (ISO/IEC 13818-1, usado no ISDB-Tb e recomendado
+pela própria TR 101 290 desde 2005, nota 2 da tabela 5.0b). O critério antigo de **40 ms** do DVB pode ser
+escolhido em **⚙ → Repetição do PCR**; vale para todos os canais na hora.
+
 **PIDs fora do pacote:** em **⚙ → PIDs fora do pacote** fica a lista de PIDs que vêm no TS mas não
 pertencem a nenhum serviço (padrão: 5000, 5016, 5017, 8184). Eles continuam aparecendo nas tabelas, em
 cinza ("Fora do pacote"), mas não geram erro: nem "PID não referenciado", nem continuidade (CC). Vale para
@@ -487,7 +491,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.23.0 && git push origin v2.17.1
+git tag v2.24.0 && git push origin v2.17.1
 ```
 
 ## Licença

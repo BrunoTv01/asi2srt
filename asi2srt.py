@@ -49,7 +49,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.23.0"
+__version__ = "2.24.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1055,6 +1055,20 @@ PIDS_ISDB.update({p: "PMT 1-seg (ISDB)" for p in range(0x1FC8, 0x1FD0)})
 # PIDs que vêm no TS mas ficam "fora do pacote" (dados privados do multiplexador): aparecem nas tabelas,
 # mas não geram erro (nem "não referenciado", nem continuidade). Lista editável no painel (⚙).
 PIDS_FORA_PADRAO = [5000, 5016, 5017, 8184]
+# Repetição do PCR (TR 101 290 2.3a). A versão antiga usava 40 ms; desde 2005 o DVB (TS 101 154) e a nota 2 da
+# tabela 5.0b da TR 101 290 recomendam o limite de 100 ms da ISO/IEC 13818-1, que é também o do ISDB-Tb.
+PCR_REP_OPCOES = (40, 100)
+PCR_REP_PADRAO_MS = 100
+
+
+def aplicar_lim_pcr_texto(ms):
+    """Atualiza a descrição do indicador 2.3a (painel e relatórios) para o limite em uso."""
+    for i, it in enumerate(TR_ITENS):
+        if it[0] == "pcr_rep":
+            TR_ITENS[i] = (it[0], it[1], it[2], it[3], f"Intervalo entre PCRs consecutivos maior que {int(ms)} ms")
+
+
+aplicar_lim_pcr_texto(PCR_REP_PADRAO_MS)
 
 
 def ler_pids(v):
@@ -1097,6 +1111,7 @@ class AnalisadorTS:
 
     def __init__(self):
         self.pids_ignorados = set()      # PIDs fora do pacote: não geram erro
+        self.pcr_rep_ticks = int(PCR_REP_PADRAO_MS / 1000 * 27_000_000)   # limite da repetição do PCR
         self.lock = threading.Lock()
         self.zerar()
         self.reiniciar_estado()
@@ -1285,7 +1300,7 @@ class AnalisadorTS:
             self._erro("pcr_disc", agora)
             self.pcr[pid] = [pcr, idx, pcr, idx, None]
             return
-        if dif > self.PCR_REP:
+        if dif > self.pcr_rep_ticks:
             self._erro("pcr_rep", agora)
         if dif > 0 and idx > uidx:
             dt = dif / 27_000_000
@@ -2329,6 +2344,8 @@ class Canal(threading.Thread):
             self.analisador.pids_ignorados = set(ler_pids(sup.get("pids_ignorados", PIDS_FORA_PADRAO)))
         except ValueError:
             self.analisador.pids_ignorados = set(PIDS_FORA_PADRAO)
+        ms = sup.get("pcr_repeticao_ms", PCR_REP_PADRAO_MS)
+        self.analisador.pcr_rep_ticks = int((ms if ms in PCR_REP_OPCOES else PCR_REP_PADRAO_MS) / 1000 * 27_000_000)
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
         c0 = normalizar_canal(cfg)
@@ -2773,16 +2790,33 @@ class Gerenciador:
             ign = ler_pids(self.sup.get("pids_ignorados", PIDS_FORA_PADRAO))
         except ValueError:
             ign = list(PIDS_FORA_PADRAO)
+        ms = self.sup.get("pcr_repeticao_ms", PCR_REP_PADRAO_MS)
+        ms = ms if ms in PCR_REP_OPCOES else PCR_REP_PADRAO_MS
+        aplicar_lim_pcr_texto(ms)
         return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
-                "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign}
+                "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign,
+                "pcr_repeticao_ms": ms}
 
     def salvar_aparencia(self, dados):
         titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
         if not titulo or len(titulo) > 80:
             raise ValueError("o nome deve ter entre 1 e 80 caracteres")
         ign = ler_pids(dados["pids_ignorados"]) if "pids_ignorados" in dados else None
+        pcr_ms = None
+        if "pcr_repeticao_ms" in dados:
+            try:
+                pcr_ms = int(dados["pcr_repeticao_ms"])
+            except (TypeError, ValueError):
+                pcr_ms = -1
+            if pcr_ms not in PCR_REP_OPCOES:
+                raise ValueError("limite de repetição do PCR: 40 ou 100 ms")
         with self.lock:
             self.sup["titulo"] = titulo
+            if pcr_ms is not None:
+                self.sup["pcr_repeticao_ms"] = pcr_ms
+                for c in list(self.exec.values()):
+                    with c.analisador.lock:
+                        c.analisador.pcr_rep_ticks = int(pcr_ms / 1000 * 27_000_000)
             if ign is not None:
                 self.sup["pids_ignorados"] = ign
                 for c in list(self.exec.values()):
@@ -4005,10 +4039,11 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                              **{k: v for k, v in c["status"].items() if k != "historico"}}
                                             for c in ger.listar()])
                 if metodo == "GET" and caminho == "/api/info":
+                    ap = ger.aparencia()
                     return self._resp(200, {"versao": __version__, "config": ger.caminho,
                                             "persistente": bool(ger.caminho), "tr101290": TR_ITENS,
                                             "plataforma": platform.machine(), "dektec": DEKTEC_DISPONIVEL,
-                                            "aparencia": ger.aparencia()})
+                                            "aparencia": ap})
                 if partes[:2] == ["api", "canais"]:
                     if len(partes) == 2:
                         if metodo == "GET":
@@ -4959,6 +4994,10 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><label class="chk" style="cursor:pointer"><input type="file" id="aplogo" accept="image/png,image/jpeg,image/svg+xml,image/webp" hidden><span class="btnf">Escolher arquivo…</span></label>
 <button type="button" id="aprem" class="perigo">Remover logo</button></div>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PNG, JPG, SVG ou WebP, até 2 MB. Fica salvo no servidor, junto da configuração. Prefira fundo transparente.</p></fieldset>
+<fieldset><legend>Repetição do PCR (TR 101 290 · 2.3a)</legend><label>Limite<select name="pcr_ms">
+<option value="100">100 ms — ISO/IEC 13818-1, ISDB-Tb e recomendação atual da TR 101 290</option>
+<option value="40">40 ms — critério antigo do DVB (TR 101 290 até 2005)</option></select></label>
+<p class="msg" style="white-space:normal;margin:8px 0 0">Gera erro 2.3a quando o intervalo entre dois PCRs do mesmo programa passa do limite. Vale para todos os canais, na hora.</p></fieldset>
 <fieldset><legend>PIDs fora do pacote</legend><label>PIDs (separados por vírgula; decimal ou 0x…)<input name="pids_ign" placeholder="5000, 5016, 5017, 8184" spellcheck="false"></label>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PIDs que vêm no TS mas não pertencem a nenhum serviço (dados do multiplexador). Continuam aparecendo nas tabelas, em cinza, mas <b>não geram erro</b>: nem "PID não referenciado", nem erro de continuidade (CC). Vale para todos os canais, na hora.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
@@ -5544,15 +5583,16 @@ $('#novo').onclick=()=>abrir();
 function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title=ap.titulo;const im=$('#mlogo');
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
-$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');apNovo=null;apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);apNovo=null;apRem=false;
  $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
 $('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
  const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
   $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
 $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
-$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
- try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1)}catch(e){toast(e.message)}};
+ try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1);
+  api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render()})}catch(e){toast(e.message)}};
 let REDE_T=null;
 const fbps=b=>b==null?'—':b>=1e9?(b/1e9).toFixed(2)+' Gb/s':b>=1e6?(b/1e6).toFixed(2)+' Mb/s':(b/1e3).toFixed(0)+' kb/s';
 const TIPO_NIC={fisica:'física',wifi:'Wi-Fi',bond:'bond',vlan:'VLAN',bridge:'bridge',vpn:'VPN',virtual:'virtual',interna:'interna'};
