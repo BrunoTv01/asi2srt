@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.25.0"
+__version__ = "2.25.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1135,6 +1135,7 @@ class AnalisadorTS:
         """Esquece o estado do fluxo (em cada (re)início do tsp)."""
         self.cc = {}
         self.visto = {}
+        self.intervalo_pid = {}     # PID -> intervalo típico entre chegadas, quando passa de 0,5 s
         self.ref = {}
         self.reportado = {}
         self.pmt_pids = {}          # pid PMT -> número do programa
@@ -1193,6 +1194,7 @@ class AnalisadorTS:
     def _retomar(self, agora):
         self.cc.clear()
         self.visto.clear()
+        self.intervalo_pid.clear()
         self.reportado.clear()
         self.secoes.clear()
         self.pcr.clear()
@@ -1212,6 +1214,7 @@ class AnalisadorTS:
         idx0 = self.pacotes
         self.pacotes += n
         npid, visto, cc_est, es_pids, pmt_pids = self.n_pid, self.visto, self.cc, self.es_pids, self.pmt_pids
+        intervalo = self.intervalo_pid
         pid_prog, cnt_prog = self.pid_prog, self.cnt_prog
         for k in range(n):
             i = k * 188
@@ -1233,6 +1236,11 @@ class AnalisadorTS:
             b1 = d[i + 1]
             pid = ((b1 & 0x1F) << 8) | d[i + 2]
             npid[pid] = npid.get(pid, 0) + 1
+            v = visto.get(pid)
+            if v is not None and 0.5 < agora - v <= 60:
+                # intervalo típico de PIDs que vêm de tempos em tempos (BIT, SDTT, CDT no ISDB-Tb)
+                g = agora - v
+                intervalo[pid] = max(g, 0.8 * intervalo.get(pid, g) + 0.2 * g)
             visto[pid] = agora
             pp = pid_prog.get(pid)
             if pp is not None:
@@ -1612,13 +1620,17 @@ class AnalisadorTS:
         refs |= {p["pcr_pid"] for p in self.programas.values()}
         return refs
 
+    def _lim_pid(self, pid):
+        """Tempo sem pacotes para considerar o PID ausente: 5 s, ou 2,5x o intervalo típico dele."""
+        return max(self.LIM_PID, 2.5 * self.intervalo_pid.get(pid, 0))
+
     # --- consultas ----------------------------------------------------
     def status(self, agora=None):
         agora = time.monotonic() if agora is None else agora
         with self.lock:
             fluindo = self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL
             ausentes = sorted(p for p in self.es_pids
-                              if agora - self.visto.get(p, self.ref.get(p, agora)) > self.LIM_PID)
+                              if agora - self.visto.get(p, self.ref.get(p, agora)) > self._lim_pid(p))
             return {
                 "contadores": dict(self.cont),
                 "recentes": [t for t, q in self.ultimo_erro.items() if agora - q < self.RECENTE_S],
@@ -1765,7 +1777,8 @@ class AnalisadorTS:
                     "taxa": int(t), "pct": round(100 * t / total, 2) if total else 0,
                     "pacotes": self.n_pid.get(pid, 0), "cc": self.cc_pid.get(pid, 0),
                     "emb": bool(self.emb.get(pid)), "pcr": pid in pcr_pids,
-                    "ausente": pid not in self.n_pid or (fluindo and agora - self.visto.get(pid, 0) > self.LIM_PID),
+                    "ausente": pid not in self.n_pid or (fluindo and agora - self.visto.get(pid, 0) > self._lim_pid(pid)),
+                    "intervalo_s": round(self.intervalo_pid[pid], 1) if pid in self.intervalo_pid else None,
                 })
             servicos = []
             for ppid, num in sorted(self.pmt_pids.items(), key=lambda x: x[1]):
@@ -5810,7 +5823,7 @@ function rPids(){if(!ana)return;const l=[...ana.pids].sort((x,y)=>{const k=ordem
  +l.map(p=>`<tr class="${p.tipo==='desconhecido'?'unref':p.tipo==='ignorado'?'ign':''} ${p.ausente?'aus':''}" title="${p.tipo==='ignorado'?'PID fora do pacote: aparece, mas não gera erro (lista em ⚙)':''}"><td class="mono n">${p.hex}</td><td class="n">${p.pid}</td><td>${esc(p.desc)}</td>
  <td>${esc(p.servico)}</td><td class="n">${fmtR(p.taxa)}</td><td class="n"><span class="bar" style="width:${Math.max(1,Math.min(60,p.pct*0.6))}px"></span>${p.pct.toFixed(1)}</td>
  <td class="n">${p.pacotes.toLocaleString('pt-BR')}</td><td class="n ${p.cc?'ruim':''}">${p.cc}</td>
- <td>${p.pcr?'<span class="badge">PCR</span> ':''}${p.emb?'<span class="badge r">emb</span>':''}${p.ausente?'<span class="badge r">ausente</span>':''}</td></tr>`).join('')}
+ <td>${p.pcr?'<span class="badge">PCR</span> ':''}${p.emb?'<span class="badge r">emb</span>':''}${(p.ausente?'<span class="badge r" title="nenhum pacote deste PID há mais que o normal para ele">ausente</span>':'')+(p.intervalo_s?`<span class="badge" title="PID enviado de tempos em tempos (tabela rara); só é marcado ausente depois de 2,5x este intervalo">a cada ~${p.intervalo_s} s</span>`:'')}</td></tr>`).join('')}
 $('#apids').addEventListener('click',e=>{const th=e.target.closest('th');if(!th)return;const k=th.dataset.ord;ordem={k,d:ordem.k===k?-ordem.d:(k==='taxa'||k==='pct'||k==='cc'||k==='pacotes'?-1:1)};rPids()});
 $('#voltar').onclick=()=>{location.hash=''};
 $('#azerar').onclick=async()=>{try{await api('POST',`/api/canais/${anaId}/zerar`);carregarAna()}catch(e){toast(e.message)}};

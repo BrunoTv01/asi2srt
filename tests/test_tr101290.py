@@ -441,3 +441,14 @@ def test_servico_sem_pcr_nao_soma_nulos():
     sv = a["servicos"][0]
     assert sv["taxa"] == 206_000 and sv["pcr_pid"] == ""
     assert next(p for p in a["pids"] if p["pid"] == 0x1FFF)["servico"] == ""
+
+
+def test_pid_raro_nao_fica_ausente_a_toa():
+    """BIT/SDTT/CDT do ISDB-Tb vêm a cada vários segundos: o limite de ausência acompanha o intervalo."""
+    an = AnalisadorTS()
+    pk = bytes([0x47, 0x40, 0x24, 0x10]) + bytes(184)
+    video = bytes([0x47, 0x41, 0x00, 0x10]) + bytes(184)
+    for k in range(6 * 16):               # vídeo contínuo (a cada 0,5 s) e a BIT a cada 8 s
+        an.processar(video * 7 + (pk if k % 16 == 0 else b""), 100.0 + 0.5 * k)
+    assert 7.5 < an.intervalo_pid[0x24] < 8.5
+    assert an._lim_pid(0x24) >= 19 and an._lim_pid(0x100) == an.LIM_PID
