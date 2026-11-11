@@ -1339,3 +1339,12 @@ def test_api_sistema(gateway):
     base, _ = gateway
     cod, r = _req(base, "GET", "/api/sistema")
     assert cod == 200 and {"cpu", "memoria", "discos", "temperatura", "processos", "sistema", "historico"} <= set(r)
+
+
+def test_explicar_erro_tsp():
+    cfg = {"entrada": {"tipo": "udp", "endereco": "226.0.0.1:1234", "interface": "enp9s0"}, "saidas": []}
+    m = a.explicar_erro_tsp("* Error: ip: error receiving from UDP socket: Resource temporarily unavailable", cfg)
+    assert "nenhum pacote em 5 s" in m and "enp9s0" in m
+    assert "outro canal" in a.explicar_erro_tsp("error attaching ... DTAPI_E_IN_USE (DTAPI status 4104)")
+    assert a.explicar_erro_tsp("qualquer coisa") == "qualquer coisa"
+    assert "rp_filter = 2" in a.SYSCTL_ASI2SRT

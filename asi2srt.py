@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.26.0"
+__version__ = "2.26.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -823,6 +823,21 @@ def _cfg_validacao(c):
         if res and pri and not nic_utilizavel(pri) and nic_utilizavel(res):
             it["interface"] = res
     return c
+
+
+def explicar_erro_tsp(linha, cfg=None):
+    """Acrescenta uma explicação em português aos erros mais comuns do TSDuck."""
+    ent = (normalizar_canal(cfg)["entrada"] if cfg else {}) or {}
+    if "error receiving from UDP socket" in linha and "temporarily unavailable" in linha:
+        nic = ent.get("interface") or "automática"
+        return (f"{linha.strip()} → nenhum pacote em 5 s. Confira: placa de entrada ({nic}) é a que recebe esse "
+                "sinal? a origem está enviando para esse endereço/porta? multicast: switch com IGMP querier e "
+                "rp_filter (asi2srt verificar).")
+    if "DTAPI_E_IN_USE" in linha:
+        return f"{linha.strip()} → esta porta da placa DekTec já está sendo usada por outro canal."
+    if "DTAPI_E_TIMEOUT" in linha:
+        return f"{linha.strip()} → nenhum sinal ASI na porta de entrada (cabo, porta de cima, origem enviando ASI?)."
+    return linha
 
 
 def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
@@ -2632,7 +2647,7 @@ class Canal(threading.Thread):
             else:
                 self._registrar(logging.INFO, linha)
             if not RE_TSP_AVISO_NORMAL.search(linha):
-                self._set(ultima_msg=linha[-300:])
+                self._set(ultima_msg=explicar_erro_tsp(linha, self.cfg)[-300:])
 
     def run(self):
         espera_min = self.sup.get("reinicio_min_s", 2)
@@ -4557,6 +4572,15 @@ def cmd_verificar(args):
         print("Placas vistas pelo TSDuck:\n" + ((r.stdout or r.stderr).strip() or "  nenhuma encontrada"))
     asi = sorted(f for f in os.listdir("/dev") if f.startswith("asirx")) if os.path.isdir("/dev") else []
     print("\nDispositivos Linux ASI: " + (", ".join("/dev/" + a for a in asi) or "nenhum"))
+    try:
+        rp = [(n, open(f"/proc/sys/net/ipv4/conf/{n}/rp_filter").read().strip())
+              for n in ["all"] + [i["nome"] for i in listar_interfaces()]]
+        estritos = [n for n, v in rp if v == "1"]
+        if estritos:
+            print(f"\n⚠ rp_filter estrito em {', '.join(estritos)}: pode descartar multicast com várias placas -> "
+                  "sudo asi2srt instalar-servico (ou sysctl net.ipv4.conf.all.rp_filter=2)")
+    except OSError:
+        pass
     print("\nPlacas de rede:")
     for i in listar_interfaces():
         print(f"  {i['nome']:<12} {', '.join(i['ips']) or 'sem IP':<18} {'link OK' if i['link'] else 'sem link':<9}"
@@ -4879,6 +4903,10 @@ net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.core.rmem_default = 4194304
 net.core.netdev_max_backlog = 10000
+# multicast com várias placas: modo "solto" do filtro de origem (o estrito descarta multicast vindo
+# de uma rede que o Linux esperaria por outra placa)
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
 """
 
 
