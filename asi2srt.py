@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.28.0"
+__version__ = "2.28.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4386,7 +4386,10 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     titulo = html.escape(ger.aparencia()["titulo"])
                     return self._resp(200, PAINEL_HTML.replace("__VERSAO__", __version__)
                                       .replace("__TITULO__", titulo)
-                                      .replace("__ICONV__", str(ger.aparencia().get("logo_v", 0))).encode(),
+                                      .replace("__ICONV__", str(ger.aparencia().get("logo_v", 0)))
+                                      .replace("__VIS_EXTRAS__", VIS_EXTRAS_HTML if em_container() else "")
+                                      .replace("__VIS_OK__", "rotas,lista,cards,comparar" if em_container()
+                                               else "rotas,comparar").encode(),
                                       "text/html; charset=utf-8")
                 if metodo == "GET" and caminho == "/logo":
                     cam = ger.logo_arquivo()
@@ -4670,6 +4673,11 @@ def cmd_init(args):
         f.write(CONFIG_INICIAL if getattr(args, "vazia", False) else CONFIG_EXEMPLO)
     print(f"configuração criada: {args.arquivo}\n"
           f"edite e rode: asi2srt rodar -c {args.arquivo}   (ou edite pelo painel web)")
+
+
+# Abas Lista e Cards: só na versão Docker; a instalação direta no sistema usa Rotas e Comparar.
+VIS_EXTRAS_HTML = ('<button data-vis="lista" title="uma linha por sinal">Lista</button>'
+                   '<button data-vis="cards">Cards</button>')
 
 
 def em_container():
@@ -5442,7 +5450,7 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 @media(max-width:600px){header{flex-wrap:wrap}.resumo{width:100%;order:3}main{padding:12px}.grid{grid-template-columns:1fr}}
 </style></head><body>
 <header><div class="marca" title="versão __VERSAO__"><img id="mlogo" alt="" hidden><div class="tx"><h1 id="mtit">__TITULO__</h1></div></div><span class="sp"></span>
-<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button><button data-vis="lista" title="uma linha por sinal">Lista</button><button data-vis="cards">Cards</button><button data-vis="comparar" title="comparar serviços e PIDs de vários sinais">Comparar</button></div>
+<div class="resumo" id="resumo"></div><div class="vis" id="vis"><button data-vis="rotas">Rotas</button>__VIS_EXTRAS__<button data-vis="comparar" title="comparar serviços e PIDs de vários sinais">Comparar</button></div>
 <button id="bsis" class="sis" title="Status do servidor (CPU, memória, temperatura)"><span id="sisres">Servidor</span></button><button id="brede" title="Placas de rede do servidor">Rede</button><button id="bap" title="Aparência (nome e logo) e PIDs fora do pacote">⚙</button><button class="pri" id="novo">+ Novo canal</button><div class="usr" id="usr"></div></header>
 <dialog id="dlgap"><form method="dialog" id="frmap">
 <div class="dh"><h3>Aparência e análise</h3><button type="button" class="mini" data-fechar>✕</button></div>
@@ -5603,6 +5611,7 @@ function card(c){const s=c.status||{},ativo=s.estado!=='parado';s._id=c.id;
  <button class="perigo" data-a="excluir" data-id="${c.id}">Excluir</button></div></div>`}
 
 let VIS='rotas';try{VIS=localStorage.getItem('asi2srt.vis')||'rotas'}catch(e){}
+if(!'__VIS_OK__'.split(',').includes(VIS))VIS='rotas';
 const TIPO_TXT={srt:'SRT',udp:'UDP',rtp:'RTP',rtmp:'RTMP',dektec:'ASI',linuxasi:'ASI',arquivo:'ARQ'};
 const viaNic=x=>x.interface?` · placa ${x.interface}`:x.interface_local?` · IP ${x.interface_local}`:'';
 function endTxt(x){return viaNic0(x)}

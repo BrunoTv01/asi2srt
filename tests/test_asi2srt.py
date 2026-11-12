@@ -1425,3 +1425,13 @@ def test_docker_arquivos():
     dc = (raiz / "docker-compose.yml").read_text()
     assert "network_mode: host" in dc and "/etc/asi2srt" in dc
     assert (raiz / "docker" / "entrypoint.sh").read_text().startswith("#!/bin/sh")
+
+
+
+def test_abas_lista_cards_so_no_docker(gateway, monkeypatch):
+    base, _ = gateway
+    _, ck, _ = _login(base, "admin", "segredo")
+    cod, _, pag = _http(base, "GET", "/", cookie=ck)
+    assert cod == 200 and b'data-vis="lista"' not in pag and b'data-vis="cards"' not in pag
+    assert b'data-vis="rotas"' in pag and b'data-vis="comparar"' in pag and b"'rotas,comparar'" in pag
+    assert 'data-vis="lista"' in a.VIS_EXTRAS_HTML and 'data-vis="cards"' in a.VIS_EXTRAS_HTML   # usado no Docker
