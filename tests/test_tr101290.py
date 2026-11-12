@@ -489,3 +489,17 @@ def test_intervalo_pmt_medido_no_fluxo():
     an._intervalo_pmt(0x100, 1250 + 7500) # 600 ms
     e = an.pmt_int[0x100]
     assert round(e["ultimo"]) == 600 and round(e["max"]) == 600 and 100 < e["medio"] < 600
+
+
+def test_pat_ausencia_no_tempo_do_fluxo_com_motivo():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    an.taxa_total = 20e6
+    an.visto[0] = 9.0
+    an.pacotes = 1000
+    an.pkt_pmt[0] = 0                    # 75 ms de fluxo: PAT em dia, apesar de 1 s no relógio
+    an._ausencia_tab(0, "pat", an.LIM_PAT, 0, 10.0)
+    assert an.cont["pat"] == 0
+    an.pacotes = 20000                   # 1,5 s de fluxo sem PAT
+    an._ausencia_tab(0, "pat", an.LIM_PAT, 0, 10.0)
+    assert an.cont["pat"] == 1 and "PAT ausente por 1.5 s" in an.motivo["pat"]

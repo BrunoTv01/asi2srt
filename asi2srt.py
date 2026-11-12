@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.28.2"
+__version__ = "2.28.3"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1146,6 +1146,7 @@ class AnalisadorTS:
         self.perda_local = 0        # datagramas descartados pelo sistema antes de chegar ao analisador
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
+        self.motivo = {}           # tipo -> descrição da última ocorrência (ex.: 'PAT ausente por 0.7 s')
         self.cc_pid = {}
         self.pkt_pmt = {}      # PID da PMT -> índice do último pacote (mede a ausência no tempo do fluxo)
         self.pmt_int = {}      # PID da PMT -> intervalo medido no fluxo (ms): ultimo, medio, max
@@ -1209,9 +1210,11 @@ class AnalisadorTS:
         self.cat_erro_tid = False
         self.nao_ref = set()
 
-    def _erro(self, tipo, agora):
+    def _erro(self, tipo, agora, motivo=None):
         self.cont[tipo] += 1
         self.ultimo_erro[tipo] = agora
+        if motivo:
+            self.motivo[tipo] = motivo
 
     def _intervalo_pmt(self, pid, idx):
         """Mede de quanto em quanto tempo a PMT chega, no tempo do fluxo (pacotes / taxa)."""
@@ -1234,9 +1237,12 @@ class AnalisadorTS:
         """1.5: PMT ausente > 0,5 s medido no TEMPO DO FLUXO (pacotes / taxa), não no relógio do servidor.
         Assim, uma pausa da máquina (CPU ocupada, pacotes chegando em rajada pelo buffer) não vira erro
         falso: só conta se a PMT realmente faltou no sinal."""
-        ult = self.visto.get(ppid, self.ref.get(ppid, agora))
-        lim = self.LIM_PMT
-        if agora - ult <= lim or agora - self.reportado.get(("pmt", ppid), -1e9) <= lim:
+        self._ausencia_tab(ppid, "pmt", self.LIM_PMT, self.ref.get(ppid, agora), agora)
+
+    def _ausencia_tab(self, ppid, tipo, lim, desde, agora):
+        """PAT (1.3) e PMT (1.5) ausentes, medidos no tempo do fluxo."""
+        ult = self.visto.get(ppid, desde)
+        if agora - ult <= lim or agora - self.reportado.get((tipo, ppid), -1e9) <= lim:
             return
         if self.taxa_total > 0:
             ref_pkt = self.pkt_pmt.get(ppid)
@@ -1245,8 +1251,11 @@ class AnalisadorTS:
                 return
         else:
             gap = agora - ult
-        self._erro_pmt(ppid, f"ausente por {gap:.1f} s (limite 0,5 s)", agora)
-        self.reportado[("pmt", ppid)] = agora
+        if tipo == "pmt":
+            self._erro_pmt(ppid, f"ausente por {gap:.1f} s (limite 0,5 s)", agora)
+        else:
+            self._erro(tipo, agora, f"PAT ausente por {gap:.1f} s no sinal (limite 0,5 s)")
+        self.reportado[(tipo, ppid)] = agora
 
     def _erro_pmt(self, pid, motivo, agora):
         self._erro("pmt", agora)
@@ -1263,7 +1272,7 @@ class AnalisadorTS:
         self.pcr.clear()
         self.pcr_chegada.clear()
         self.pts_visto.clear()
-        self.pkt_pmt = {p: self.pacotes for p in self.pmt_pids}
+        self.pkt_pmt = {p: self.pacotes for p in list(self.pmt_pids) + [0]}
         self.pmt_ini.clear()
         self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
         self.si_visto = {k: agora for k in self.si_visto}
@@ -1348,13 +1357,13 @@ class AnalisadorTS:
                 if b1 & 0x40 and pid in es_pids:
                     self._pes(pid, d, i, afc, agora)
             if pid < 0x20 or pid in pmt_pids:
-                if pid in pmt_pids:
+                if pid == 0 or pid in pmt_pids:
                     if b1 & 0x40:
                         self._intervalo_pmt(pid, idx0 + k)
                     self.pkt_pmt[pid] = idx0 + k
                 if scr and (pid == 0 or pid in pmt_pids):
                     if pid == 0:
-                        self._erro("pat", agora)
+                        self._erro("pat", agora, "PAT embaralhada")
                     else:
                         self._erro_pmt(pid, "PMT embaralhada", agora)
                 elif afc & 1 and not scr:
@@ -1495,7 +1504,7 @@ class AnalisadorTS:
 
     def _pat(self, sec, agora):
         if sec[0] != 0x00:
-            self._erro("pat", agora)
+            self._erro("pat", agora, f"table_id 0x{sec[0]:02X} no PID 0 (esperado 0x00)")
             return
         if len(sec) < 12:
             return
@@ -1667,7 +1676,7 @@ class AnalisadorTS:
                     self._erro(tipo, agora)
                 self.reportado[(tipo, chave)] = agora
 
-        ausente(0, self.LIM_PAT, "pat", self.inicio_fluxo)
+        self._ausencia_tab(0, "pat", self.LIM_PAT, self.inicio_fluxo, agora)
         for ppid in self.pmt_pids:
             self._ausencia_pmt(ppid, agora)
         for epid, (_, _, tipo, _) in self.es_pids.items():
@@ -1905,6 +1914,8 @@ class AnalisadorTS:
                 "tr101290": {
                     "contadores": dict(self.cont),
                     "ha_s": {t: round(agora - q, 1) for t, q in self.ultimo_erro.items()},
+                    "motivos": dict(self.motivo),
+                    "pat_intervalo": {k: round(v) for k, v in self.pmt_int[0].items()} if 0 in self.pmt_int else None,
                     "recentes": [t for t, q in self.ultimo_erro.items() if agora - q < self.RECENTE_S],
                     "nao_aplicavel": sorted(set(na) - {t for t, q in self.ultimo_erro.items()
                                                        if agora - q < self.RECENTE_S}),
@@ -3169,7 +3180,9 @@ def dados_relatorio(dados, canal, titulo):
     ultimo = dict(tr.get("ultimo_em") or {})
     for k, ha in (tr.get("ha_s") or {}).items():
         ultimo.setdefault(k, agora - ha)
-    indicadores = [{"prio": prio, "cod": cod, "nome": nome, "desc": desc, "valor": cont.get(k, 0),
+    mot = tr.get("motivos") or {}
+    indicadores = [{"prio": prio, "cod": cod, "nome": nome,
+                    "desc": desc + (f" | Última: {mot[k]}" if mot.get(k) and cont.get(k) else ""), "valor": cont.get(k, 0),
                     "na": k in na and not cont.get(k, 0), "ultimo": ultimo.get(k)}
                    for k, prio, cod, nome, desc in TR_ITENS]
     modo = r.get("modo_taxa") or {}
@@ -6001,7 +6014,8 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
  $('#atr').innerHTML=[1,2,3].map(p=>`<div class="trg"><h4>Prioridade ${p}</h4>${TRI.filter(x=>x[1]===p).map(([k,,cod,nome,desc])=>{
   const v=t.contadores[k]||0,rec=t.recentes.includes(k),na=t.nao_aplicavel.includes(k),ha=S?null:(t.ha_s||{})[k],em=S?(t.ultimo_em||{})[k]:null;
   const c=rec?'e':(na&&!v)?'x':v?'w':'';
-  return`<div class="trl ${c}" title="${esc(desc)}${na?' — não aplicável a este TS':''}"><i></i><span class="cod">${cod}</span><span>${nome}</span>
+  const mot=(t.motivos||{})[k],pi=k==='pat'&&t.pat_intervalo?` · PAT a cada ~${t.pat_intervalo.medio} ms (máx ${t.pat_intervalo.max} ms)`:'';
+  return`<div class="trl ${c}" title="${esc(desc)}${na?' — não aplicável a este TS':''}${mot&&v?'\nÚltima: '+esc(mot):''}${pi}"><i></i><span class="cod">${cod}</span><span>${nome}${mot&&v?`<small style="display:block;color:var(--mut);font-size:10.5px">${esc(mot)}</small>`:''}</span>
   <span class="ha">${na&&!v?'n/a':ha!=null?'há '+fmtHa(ha):em!=null?'às '+fmtH(em):''}</span><b>${v}</b></div>`}).join('')}</div>`).join('');
  // gráfico
  const h=a.historico,W=600,H=150;if(h.length>1){const mx=Math.max(...h)*1.15||1,
