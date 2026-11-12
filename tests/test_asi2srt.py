@@ -1470,3 +1470,36 @@ def test_pipeline_rs204():
 def test_relatorio_pids_em_analise():
     d = {"pids": [{"pid": 0}, {"pid": 0x100}, {"pid": 5000, "tipo": "ignorado"}, {"pid": 0x1FFF}], "n_pids": 4}
     assert a._f_pids(d) == "4 (2 em análise)"
+
+
+# ---------------- 2.31: registro de acessos ----------------
+def test_auditoria_queda_e_boot(tmp_path, monkeypatch):
+    cam = str(tmp_path / "x-auditoria.jsonl")
+    monkeypatch.setattr(a, "hora_boot", lambda: 1000.0)
+    au = a.Auditoria(cam)
+    au.inicio_servico()                       # 1ª vez: só "iniciado"
+    assert [e["tipo"] for e in au.listar()] == ["servico_iniciado"]
+    au2 = a.Auditoria(cam)                    # reiniciou sem "parado" e sem reboot -> queda
+    au2.inicio_servico()
+    tipos = [e["tipo"] for e in au2.listar()]
+    assert tipos[:2] == ["servico_iniciado", "servico_queda"]
+    au2.registrar("servico_parado")
+    monkeypatch.setattr(a, "hora_boot", lambda: 5000.0)   # máquina reiniciada depois de parada normal
+    au3 = a.Auditoria(cam)
+    au3.inicio_servico()
+    boot = [e for e in au3.listar() if e["tipo"] == "maquina_ligada"]
+    assert boot and boot[0]["ok"] and boot[0]["t"] == 5000.0
+
+
+def test_auditoria_api_login_e_acoes(gateway):
+    base, _ = gateway
+    a.AUDIT = a.Auditoria()
+    _http(base, "POST", "/api/login", {"usuario": "admin", "senha": "errada"})
+    _, ck, _ = _login(base, "admin", "segredo")
+    cod, _, corpo = _http(base, "GET", "/api/auditoria", cookie=ck)
+    l = json.loads(corpo)
+    tipos = [e["tipo"] for e in l]
+    assert cod == 200 and "login" in tipos and "login_falhou" in tipos
+    assert l[0]["usuario"] == "admin" and l[0]["ip"]
+    cod, cab, corpo = _http(base, "GET", "/api/auditoria?baixar=1", cookie=ck)
+    assert cod == 200 and "data;hora;evento" in corpo.decode("utf-8-sig")

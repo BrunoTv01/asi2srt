@@ -477,6 +477,16 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## Registro de acessos
+
+Fica no menu do usuário → **Registro de acessos** (só para admin). Registra:
+- **Entradas e saídas:** quem entrou, a hora, o IP e o navegador; logins recusados e bloqueios; troca de senha.
+- **Ações:** canal criado, alterado, excluído, iniciado, parado ou reiniciado; contadores zerados; ⚙ alterado; usuários alterados.
+- **Serviço:** quando o serviço asi2srt subiu e parou. Se subiu sem ter parado normalmente, registra como **parada anormal** (travamento ou processo encerrado à força). Também registra quando a **máquina foi ligada ou reiniciada**, avisando se antes não houve desligamento normal (provável queda de energia).
+- **Reinícios automáticos:** entrada sem sinal, saída travada ou processamento caiu (no máximo um registro por minuto para cada caso).
+
+Os registros ficam em `<config>-auditoria.jsonl` (até 5 MB, mais 1 arquivo anterior) e podem ser baixados em CSV, com filtro por tipo e por usuário.
+
 ## TS 188 e BTS 204
 
 O asi2srt aceita pacotes de **188 bytes (TS)** e de **204 bytes (BTS / RS204)**, e reconhece o formato sozinho.
@@ -561,7 +571,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.30.1 && git push origin v2.30.1
+git tag v2.31.0 && git push origin v2.31.0
 ```
 
 ## Licença

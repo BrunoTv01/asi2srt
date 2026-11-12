@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.30.1"
+__version__ = "2.31.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -2735,6 +2735,8 @@ class Canal(threading.Thread):
             if (teve_dados and parado > limite) or (not teve_dados and tipo == "linuxasi" and parado > max(limite, 30)):
                 self.reinicios_vigia += 1
                 self._registrar(logging.WARNING, f"entrada sem sinal há {int(parado)} s — reiniciando a entrada")
+                auditar("reinicio_auto", detalhe=f"{self.cfg.get('nome', self.name)}: entrada sem sinal há {int(parado)} s",
+                        intervalo_min=60)
                 self._set(ultima_msg=f"sem sinal há {int(parado)} s: entrada reiniciada")
                 try:
                     p.terminate()
@@ -2774,6 +2776,8 @@ class Canal(threading.Thread):
                     and agora - ps.atividade > 30:
                 self._registrar(logging.WARNING, f"[saída {i + 1}] sem atividade há {int(agora - ps.atividade)} s "
                                 "com a entrada no ar — reiniciando a saída")
+                auditar("reinicio_auto", detalhe=f"{self.cfg.get('nome', self.name)}: saída {i + 1} travada",
+                        intervalo_min=60)
                 ps.atividade = agora
                 try:
                     pp.terminate()
@@ -2884,6 +2888,8 @@ class Canal(threading.Thread):
                 self.st["reinicios"] += 1
             self._set(estado="reiniciando", bitrate_bps=0, inicio_execucao=None)
             self._registrar(logging.ERROR, f"tsp saiu (código {rc}). Reiniciando em {espera}s.")
+            auditar("reinicio_auto", detalhe=f"{self.cfg.get('nome', self.name)}: processamento caiu (código {rc})",
+                    ok=False, intervalo_min=60)
             self.parar.wait(espera)
             espera = min(espera * 2, espera_max)
         self._set(estado="parado", bitrate_bps=0, inicio_execucao=None)
@@ -4479,12 +4485,16 @@ def servidor_web(ger: Gerenciador, endereco: str):
             d = self._corpo()
             u = acesso.autenticar(d.get("usuario", ""), d.get("senha", ""), ip)
             if not u:
+                auditar("login_falhou", usuario=str(d.get("usuario", ""))[:40], ip=ip,
+                        detalhe="usuário ou senha incorretos" if not acesso.espera_bloqueio(ip)
+                        else "bloqueado por excesso de tentativas", ok=False)
                 time.sleep(0.5)
                 espera = acesso.espera_bloqueio(ip)
                 return self._resp(429 if espera else 401, {"erro": f"Muitas tentativas erradas. Aguarde {max(1, round(espera / 60))} min."
                                                            if espera else "Usuário ou senha incorretos"})
             token = acesso.criar_sessao(u)
             log.info("painel: login de %s (%s) a partir de %s", u["usuario"], u.get("papel"), ip)
+            auditar("login", usuario=u["usuario"], ip=ip, detalhe=f"{u.get('papel')} · {self.headers.get('User-Agent', '')[:80]}")
             return self._resp(200, acesso.publico(u), cab={"Set-Cookie": f"{COOKIE_SESSAO}={token}; Path=/; HttpOnly; "
                                                                       f"SameSite=Strict; Max-Age={SESSAO_MAX_S}"})
 
@@ -4552,6 +4562,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         return self._resp(429, {"erro": "muitas tentativas erradas; aguarde alguns minutos"})
                     return self._resp(401, {"erro": "login necessário"})
                 if caminho == "/api/logout" and metodo == "POST":
+                    auditar("logout", usuario=u["usuario"], ip=self._ip())
                     acesso.encerrar(self._token())
                     return self._resp(200, {"ok": True}, cab={"Set-Cookie": f"{COOKIE_SESSAO}=; Path=/; HttpOnly; "
                                                                              "SameSite=Strict; Max-Age=0"})
@@ -4560,20 +4571,39 @@ def servidor_web(ger: Gerenciador, endereco: str):
                 if caminho == "/api/eu/senha" and metodo == "PUT":
                     d = self._corpo()
                     acesso.trocar_senha(u["usuario"], d.get("atual"), d.get("nova"), self._token())
+                    auditar("senha", usuario=u["usuario"], ip=self._ip())
                     return self._resp(200, {"ok": True})
+                if caminho == "/api/auditoria" and metodo == "GET":
+                    if u.get("papel") != "admin":
+                        return self._resp(403, {"erro": "apenas administradores"})
+                    l = AUDIT.listar(int(q.get("limite", 500)), q.get("usuario") or None, q.get("tipo") or None,
+                                     float(q["desde"]) if q.get("desde") else None)
+                    if q.get("baixar"):
+                        linhas = ["data;hora;evento;usuario;ip;detalhe"] + [
+                            ";".join([time.strftime("%d/%m/%Y", time.localtime(e["t"])),
+                                      time.strftime("%H:%M:%S", time.localtime(e["t"])), e["descricao"], e["usuario"],
+                                      e["ip"], e["detalhe"].replace(";", ",")]) for e in l]
+                        return self._resp(200, ("\ufeff" + "\r\n".join(linhas)).encode("utf-8"), "text/csv; charset=utf-8",
+                                          baixar=f"acessos-{time.strftime('%Y%m%d-%H%M')}.csv")
+                    return self._resp(200, l)
                 if u is not None and u.get("papel") != "admin" and self._so_admin(metodo, caminho, partes):
                     return self._resp(403, {"erro": "apenas administradores podem fazer isso"})
                 if partes[:2] == ["api", "usuarios"]:
                     if len(partes) == 2 and metodo == "GET":
                         return self._resp(200, acesso.listar())
                     if len(partes) == 2 and metodo == "POST":
-                        return self._resp(201, acesso.salvar(self._corpo()))
+                        r = acesso.salvar(self._corpo())
+                        auditar("usuario", usuario=u["usuario"], ip=self._ip(), detalhe=f"criou {r.get('usuario')} ({r.get('papel')})")
+                        return self._resp(201, r)
                     if len(partes) == 3:
                         try:
                             if metodo == "PUT":
-                                return self._resp(200, acesso.salvar(self._corpo(), partes[2]))
+                                r = acesso.salvar(self._corpo(), partes[2])
+                                auditar("usuario", usuario=u["usuario"], ip=self._ip(), detalhe=f"alterou {partes[2]}")
+                                return self._resp(200, r)
                             if metodo == "DELETE":
                                 acesso.remover(partes[2], u["usuario"])
+                                auditar("usuario", usuario=u["usuario"], ip=self._ip(), detalhe=f"excluiu {partes[2]}")
                                 return self._resp(200, {"ok": True})
                         except KeyError:
                             return self._resp(404, {"erro": "usuário não encontrado"})
@@ -4624,7 +4654,9 @@ def servidor_web(ger: Gerenciador, endereco: str):
                     if metodo == "GET":
                         return self._resp(200, ger.aparencia())
                     if metodo == "PUT":
-                        return self._resp(200, ger.salvar_aparencia(self._corpo()))
+                        r = ger.salvar_aparencia(self._corpo())
+                        auditar("aparencia", usuario=u["usuario"], ip=self._ip())
+                        return self._resp(200, r)
                 if metodo == "GET" and caminho == "/status.json":
                     return self._resp(200, [{"nome": c["nome"], "id": c["id"],
                                              **{k: v for k, v in c["status"].items() if k != "historico"}}
@@ -4642,15 +4674,21 @@ def servidor_web(ger: Gerenciador, endereco: str):
                         if metodo == "POST":
                             dados = self._corpo()
                             dados.pop("id", None)
-                            return self._resp(201, ger.salvar_canal(dados))
+                            r = ger.salvar_canal(dados)
+                            auditar("canal_criado", usuario=u["usuario"], ip=self._ip(), detalhe=str(dados.get("nome", "")))
+                            return self._resp(201, r)
                     cid = partes[2] if len(partes) > 2 else None
                     if cid not in ger.defs:
                         return self._resp(404, {"erro": "canal não encontrado"})
                     if len(partes) == 3:
+                        nome_c = ger.defs[cid].get("nome", cid)
                         if metodo == "PUT":
-                            return self._resp(200, ger.salvar_canal(self._corpo(), cid))
+                            r = ger.salvar_canal(self._corpo(), cid)
+                            auditar("canal_alterado", usuario=u["usuario"], ip=self._ip(), detalhe=nome_c)
+                            return self._resp(200, r)
                         if metodo == "DELETE":
                             ger.remover(cid)
+                            auditar("canal_removido", usuario=u["usuario"], ip=self._ip(), detalhe=nome_c)
                             return self._resp(200, {"ok": True})
                     if len(partes) == 4:
                         acao = partes[3]
@@ -4712,6 +4750,8 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                                                for i, s in enumerate(c["saidas"])]})
                         if metodo == "POST" and acao in ("iniciar", "parar", "reiniciar", "zerar"):
                             getattr(ger, acao)(cid)
+                            auditar("canal_" + acao, usuario=u["usuario"], ip=self._ip(),
+                                    detalhe=ger.defs[cid].get("nome", cid))
                             return self._resp(200, {"ok": True})
                     if len(partes) == 5 and metodo == "GET" and partes[3] == "previa":
                         t = ger.exec.get(cid)
@@ -4796,9 +4836,140 @@ def _carregar(args):
     return cfg, caminho
 
 
+# ======================================================================
+# Registro de acesso e eventos (auditoria): quem entrou, quando, o que fez e se o serviço reiniciou
+# ======================================================================
+AUDIT_TIPOS = {
+    "login": "Entrou no sistema", "login_falhou": "Tentativa de login recusada", "logout": "Saiu do sistema",
+    "senha": "Trocou a própria senha", "usuario": "Usuários alterados",
+    "canal_criado": "Canal criado", "canal_alterado": "Canal alterado", "canal_removido": "Canal excluído",
+    "canal_iniciar": "Canal iniciado", "canal_parar": "Canal parado", "canal_reiniciar": "Canal reiniciado",
+    "canal_zerar": "Contadores zerados", "aparencia": "Configuração (⚙) alterada",
+    "servico_iniciado": "Serviço asi2srt iniciado", "servico_parado": "Serviço asi2srt parado",
+    "servico_queda": "Serviço reiniciado sem parada normal", "maquina_ligada": "Servidor ligado / reiniciado",
+    "reinicio_auto": "Reinício automático",
+}
+
+
+class Auditoria:
+    MAX_MEM = 3000
+    MAX_BYTES = 5 * 1024 * 1024
+
+    def __init__(self, caminho=None):
+        self.caminho = caminho
+        self.lock = threading.Lock()
+        self.ev = collections.deque(maxlen=self.MAX_MEM)
+        self._ult = {}
+        if caminho:
+            for cam in (caminho + ".1", caminho):
+                try:
+                    with open(cam, encoding="utf-8") as f:
+                        for linha in f:
+                            try:
+                                self.ev.append(json.loads(linha))
+                            except ValueError:
+                                pass
+                except OSError:
+                    pass
+
+    def registrar(self, tipo, usuario="sistema", ip="", detalhe="", ok=True, intervalo_min=0, chave=None, extra=None):
+        agora = time.time()
+        if intervalo_min:
+            k = chave or (tipo, detalhe)
+            if agora - self._ult.get(k, 0) < intervalo_min:
+                return
+            self._ult[k] = agora
+        e = {"t": round(agora, 3), "tipo": tipo, "usuario": usuario or "—", "ip": ip or "", "detalhe": detalhe or "",
+             "ok": bool(ok), **(extra or {})}
+        with self.lock:
+            self.ev.append(e)
+            if self.caminho:
+                try:
+                    if os.path.exists(self.caminho) and os.path.getsize(self.caminho) > self.MAX_BYTES:
+                        os.replace(self.caminho, self.caminho + ".1")
+                    with open(self.caminho, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                except OSError as x:
+                    log.error("auditoria: %s", x)
+
+    def ultimo(self, *tipos):
+        with self.lock:
+            for e in reversed(self.ev):
+                if e["tipo"] in tipos:
+                    return e
+        return None
+
+    def listar(self, limite=500, usuario=None, tipo=None, desde=None):
+        with self.lock:
+            l = list(self.ev)
+        if usuario:
+            l = [e for e in l if e["usuario"] == usuario]
+        if tipo:
+            grupos = {"acesso": ("login", "login_falhou", "logout", "senha"),
+                      "servico": ("servico_iniciado", "servico_parado", "servico_queda", "maquina_ligada", "reinicio_auto")}
+            ts = grupos.get(tipo, (tipo,))
+            l = [e for e in l if e["tipo"] in ts]
+        if desde:
+            l = [e for e in l if e["t"] >= desde]
+        return [{**e, "descricao": AUDIT_TIPOS.get(e["tipo"], e["tipo"])} for e in reversed(l[-limite:])]
+
+    def inicio_servico(self):
+        """Na subida: registra boot da máquina e queda do serviço (sem 'parado' antes)."""
+        boot = hora_boot()
+        ult_ini = self.ultimo("servico_iniciado")
+        ult_fim = self.ultimo("servico_parado", "servico_queda")
+        if boot and (not ult_ini or (ult_ini.get("boot") or 0) < boot - 5):
+            if ult_ini:     # já rodou antes: a máquina foi ligada/reiniciada desde então
+                self._reg_boot(boot, ult_ini, ult_fim)
+        elif ult_ini and (not ult_fim or ult_fim["t"] < ult_ini["t"]):
+            self.registrar("servico_queda", detalhe="o serviço anterior (iniciado em "
+                           + time.strftime("%d/%m %H:%M:%S", time.localtime(ult_ini["t"]))
+                           + ") terminou sem parada normal: travamento ou processo encerrado à força", ok=False)
+        e_det = f"versão {__version__}" + (f" · máquina ligada em {time.strftime('%d/%m %H:%M:%S', time.localtime(boot))}"
+                                           if boot else "")
+        self.registrar("servico_iniciado", detalhe=e_det, extra={"boot": boot})
+
+    def _reg_boot(self, boot, ult_ini, ult_fim):
+        normal = ult_fim and ult_fim["t"] >= ult_ini["t"]
+        e = {"t": round(boot, 3), "tipo": "maquina_ligada", "usuario": "sistema", "ip": "",
+             "detalhe": "desligamento normal antes" if normal else
+                        "SEM desligamento normal antes: provável queda de energia ou travamento", "ok": bool(normal)}
+        with self.lock:
+            self.ev.append(e)
+        if self.caminho:
+            try:
+                with open(self.caminho, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            except OSError:
+                pass
+
+
+def hora_boot():
+    try:
+        for linha in open("/proc/stat"):
+            if linha.startswith("btime"):
+                return float(linha.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+AUDIT = Auditoria()
+
+
+def auditar(*a, **k):
+    try:
+        AUDIT.registrar(*a, **k)
+    except Exception:  # noqa: BLE001 - registro nunca derruba o serviço
+        log.exception("auditoria")
+
+
 def executar_gateway(cfg: dict, caminho=None):
+    global AUDIT
     ger = Gerenciador(cfg, caminho)
     sup = ger.sup
+    AUDIT = Auditoria((os.path.splitext(caminho)[0] + "-auditoria.jsonl") if caminho else None)
+    AUDIT.inicio_servico()
     if sup.get("log_arquivo"):
         logging.getLogger().addHandler(logging.FileHandler(sup["log_arquivo"]))
     log.info("asi2srt %s - %d canal(is) configurado(s)", __version__, len(ger.defs))
@@ -4833,6 +5004,7 @@ def executar_gateway(cfg: dict, caminho=None):
 
     def sair(*_):
         log.info("encerrando...")
+        auditar("servico_parado", detalhe="parada normal (systemctl stop/restart, desligamento ou Ctrl+C)")
         ger.encerrar_tudo()
         fim.set()
 
@@ -5768,6 +5940,14 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <label>Repita a nova senha<input type="password" name="nova2" autocomplete="new-password" minlength="6" required></label>
 <p class="msg" style="white-space:normal;margin:0">Mínimo de 6 caracteres. Ao trocar, as outras sessões abertas com este usuário são encerradas.</p></div>
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Trocar senha</button></div></form></dialog>
+<dialog id="dlgaud" style="width:min(1100px,96vw)"><div class="dh"><h3>Registro de acessos e eventos</h3><button type="button" class="mini" data-fechar>✕</button></div>
+<div class="db"><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+ <select id="audtipo"><option value="">Tudo</option><option value="acesso">Entradas no sistema</option><option value="servico">Serviço e reinícios</option>
+ <option value="canal_parar">Canais parados</option><option value="canal_reiniciar">Canais reiniciados</option><option value="canal_alterado">Canais alterados</option><option value="login_falhou">Logins recusados</option></select>
+ <select id="audusr"><option value="">Todos os usuários</option></select>
+ <span id="audres" class="msg" style="margin-left:auto"></span><a class="btn" id="audcsv" href="#">Baixar CSV</a></div>
+<div id="audserv"></div>
+<div class="tabw" style="max-height:60vh;overflow:auto"><table class="t" id="audtab"></table></div></div></dialog>
 <dialog id="dlgus"><div class="dh"><h3>Usuários</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><table class="us" id="tus"></table>
 <form id="frmus" style="margin-top:16px"><fieldset><legend id="uslg">Novo usuário</legend><div class="campos">
@@ -6440,10 +6620,25 @@ const ini=n=>String(n||'?').trim().split(/\s+/).map(x=>x[0]).slice(0,2).join('')
 function desenharUsr(){if(!EU)return;document.body.classList.toggle('op',EU.papel!=='admin');
  $('#usr').innerHTML=`<button id="busr" title="${esc(EU.usuario)}"><span class="av">${esc(ini(EU.nome))}</span><span class="un">${esc(EU.nome)}<small>${esc(EU.papel_nome)}</small></span> ▾</button>
  <div class="mn" id="mnusr" hidden><div class="q"><b>${esc(EU.nome)}</b>${esc(EU.usuario)} · ${esc(EU.papel_nome)}</div>
- <button data-u="senha">Trocar minha senha</button>${EU.papel==='admin'?'<button data-u="usuarios">Usuários e permissões</button>':''}<button data-u="sair">Sair</button></div>`;
+ <button data-u="senha">Trocar minha senha</button>${EU.papel==='admin'?'<button data-u="usuarios">Usuários e permissões</button><button data-u="acessos">Registro de acessos</button>':''}<button data-u="sair">Sair</button></div>`;
  const av=$('#avisos');const id='avsenha';if(EU.senha_padrao&&!document.getElementById(id))av.insertAdjacentHTML('afterbegin',
   `<div class="aviso" id="${id}">Você está usando a senha padrão <b>admin</b>. <button class="mini" data-u="senha">Trocar agora</button></div>`);
  else if(!EU.senha_padrao&&document.getElementById(id))document.getElementById(id).remove()}
+// ---- registro de acessos (admin)
+const audDH=s=>new Date(s*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+const AUD_COR={login:'#7ee2a8',login_falhou:'var(--err)',logout:'var(--mut)',servico_queda:'var(--err)',maquina_ligada:'var(--warn)',
+ servico_iniciado:'#7ee2a8',servico_parado:'var(--warn)',reinicio_auto:'var(--warn)',canal_parar:'var(--warn)',canal_removido:'var(--err)'};
+async function audCarregar(usuarios){const tp=$('#audtipo').value,us=$('#audusr').value,qs=`?limite=1000&tipo=${encodeURIComponent(tp)}&usuario=${encodeURIComponent(us)}`;
+ $('#audcsv').href='/api/auditoria'+qs+'&baixar=1';
+ let l=[];try{l=await api('GET','/api/auditoria'+qs)}catch(e){$('#audtab').innerHTML=`<tr><td>${esc(e.message)}</td></tr>`;return}
+ if(usuarios){try{const t=await api('GET','/api/auditoria?limite=3000');const n=[...new Set(t.map(e=>e.usuario).filter(x=>x&&x!=='sistema'&&x!=='—'))].sort();
+  $('#audusr').innerHTML='<option value="">Todos os usuários</option>'+n.map(x=>`<option>${esc(x)}</option>`).join('');
+  const ini=t.find(e=>e.tipo==='servico_iniciado'),boot=t.find(e=>e.tipo==='maquina_ligada'),q=t.find(e=>e.tipo==='servico_queda'||(e.tipo==='maquina_ligada'&&!e.ok));
+  $('#audserv').innerHTML=`<div class="kpis" style="margin-bottom:10px">${kpi('Serviço iniciado',ini?audDH(ini.t):'—',ini?ini.detalhe:'')}${kpi('Último boot da máquina',boot?audDH(boot.t):'—',boot?boot.detalhe:'')}${kpi('Última parada anormal',q?`<span style="color:var(--err)">${audDH(q.t)}</span>`:'nenhuma',q?q.detalhe:'')}</div>`}catch(e){}}
+ $('#audres').textContent=`${l.length} evento(s)`;
+ $('#audtab').innerHTML='<tr><th>Data e hora</th><th>Evento</th><th>Usuário</th><th>IP</th><th>Detalhe</th></tr>'+l.map(e=>`<tr><td class="mono" style="white-space:nowrap">${audDH(e.t)}</td>
+  <td style="color:${AUD_COR[e.tipo]||'inherit'};white-space:nowrap">${esc(e.descricao)}</td><td>${esc(e.usuario)}</td><td class="mono">${esc(e.ip)}</td><td>${esc(e.detalhe)}</td></tr>`).join('');}
+$('#audtipo').onchange=()=>audCarregar();$('#audusr').onchange=()=>audCarregar();
 async function carregarEu(){try{EU=await api('GET','/api/eu');desenharUsr()}catch(e){}}
 document.addEventListener('click',async e=>{const m=$('#mnusr');const b=e.target.closest('#busr');
  if(b){m.hidden=!m.hidden;return}if(m&&!e.target.closest('#mnusr'))m.hidden=true;
@@ -6451,6 +6646,7 @@ document.addEventListener('click',async e=>{const m=$('#mnusr');const b=e.target
  if(a==='sair'){try{await api('POST','/api/logout')}catch(x){}location.href='/login';return}
  if(a==='senha'){$('#frmsenha').reset();$('#dlgsenha').showModal();return}
  if(a==='usuarios'){usEdit(null);await listarUs();$('#dlgus').showModal();return}
+ if(a==='acessos'){await audCarregar(true);$('#dlgaud').showModal();return}
  if(a==='ued'){usEdit(US.find(x=>x.usuario===u.dataset.n));return}
  if(a==='uex'){if(!confirm(`Excluir o usuário "${u.dataset.n}"?`))return;
   try{await api('DELETE','/api/usuarios/'+encodeURIComponent(u.dataset.n));toast('Usuário excluído',1);listarUs()}catch(x){toast(x.message)}}});
