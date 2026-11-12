@@ -477,6 +477,29 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## Docker
+
+O asi2srt também roda em container. A imagem traz o asi2srt, o TSDuck (plugins srt, ip e dektec), o ffmpeg e o reportlab (PDF).
+
+```bash
+git clone https://github.com/BrunoTv01/asi2srt.git && cd asi2srt
+docker compose up -d --build
+docker compose logs -f
+```
+
+Painel: `http://IP-DO-SERVIDOR:8088` (admin/admin no 1º acesso).
+
+- **Rede do host** (`network_mode: host`): obrigatória para multicast, SRT listener, várias placas de rede e placa reserva.
+- **Dados** no volume `asi2srt-dados` (`/etc/asi2srt`): configuração, usuários, relatórios e logo. Sobrevivem a atualizações.
+- **Ajustes de kernel no HOST** (o container não pode mudar o kernel). Rode uma vez:
+  ```bash
+  docker run --rm asi2srt sysctl | sudo tee /etc/sysctl.d/90-asi2srt.conf && sudo sysctl -p /etc/sysctl.d/90-asi2srt.conf
+  ```
+- **Placa DekTec:** o driver é módulo do kernel, então instale no host (`sudo asi2srt instalar-dektec --sdk <URL>`). Depois descomente `devices:` no `docker-compose.yml` com os nomes de `ls /dev/Dta*`.
+- **Porta do painel:** `PORTA: "9000"` em `environment`.
+- **Atualizar:** `git pull && docker compose up -d --build`.
+- **Comandos:** `docker compose exec asi2srt asi2srt verificar`.
+
 ## Estabilidade e robustez
 
 ### Máquinas modestas (ex.: i3 com 2 GB de RAM)
@@ -517,7 +540,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.27.2 && git push origin v2.27.2
+git tag v2.28.0 && git push origin v2.28.0
 ```
 
 ## Licença

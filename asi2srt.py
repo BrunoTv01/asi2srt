@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.27.2"
+__version__ = "2.28.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4639,6 +4639,10 @@ def executar_gateway(cfg: dict, caminho=None):
 
     signal.signal(signal.SIGINT, sair)
     signal.signal(signal.SIGTERM, sair)
+    if em_container() and (rmem_max() or BUFFER_UDP) < BUFFER_UDP:
+        log.warning("Docker: buffer UDP do host limitado a %d KB. No HOST rode: docker run --rm asi2srt sysctl | "
+                    "sudo tee /etc/sysctl.d/90-asi2srt.conf && sudo sysctl -p /etc/sysctl.d/90-asi2srt.conf",
+                    (rmem_max() or 0) // 1024)
     fim.wait()
 
 
@@ -4663,13 +4667,31 @@ def cmd_init(args):
     if os.path.exists(args.arquivo) and not args.forcar:
         raise SystemExit(f"{args.arquivo} já existe (use --forcar para sobrescrever)")
     with open(args.arquivo, "w", encoding="utf-8") as f:
-        f.write(CONFIG_EXEMPLO)
+        f.write(CONFIG_INICIAL if getattr(args, "vazia", False) else CONFIG_EXEMPLO)
     print(f"configuração criada: {args.arquivo}\n"
           f"edite e rode: asi2srt rodar -c {args.arquivo}   (ou edite pelo painel web)")
 
 
+def em_container():
+    return os.path.exists("/.dockerenv") or os.environ.get("ASI2SRT_DOCKER") == "1"
+
+
+def rmem_max():
+    try:
+        return int(open("/proc/sys/net/core/rmem_max").read())
+    except (OSError, ValueError):
+        return None
+
+
 def cmd_verificar(args):
     ok = True
+    if em_container():
+        rm = rmem_max()
+        print("Rodando em container Docker (rede do host: --network host)")
+        if rm is not None and rm < BUFFER_UDP:
+            print(f"⚠ buffer UDP do host limitado a {rm // 1024} KB: risco de perder pacotes em multicast/SRT.\n"
+                  "   No HOST rode:  docker run --rm asi2srt sysctl | sudo tee /etc/sysctl.d/90-asi2srt.conf"
+                  " && sudo sysctl -p /etc/sysctl.d/90-asi2srt.conf")
     print(f"Plataforma: {platform.machine()} · {_os_release().get('PRETTY_NAME', platform.system())}"
           + ("" if DEKTEC_DISPONIVEL else "  (placas DekTec não são suportadas nesta arquitetura)"))
     tsp = shutil.which(args.tsp) or (args.tsp if os.path.exists(args.tsp) else None)
@@ -6193,7 +6215,11 @@ def main(argv=None):
     p = sub.add_parser("init", help="gera configuração de exemplo")
     p.add_argument("arquivo", nargs="?", default="asi2srt.yaml")
     p.add_argument("--forcar", action="store_true")
+    p.add_argument("--vazia", action="store_true", help="configuração inicial sem canais (usada pelo Docker)")
     p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("sysctl", help="mostra os ajustes de kernel recomendados (para aplicar no host do Docker)")
+    p.set_defaults(func=lambda a: print(SYSCTL_ASI2SRT, end="") or 0)
 
     p = sub.add_parser("verificar", help="confere TSDuck, plugins e placas")
     p.add_argument("--tsp", default="tsp")

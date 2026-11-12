@@ -1,0 +1,47 @@
+# asi2srt com Docker Compose
+#
+#   docker compose up -d --build     # cria a imagem e sobe
+#   docker compose logs -f           # acompanha
+#   docker compose pull && docker compose up -d --build   # atualizar (após git pull)
+#
+# Painel: http://IP-DO-SERVIDOR:8088  (admin / admin no 1º acesso)
+services:
+  asi2srt:
+    build: .
+    image: asi2srt:latest
+    container_name: asi2srt
+    restart: unless-stopped
+
+    # Rede do host: obrigatório para multicast, SRT listener, várias placas de rede e placa reserva.
+    network_mode: host
+
+    environment:
+      TZ: America/Sao_Paulo
+      # PORTA: "8088"           # porta do painel
+
+    volumes:
+      - asi2srt-dados:/etc/asi2srt     # configuração, usuários, relatórios e logo (sobrevive a atualizações)
+
+    # Placa DekTec (driver instalado no HOST com: sudo asi2srt instalar-dektec).
+    # Descomente e ajuste conforme "ls /dev/Dta*" no host:
+    # devices:
+    #   - /dev/Dta1:/dev/Dta1
+    #   - /dev/Dta1Ex:/dev/Dta1Ex
+
+    # Prioridade de tempo real para o processamento do sinal e fixar CPU em modo desempenho
+    cap_add:
+      - SYS_NICE
+      - NET_ADMIN        # failover de placa de rede e rotas por placa
+    ulimits:
+      nofile: 65536
+      memlock: -1
+    oom_score_adj: -500
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  asi2srt-dados:

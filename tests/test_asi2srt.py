@@ -1405,3 +1405,23 @@ def test_sistema_ajustes_maquina_fraca():
     assert "vm.swappiness = 10" in a.SYSCTL_ASI2SRT
     assert "OOMScoreAdjust=-500" in a.UNIDADE_SYSTEMD
     assert callable(a.ajustar_cpu_desempenho)
+
+
+# ---------------- 2.28: Docker ----------------
+def test_docker_init_vazia_e_sysctl(tmp_path, capsys):
+    import subprocess, sys as _s
+    cfg = tmp_path / "c.yaml"
+    r = subprocess.run([_s.executable, a.__file__, "init", "--vazia", str(cfg)], capture_output=True, text=True)
+    assert r.returncode == 0 and "canais: []" in cfg.read_text()
+    r = subprocess.run([_s.executable, a.__file__, "sysctl"], capture_output=True, text=True)
+    assert r.returncode == 0 and "net.core.rmem_max" in r.stdout
+
+
+def test_docker_arquivos():
+    import pathlib
+    raiz = pathlib.Path(a.__file__).parent
+    df = (raiz / "Dockerfile").read_text()
+    assert "instalar-tsduck" in df and "VOLUME /etc/asi2srt" in df and "HEALTHCHECK" in df
+    dc = (raiz / "docker-compose.yml").read_text()
+    assert "network_mode: host" in dc and "/etc/asi2srt" in dc
+    assert (raiz / "docker" / "entrypoint.sh").read_text().startswith("#!/bin/sh")
