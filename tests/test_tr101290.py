@@ -503,3 +503,17 @@ def test_pat_ausencia_no_tempo_do_fluxo_com_motivo():
     an.pacotes = 20000                   # 1,5 s de fluxo sem PAT
     an._ausencia_tab(0, "pat", an.LIM_PAT, 0, 10.0)
     assert an.cont["pat"] == 1 and "PAT ausente por 1.5 s" in an.motivo["pat"]
+
+
+def test_taxa_util_pelo_pcr_ignora_atraso_de_chegada():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    for _ in range(10):
+        an.hist_chegada.append(20_000_000)
+    an.hist_pcr_ts.append(25_000_000)
+    an._acc_teve = True
+    an.taxa_total = 12_500_000            # segundo "vale": chegou metade dos pacotes
+    # 10 Mb/s úteis contados pela chegada, mas no sinal são 25 Mb/s x 80% = 20 Mb/s
+    assert round(an._util_pelo_pcr(10_000_000)) == 20_000_000
+    an._acc_teve = False                  # sem PCR neste segundo: usa a contagem
+    assert an._util_pelo_pcr(10_000_000) == 10_000_000

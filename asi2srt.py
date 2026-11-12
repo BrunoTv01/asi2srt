@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.29.0"
+__version__ = "2.29.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1182,6 +1182,7 @@ class AnalisadorTS:
         self.taxa_total = 0
         self.hist_total = collections.deque(maxlen=300)
         self.hist_util = collections.deque(maxlen=300)   # taxa sem pacotes nulos, a cada 1 s
+        self.hist_chegada = collections.deque(maxlen=300) # mesma taxa contada pela CHEGADA (relógio do servidor)
         self.hist_serv = {}         # número do programa -> deque das taxas por segundo (por chegada)
         # taxa medida pelo relógio do próprio fluxo (PCR): não depende de quando os pacotes chegam
         self.pid_prog = {}          # pid -> número do programa
@@ -1606,6 +1607,24 @@ class AnalisadorTS:
         except (ValueError, OverflowError):
             return None
 
+    _acc_teve = False
+    _ts_pcr_ultimo = None
+
+    def _util_pelo_pcr(self, util_cheg):
+        """Taxa útil no TEMPO DO SINAL: taxa do TS medida pelo PCR x fração de pacotes não nulos.
+        Contar pacotes por segundo de relógio faz um 'vale + pico' sempre que a entrega atrasa um instante
+        (servidor ocupado, rede/SRT segurando pacotes): o sinal não mudou, só a chegada. Pelo PCR, não."""
+        ts = self.hist_pcr_ts[-1] if (self.hist_pcr_ts and self._acc_teve) else None
+        if not ts or self.taxa_total <= 0 or util_cheg <= 0:
+            return util_cheg
+        util = ts * util_cheg / self.taxa_total
+        ref = sorted(x for x in list(self.hist_chegada)[-10:] if x > 0)
+        if ref:
+            med = ref[len(ref) // 2]
+            if abs(util - med) > 0.5 * med:      # PCR incoerente com o sinal: fica com a contagem
+                return util_cheg
+        return util
+
     # --- verificações por tempo ---------------------------------------
     def verificar(self, agora):
         """Checagens por tempo e cálculo de taxas (chamar algumas vezes por segundo)."""
@@ -1616,6 +1635,7 @@ class AnalisadorTS:
             self.taxa = {p: (n - self.n_ant.get(p, 0)) * 1504 / dt for p, n in self.n_pid.items()}
             self.taxa_total = sum(self.taxa.values())
             self.hist_total.append(int(self.taxa_total))
+            self._acc_teve = bool(self.acc_ts)
             if self.acc_ts:
                 ref = max(self.acc_ts, key=lambda p: len(self.acc_ts[p]))
                 v = self.acc_ts[ref]
@@ -1623,6 +1643,7 @@ class AnalisadorTS:
             for num, v in self.acc_prog.items():
                 self.hist_serv_pcr.setdefault(num, collections.deque(maxlen=60)).append(int(sum(v) / len(v)))
             self.acc_ts, self.acc_prog = {}, {}
+            self._ts_pcr_ultimo = self.hist_pcr_ts[-1] if self.hist_pcr_ts and self._acc_teve else None
             for ppid, num in self.pmt_pids.items():
                 pids = {ppid} | {e for e, v in self.es_pids.items() if v[0] == ppid}
                 pcr = (self.programas.get(ppid) or {}).get("pcr_pid")
@@ -1630,7 +1651,9 @@ class AnalisadorTS:
                     pids.add(pcr)
                 self.hist_serv.setdefault(num, collections.deque(maxlen=60)).append(
                     int(sum(self.taxa.get(p, 0) for p in pids)))
-            util = self.taxa_total - self.taxa.get(0x1FFF, 0)
+            util_cheg = self.taxa_total - self.taxa.get(0x1FFF, 0)
+            util = self._util_pelo_pcr(util_cheg)
+            self.hist_chegada.append(int(util_cheg))
             self.hist_util.append(int(util))
             fluindo = self.ultimo_pacote is not None and agora - self.ultimo_pacote < self.LIM_SINAL
             if util > 0 and fluindo:
@@ -1647,8 +1670,8 @@ class AnalisadorTS:
                         self._semente = False
                     else:
                         e[2], e[3] = min(e[2], m5), max(e[3], m5)
-                    ant = sorted(list(self.hist_util)[-11:-1])
-                    if len(ant) >= 5 and util > 1e6 and util > 2.5 * ant[len(ant) // 2]:
+                    ant = sorted(list(self.hist_chegada)[-11:-1])
+                    if len(ant) >= 5 and util_cheg > 1e6 and util_cheg > 2.5 * ant[len(ant) // 2]:
                         self.picos += 1
                 elif e[2] is None and self.inicio_fluxo is not None and agora - self.inicio_fluxo >= 3:
                     e[2] = e[3] = util   # sessão curta: valor provisório até ter a média de 5 s
@@ -2818,19 +2841,48 @@ class Gerenciador:
                     self.relatorios = json.load(f)
             except (OSError, ValueError) as e:
                 log.error("não foi possível ler %s: %s", self.rel_caminho, e)
+        # sessões em andamento ficam num arquivo à parte (pequeno): o autosave de 1 min não reescreve
+        # o histórico inteiro (vários MB), o que travava a análise por um instante em máquina fraca
+        self.and_caminho = (os.path.splitext(caminho)[0] + "-andamento.json") if caminho else None
+        self.andamento = {}
+        if self.and_caminho and os.path.exists(self.and_caminho):
+            try:
+                with open(self.and_caminho, encoding="utf-8") as f:
+                    for cid, rel in (json.load(f) or {}).items():   # sessão interrompida (queda de energia)
+                        lista = self.relatorios.setdefault(cid, [])
+                        if lista and lista[0].get("inicio") == rel.get("inicio"):
+                            lista[0] = rel
+                        else:
+                            lista.insert(0, rel)
+                        del lista[self.MAX_RELATORIOS:]
+                self._gravar_relatorios()
+                os.remove(self.and_caminho)
+            except (OSError, ValueError) as e:
+                log.error("não foi possível ler %s: %s", self.and_caminho, e)
         self._parar_autosave = threading.Event()
         threading.Thread(target=self._autosave, daemon=True, name="autosave").start()
 
     # --- relatórios de análise ---------------------------------------
     MAX_RELATORIOS = 20
 
-    def _gravar_relatorios(self):
-        if not self.rel_caminho:
-            return
-        tmp = self.rel_caminho + ".tmp"
+    @staticmethod
+    def _gravar_json(caminho, dados):
+        txt = json.dumps(dados, ensure_ascii=False, separators=(",", ":"))   # encoder em C: rápido
+        tmp = caminho + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.relatorios, f, ensure_ascii=False)
-        os.replace(tmp, self.rel_caminho)
+            f.write(txt)
+        os.replace(tmp, caminho)
+
+    def _gravar_relatorios(self):
+        if self.rel_caminho:
+            self._gravar_json(self.rel_caminho, self.relatorios)
+
+    def _gravar_andamento(self):
+        if self.and_caminho:
+            if self.andamento:
+                self._gravar_json(self.and_caminho, self.andamento)
+            elif os.path.exists(self.and_caminho):
+                os.remove(self.and_caminho)
 
     def _guardar(self, cid, t, motivo):
         if t.analisador.pacotes == 0:
@@ -2845,7 +2897,13 @@ class Gerenciador:
                 lista.insert(0, rel)
             del lista[self.MAX_RELATORIOS:]
             try:
-                self._gravar_relatorios()
+                if motivo == "em andamento":
+                    self.andamento[cid] = rel
+                    self._gravar_andamento()
+                else:
+                    self.andamento.pop(cid, None)
+                    self._gravar_relatorios()
+                    self._gravar_andamento()
             except OSError as e:
                 log.error("não foi possível salvar relatórios: %s", e)
 
