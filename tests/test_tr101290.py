@@ -461,3 +461,20 @@ def test_erro_pmt_por_servico_com_motivo():
     an._erro_pmt(0x0100, "table_id 0x00 (esperado 0x02)", 2.0)
     assert an.cont["pmt"] == 2
     assert an.pmt_err[0x0100] == {"n": 2, "motivo": "table_id 0x00 (esperado 0x02)"}
+
+
+def test_pmt_ausencia_no_tempo_do_fluxo_nao_no_relogio():
+    """Pausa do servidor (pacotes chegando atrasados em rajada) não pode virar erro 1.5."""
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    an.pmt_pids = {0x100}
+    an.taxa_total = 20e6
+    an.ultimo_pacote = 10.0
+    an.visto[0x100] = 9.0           # relógio: 1 s sem PMT
+    an.pacotes = 1000
+    an.pkt_pmt[0x100] = 0           # fluxo: 1000 pacotes = 75 ms -> PMT em dia
+    an._ausencia_pmt(0x100, 10.0)
+    assert an.cont["pmt"] == 0
+    an.pacotes = 20000              # 20000 pacotes = 1,5 s de fluxo sem PMT -> erro real
+    an._ausencia_pmt(0x100, 10.0)
+    assert an.cont["pmt"] == 1 and "1.5 s" in an.pmt_err[0x100]["motivo"]

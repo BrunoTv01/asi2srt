@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.27.1"
+__version__ = "2.27.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1147,6 +1147,7 @@ class AnalisadorTS:
         self.cont = {t: 0 for t in TIPOS_TR101290}
         self.ultimo_erro = {}
         self.cc_pid = {}
+        self.pkt_pmt = {}      # PID da PMT -> índice do último pacote (mede a ausência no tempo do fluxo)
         self.pmt_err = {}      # PID da PMT -> {n, motivo}: mostra QUAL serviço gerou o erro 1.5
         self.desde = time.time()
 
@@ -1210,6 +1211,24 @@ class AnalisadorTS:
         self.cont[tipo] += 1
         self.ultimo_erro[tipo] = agora
 
+    def _ausencia_pmt(self, ppid, agora):
+        """1.5: PMT ausente > 0,5 s medido no TEMPO DO FLUXO (pacotes / taxa), não no relógio do servidor.
+        Assim, uma pausa da máquina (CPU ocupada, pacotes chegando em rajada pelo buffer) não vira erro
+        falso: só conta se a PMT realmente faltou no sinal."""
+        ult = self.visto.get(ppid, self.ref.get(ppid, agora))
+        lim = self.LIM_PMT
+        if agora - ult <= lim or agora - self.reportado.get(("pmt", ppid), -1e9) <= lim:
+            return
+        if self.taxa_total > 0:
+            ref_pkt = self.pkt_pmt.get(ppid)
+            gap = ((self.pacotes - ref_pkt) * 188 * 8 / self.taxa_total) if ref_pkt is not None else agora - ult
+            if gap <= lim:
+                return
+        else:
+            gap = agora - ult
+        self._erro_pmt(ppid, f"ausente por {gap:.1f} s (limite 0,5 s)", agora)
+        self.reportado[("pmt", ppid)] = agora
+
     def _erro_pmt(self, pid, motivo, agora):
         self._erro("pmt", agora)
         e = self.pmt_err.setdefault(pid, {"n": 0, "motivo": ""})
@@ -1225,6 +1244,7 @@ class AnalisadorTS:
         self.pcr.clear()
         self.pcr_chegada.clear()
         self.pts_visto.clear()
+        self.pkt_pmt = {p: self.pacotes for p in self.pmt_pids}
         self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
         self.si_visto = {k: agora for k in self.si_visto}
         self.inicio_fluxo = agora
@@ -1308,6 +1328,8 @@ class AnalisadorTS:
                 if b1 & 0x40 and pid in es_pids:
                     self._pes(pid, d, i, afc, agora)
             if pid < 0x20 or pid in pmt_pids:
+                if pid in pmt_pids:
+                    self.pkt_pmt[pid] = idx0 + k
                 if scr and (pid == 0 or pid in pmt_pids):
                     if pid == 0:
                         self._erro("pat", agora)
@@ -1466,6 +1488,7 @@ class AnalisadorTS:
             for ppid in novos:
                 if ppid not in self.pmt_pids:
                     self.ref[ppid] = agora
+                    self.pkt_pmt[ppid] = self.pacotes
             self.pmt_pids = novos
             self.es_pids = {k: v for k, v in self.es_pids.items() if v[0] in novos}
             self.programas = {k: v for k, v in self.programas.items() if k in novos}
@@ -1624,7 +1647,7 @@ class AnalisadorTS:
 
         ausente(0, self.LIM_PAT, "pat", self.inicio_fluxo)
         for ppid in self.pmt_pids:
-            ausente(ppid, self.LIM_PMT, "pmt", self.ref.get(ppid, agora))
+            self._ausencia_pmt(ppid, agora)
         for epid, (_, _, tipo, _) in self.es_pids.items():
             ausente(epid, self.LIM_PID, "pid", self.ref.get(epid, agora))
             if tipo in ("video", "audio") and epid in self.pts_visto:
