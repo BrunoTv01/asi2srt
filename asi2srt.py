@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.28.1"
+__version__ = "2.28.2"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1148,6 +1148,8 @@ class AnalisadorTS:
         self.ultimo_erro = {}
         self.cc_pid = {}
         self.pkt_pmt = {}      # PID da PMT -> índice do último pacote (mede a ausência no tempo do fluxo)
+        self.pmt_int = {}      # PID da PMT -> intervalo medido no fluxo (ms): ultimo, medio, max
+        self.pmt_ini = {}      # PID da PMT -> índice do último início de seção
         self.pmt_err = {}      # PID da PMT -> {n, motivo}: mostra QUAL serviço gerou o erro 1.5
         self.desde = time.time()
 
@@ -1211,6 +1213,23 @@ class AnalisadorTS:
         self.cont[tipo] += 1
         self.ultimo_erro[tipo] = agora
 
+    def _intervalo_pmt(self, pid, idx):
+        """Mede de quanto em quanto tempo a PMT chega, no tempo do fluxo (pacotes / taxa)."""
+        ant = self.pmt_ini.get(pid)
+        self.pmt_ini[pid] = idx
+        if ant is None or self.taxa_total <= 0:
+            return
+        ms = (idx - ant) * 188 * 8 / self.taxa_total * 1000
+        if ms < 1:              # seções seguidas no mesmo PID (ex.: PMT de vários programas juntas)
+            return
+        e = self.pmt_int.get(pid)
+        if e is None:
+            self.pmt_int[pid] = {"ultimo": ms, "medio": ms, "max": ms}
+        else:
+            e["ultimo"] = ms
+            e["medio"] += (ms - e["medio"]) * 0.1
+            e["max"] = max(e["max"], ms)
+
     def _ausencia_pmt(self, ppid, agora):
         """1.5: PMT ausente > 0,5 s medido no TEMPO DO FLUXO (pacotes / taxa), não no relógio do servidor.
         Assim, uma pausa da máquina (CPU ocupada, pacotes chegando em rajada pelo buffer) não vira erro
@@ -1245,6 +1264,7 @@ class AnalisadorTS:
         self.pcr_chegada.clear()
         self.pts_visto.clear()
         self.pkt_pmt = {p: self.pacotes for p in self.pmt_pids}
+        self.pmt_ini.clear()
         self.ref = {p: agora for p in list(self.pmt_pids) + list(self.es_pids)}
         self.si_visto = {k: agora for k in self.si_visto}
         self.inicio_fluxo = agora
@@ -1329,6 +1349,8 @@ class AnalisadorTS:
                     self._pes(pid, d, i, afc, agora)
             if pid < 0x20 or pid in pmt_pids:
                 if pid in pmt_pids:
+                    if b1 & 0x40:
+                        self._intervalo_pmt(pid, idx0 + k)
                     self.pkt_pmt[pid] = idx0 + k
                 if scr and (pid == 0 or pid in pmt_pids):
                     if pid == 0:
@@ -1857,6 +1879,7 @@ class AnalisadorTS:
                     "taxa": tx, "componentes": comps,
                     "pmt_erros": self.pmt_err.get(ppid, {}).get("n", 0),
                     "pmt_motivo": self.pmt_err.get(ppid, {}).get("motivo", ""),
+                    "pmt_intervalo": {k: round(v) for k, v in self.pmt_int[ppid].items()} if ppid in self.pmt_int else None,
                 })
             na = []
             if self.taxa.get(0x1FFF, 0) <= 0:
@@ -3218,6 +3241,8 @@ def relatorio_txt(d) -> str:
                  + (f"  intervalo PCR {pcr.get('intervalo_ms')} ms  jitter {pcr.get('jitter_ns')} ns" if pcr else ""))
         if s.get("pmt_erros"):
             L.append(f"    Erro PMT (1.5): {s['pmt_erros']} - último: {s.get('pmt_motivo') or ''}")
+        if s.get("pmt_intervalo"):
+            L.append(f"    PMT a cada ~{s['pmt_intervalo']['medio']} ms (máx {s['pmt_intervalo']['max']} ms; limite 500 ms)")
         for c in s.get("componentes", []):
             L.append(f"      {c['hex']}  {c['desc']:<26} {c['stream_type']}  {_f_taxa(c['taxa'])}")
     if not d["servicos"]:
@@ -6035,7 +6060,7 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   <div class="sh"><b>${esc(s.nome)}</b><span class="m">${esc(s.provedor||'')}</span>
   ${s.tipo?`<span class="badge">${esc(s.tipo)}</span>`:''}${s.embaralhado?'<span class="badge r">embaralhado</span>':''}${seloModo(s.modo)}<span class="tx">${fmtR(s.taxa)}</span></div>
   ${cfgA.length?`<div class="saiem">${dest.length?'Sai em: '+dest.join(' · '):'Não sai em nenhum destino'}</div>`:''}
-  <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span>${s.pmt_erros?`<span class="badge r" title="Último: ${esc(s.pmt_motivo||'')}">Erro PMT (1.5): ${s.pmt_erros} · ${esc(s.pmt_motivo||'')}</span>`:''}<span>PCR <b>${s.pcr_pid||'—'}</b></span>
+  <div class="meta"><span>Programa <b>${s.numero}</b></span><span>PMT <b>${s.pmt}</b></span>${s.pmt_intervalo?`<span title="Intervalo entre PMTs medido no sinal. TR 101 290 1.5: máximo 500 ms">PMT a cada <b style="color:${s.pmt_intervalo.max>500?'var(--err)':s.pmt_intervalo.max>400?'var(--warn)':'inherit'}">~${s.pmt_intervalo.medio} ms</b> (máx ${s.pmt_intervalo.max} ms)</span>`:''}${s.pmt_erros?`<span class="badge r" title="Último: ${esc(s.pmt_motivo||'')}">Erro PMT (1.5): ${s.pmt_erros} · ${esc(s.pmt_motivo||'')}</span>`:''}<span>PCR <b>${s.pcr_pid||'—'}</b></span>
   ${s.pcr?`<span>Intervalo PCR <b>${s.pcr.intervalo_ms} ms</b></span><span>Jitter PCR <b>${s.pcr.jitter_ns} ns</b></span>`:''}</div>
   <div class="tabw"><table class="t"><tr><th>PID</th><th>Componente</th><th>stream_type</th><th class="n">Bitrate</th></tr>
   ${s.componentes.map(c=>`<tr><td class="mono">${c.hex}</td><td>${esc(c.desc)}${c.emb?' <span class="badge r">emb</span>':''}</td><td class="mono">${c.stream_type}</td><td class="n">${fmtR(c.taxa)}</td></tr>`).join('')}</table></div></div>`}).join('')

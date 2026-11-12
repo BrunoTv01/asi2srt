@@ -478,3 +478,14 @@ def test_pmt_ausencia_no_tempo_do_fluxo_nao_no_relogio():
     an.pacotes = 20000              # 20000 pacotes = 1,5 s de fluxo sem PMT -> erro real
     an._ausencia_pmt(0x100, 10.0)
     assert an.cont["pmt"] == 1 and "1.5 s" in an.pmt_err[0x100]["motivo"]
+
+
+def test_intervalo_pmt_medido_no_fluxo():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    an.taxa_total = 18.8e6 / 1.0          # 1 pacote = 80 us
+    an._intervalo_pmt(0x100, 0)
+    an._intervalo_pmt(0x100, 1250)        # 100 ms
+    an._intervalo_pmt(0x100, 1250 + 7500) # 600 ms
+    e = an.pmt_int[0x100]
+    assert round(e["ultimo"]) == 600 and round(e["max"]) == 600 and 100 < e["medio"] < 600
