@@ -477,6 +477,15 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## TS 188 e BTS 204
+
+O asi2srt aceita pacotes de **188 bytes (TS)** e de **204 bytes (BTS / RS204)**, e reconhece o formato sozinho.
+
+- **Entrada UDP, SRT, arquivo ou ASI pelo driver Linux:** o formato é detectado automaticamente. No BTS do ISDB-Tb, os 16 bytes finais de cada pacote trazem a informação ISDB-T, e a análise mostra **Pacote: BTS 204 (ISDB-T)** e a **taxa por camada (A, B, C)**.
+- **Entrada ASI pela DekTec:** o TSDuck recebe sempre em 188 (a placa descarta os 16 bytes finais). O conteúdo é analisado normalmente. Quando a taxa e o PID 0x1FF0 (IIP) indicam BTS, a análise avisa "origem provavelmente BTS 204".
+- **Saídas SRT, UDP e RTP:** campo **Pacote** com 188 (padrão, TS) ou 204 (BTS: mantém os 16 bytes da entrada; se a entrada era 188, o trailer sai preenchido com 0xFF).
+- Precisa do TSDuck 3.39 ou mais novo para levar o trailer até as saídas. Com versão antiga, o 204 é aceito, mas tudo sai em 188.
+
 ## Subida automática (reinício e queda de energia)
 
 O instalador já deixa tudo pronto. Para aplicar ou reaplicar só esta parte, rode `sudo asi2srt inicio-automatico`. Ela faz quatro ajustes:
@@ -552,7 +561,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.29.1 && git push origin v2.29.1
+git tag v2.30.0 && git push origin v2.30.0
 ```
 
 ## Licença

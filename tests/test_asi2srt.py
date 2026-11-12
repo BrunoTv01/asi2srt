@@ -1449,3 +1449,19 @@ def test_inicio_automatico_exige_root(monkeypatch):
     monkeypatch.setattr(a.os, "geteuid", lambda: 1000)
     with pytest.raises(SystemExit):
         a.cmd_inicio_automatico(None)
+
+
+def test_pipeline_rs204():
+    c = {"nome": "x", "entrada": {"tipo": "udp", "endereco": "1234"},
+         "saidas": [{"tipo": "udp", "endereco": "239.1.1.1:1234", "formato": "204"},
+                    {"tipo": "srt", "modo": "caller", "endereco": "h:9000"}]}
+    cmd = a.montar_comando(c, "tsp", porta_analise=5000, porta_dist=5001, rs204=True)
+    i = cmd.index("fork")
+    assert "--format" in cmd[i:i + 8] and "RS204" in cmd and any("--rs204" in x for x in cmd)
+    assert cmd[-1] == "--rs204"                      # distribuidor leva o trailer às saídas
+    sem = a.montar_comando(c, "tsp", porta_analise=5000, porta_dist=5001, rs204=False)
+    assert "RS204" not in sem and "--rs204" not in " ".join(sem)
+    assert "--rs204" in a.montar_saida(c["saidas"][0], 0, "tsp")
+    assert "--rs204" not in a.montar_saida(c["saidas"][1], 1, "tsp")
+    with pytest.raises(ValueError):
+        a._args_formato({"formato": "192"})

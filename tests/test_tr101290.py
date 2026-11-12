@@ -517,3 +517,43 @@ def test_taxa_util_pelo_pcr_ignora_atraso_de_chegada():
     assert round(an._util_pelo_pcr(10_000_000)) == 20_000_000
     an._acc_teve = False                  # sem PCR neste segundo: usa a contagem
     assert an._util_pelo_pcr(10_000_000) == 10_000_000
+
+
+# ---------------- 2.30: TS 188 e BTS 204 ----------------
+def _pkt188(pid=0x100, cc=0):
+    return bytes([0x47, (pid >> 8) & 0x1F, pid & 0xFF, 0x10 | (cc & 0x0F)]) + b"\xff" * 184
+
+
+def _trailer(camada, tmcc=2):
+    return bytes([tmcc << 6, camada << 4, 0x80, 0x00]) + b"\xff" * 12
+
+
+def test_tamanho_pacote_188_e_204():
+    import asi2srt as a
+    d188 = b"".join(_pkt188(cc=i) for i in range(7))
+    d204 = b"".join(_pkt188(cc=i) + _trailer(1) for i in range(7))
+    assert a.tamanho_pacote(d188) == 188 and a.tamanho_pacote(d204) == 204
+    # 1428 bytes = 7 x 204, mas também não é múltiplo de 188 -> 204
+    assert len(d204) % 188 != 0
+
+
+def test_analisador_reconhece_bts_204_e_camadas():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    camadas = [1, 1, 2, 2, 2, 3, 0]
+    d = b"".join(_pkt188(cc=i) + _trailer(c) for i, c in enumerate(camadas))
+    an.processar(d, 1.0)
+    assert an.pacotes == 7 and an.n_204 == 7 and an.n_isdbt == 7
+    assert an.n_camada == {1: 2, 2: 3, 3: 1, 0: 1}
+    assert an.cc_pid.get(0x100, 0) == 0             # pacotes lidos no passo certo (CC em ordem)
+    an.camadas_taxa = {1: 2e6, 2: 3e6}
+    f = an._formato()
+    assert f["bts"] and f["formato"] == "BTS 204 (ISDB-T)" and f["camadas"] == {"A": 2000000, "B": 3000000}
+
+
+def test_trailer_ff_e_ts_188_na_origem():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    d = b"".join(_pkt188(cc=i) + b"\xff" * 16 for i in range(7))   # TSDuck completou com 0xFF
+    an.processar(d, 1.0)
+    assert an.n_204 == 0 and an.n_188 == 7 and not an._formato()["bts"]

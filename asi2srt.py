@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.29.1"
+__version__ = "2.30.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -325,10 +325,18 @@ def _args_srt(s: dict, entrada: bool, prefixo=None) -> list:
     return a
 
 
+def _args_formato(s: dict) -> list:
+    """formato '204' = BTS: cada pacote sai com os 16 bytes de informação ISDB-T (vindos da entrada)."""
+    f = str(s.get("formato") or "188")
+    if f not in ("188", "204"):
+        raise ValueError("formato do pacote deve ser 188 (TS) ou 204 (BTS)")
+    return ["--rs204"] if f == "204" else []
+
+
 def _args_saida(s: dict, prefixo=None) -> list:
     tipo = s.get("tipo", "srt")
     if tipo == "srt":
-        return ["srt"] + _args_srt(s, entrada=False, prefixo=prefixo)
+        return ["srt"] + _args_srt(s, entrada=False, prefixo=prefixo) + _args_formato(s)
     if tipo == "udp":
         if not re.match(r"^[\w.\-]*:\d+$|^\d+$", str(s.get("endereco", "")).strip()):
             raise ValueError("saída UDP precisa de ip:porta")
@@ -338,7 +346,7 @@ def _args_saida(s: dict, prefixo=None) -> list:
         ip = _ip_local(s)
         if ip:
             a += ["--local-address", ip]
-        return a
+        return a + _args_formato(s)
     if tipo == "rtp":
         a = _args_saida({**s, "tipo": "udp"})
         a += ["--rtp"]
@@ -581,6 +589,29 @@ def placas_sem_driver():
             drv = os.path.basename(os.path.realpath(f"{d}/driver")) if os.path.exists(f"{d}/driver") else None
             out.append({"pci": slot, "modelo": _modelo_pci(slot), "driver": drv})
     return out
+
+
+def tamanho_pacote(d) -> int:
+    """188 (TS) ou 204 (TS + 16 bytes: BTS/RS) pelo tamanho do datagrama e pelos sync bytes."""
+    n = len(d)
+    if n % 204 == 0 and (n % 188 or (n >= 408 and d[204] == 0x47 and d[188] != 0x47)):
+        return 204
+    return 188
+
+
+_RS204 = {}
+
+
+def suporta_rs204(tsp_bin="tsp") -> bool:
+    """TSDuck 3.39+: leva o trailer de 16 bytes dos pacotes de 204 bytes até as saídas."""
+    if tsp_bin not in _RS204:
+        try:
+            a = subprocess.run([tsp_bin, "-P", "fork", "--help"], capture_output=True, text=True, timeout=5)
+            b = subprocess.run([tsp_bin, "-O", "ip", "--help"], capture_output=True, text=True, timeout=5) if "RS204" in (a.stdout + a.stderr) else a
+            _RS204[tsp_bin] = "RS204" in (a.stdout + a.stderr) and "--rs204" in (b.stdout + b.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _RS204[tsp_bin] = False
+    return _RS204[tsp_bin]
 
 
 def ip_da_interface(nome: str) -> str:
@@ -842,8 +873,11 @@ def explicar_erro_tsp(linha, cfg=None):
     return linha
 
 
-def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None) -> list:
-    """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS."""
+def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_dist=None, rs204=None) -> list:
+    """porta_analise: porta UDP local onde o analisador TR 101 290 recebe uma cópia do TS.
+    rs204: leva os pacotes de 204 bytes (BTS) com o trailer até o analisador e as saídas."""
+    if rs204 is None:
+        rs204 = bool(porta_analise or porta_dist) and suporta_rs204(tsp_bin)
     canal = normalizar_canal(canal)
     ent = canal["entrada"]
     _validar_reserva(ent)
@@ -883,8 +917,12 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
     # cópia do TS bruto (logo após a entrada, antes de filtros) para o analisador TR 101 290
     if porta_analise and proc.get("analise_tr101290", True):
         filho = [tsp_bin, "-O", "ip", f"127.0.0.1:{porta_analise}", "--packet-burst", str(LOTE_INTERNO)]
-        cmd += ["-P", "fork", "--nowait", "--ignore-abort", "--buffered-packets", str(LOTE_INTERNO),
-                " ".join(shlex.quote(a) for a in filho)]
+        if rs204:
+            filho += ["--rs204"]
+        cmd += ["-P", "fork", "--nowait", "--ignore-abort", "--buffered-packets", str(LOTE_INTERNO)]
+        if rs204:
+            cmd += ["--format", "RS204"]
+        cmd += [" ".join(shlex.quote(a) for a in filho)]
 
     pids =[_pid(p) for p in (proc.get("remover_pids") or []) if str(p).strip()]
     if proc.get("remover_nulos", True) and not so_analise:
@@ -910,6 +948,8 @@ def montar_comando(canal: dict, tsp_bin: str = "tsp", porta_analise=None, porta_
         cmd += ["-O", "drop"]
     else:  # o distribuidor alimenta as saídas e a janela de imagem
         cmd += ["-O", "ip", f"127.0.0.1:{porta_dist or 'PORTA_DIST'}", "--packet-burst", str(LOTE_INTERNO)]
+        if rs204:
+            cmd += ["--rs204"]
     return cmd
 
 
@@ -1153,6 +1193,11 @@ class AnalisadorTS:
         self.pkt_pmt = {}      # PID da PMT -> índice do último pacote (mede a ausência no tempo do fluxo)
         self.pmt_int = {}      # PID da PMT -> intervalo medido no fluxo (ms): ultimo, medio, max
         self.pmt_ini = {}      # PID da PMT -> índice do último início de seção
+        self.n_188 = 0         # pacotes recebidos sem trailer (TS 188)
+        self.n_204 = 0         # pacotes com trailer de 16 bytes real (BTS 204)
+        self.n_isdbt = 0       # ... cujo trailer é de TV digital terrestre (ISDB-T)
+        self.n_camada = {}     # indicador de camada do trailer -> pacotes (1=A, 2=B, 3=C, 0=nulo, 8=IIP)
+        self.n_camada_ant, self.camadas_taxa = {}, {}
         self.pmt_err = {}      # PID da PMT -> {n, motivo}: mostra QUAL serviço gerou o erro 1.5
         self.desde = time.time()
 
@@ -1218,6 +1263,38 @@ class AnalisadorTS:
         self.ultimo_erro[tipo] = agora
         if motivo:
             self.motivo[tipo] = motivo
+
+    BTS_TAXA_188 = 32_507_936 * 188 / 204     # BTS ISDB-Tb (32,507936 Mb/s) contado em pacotes de 188
+
+    def _formato(self):
+        """TS 188 ou BTS 204, para o painel e os relatórios."""
+        tot = self.n_188 + self.n_204
+        if tot and self.n_204 > 0.5 * tot:
+            nomes = {1: "A", 2: "B", 3: "C", 0: "nulo", 8: "IIP", 4: "AC"}
+            cam = {nomes.get(c, f"#{c}"): int(v) for c, v in sorted(self.camadas_taxa.items()) if v > 0}
+            return {"formato": "BTS 204" + (" (ISDB-T)" if self.n_isdbt > 0.5 * self.n_204 else ""),
+                    "bts": True, "camadas": cam}
+        prov = (abs(self.taxa_total - self.BTS_TAXA_188) < 0.002 * self.BTS_TAXA_188
+                and 0x1FF0 in self.n_pid)
+        return {"formato": "TS 188" + (" (taxa e IIP de BTS: origem provavelmente BTS 204)" if prov else ""),
+                "bts": False, "camadas": {}}
+
+    def _trailers(self, d, n):
+        """Pacotes de 204 bytes (BTS): os 16 bytes finais trazem a informação ISDB-T (camada de cada
+        pacote). Trailer todo 0xFF = o TS de origem era 188 e o TSDuck só completou o tamanho."""
+        cam = self.n_camada
+        reais = 0
+        for k in range(n):
+            j = k * 204 + 188
+            if d[j] == 0xFF and d[j + 1] == 0xFF and d[j + 2] == 0xFF and d[j + 7] == 0xFF:
+                continue
+            reais += 1
+            li = d[j + 1] >> 4
+            cam[li] = cam.get(li, 0) + 1
+            if d[j] >> 6 in (2, 3):
+                self.n_isdbt += 1
+        self.n_204 += reais
+        self.n_188 += n - reais
 
     def _intervalo_pmt(self, pid, idx):
         """Mede de quanto em quanto tempo a PMT chega, no tempo do fluxo (pacotes / taxa)."""
@@ -1287,14 +1364,19 @@ class AnalisadorTS:
             self._retomar(agora)
         self.ultimo_pacote = agora
         self.fluindo = True
-        n = len(d) // 188
+        passo = tamanho_pacote(d)
+        n = len(d) // passo
         idx0 = self.pacotes
         self.pacotes += n
+        if passo == 204:
+            self._trailers(d, n)
+        else:
+            self.n_188 += n
         npid, visto, cc_est, es_pids, pmt_pids = self.n_pid, self.visto, self.cc, self.es_pids, self.pmt_pids
         intervalo = self.intervalo_pid
         pid_prog, cnt_prog = self.pid_prog, self.cnt_prog
         for k in range(n):
-            i = k * 188
+            i = k * passo
             if d[i] != 0x47:
                 self._erro("sync_byte", agora)
                 self.ruins += 1
@@ -1651,6 +1733,8 @@ class AnalisadorTS:
                     pids.add(pcr)
                 self.hist_serv.setdefault(num, collections.deque(maxlen=60)).append(
                     int(sum(self.taxa.get(p, 0) for p in pids)))
+            self.camadas_taxa = {c: (q - self.n_camada_ant.get(c, 0)) * 1504 / dt for c, q in self.n_camada.items()}
+            self.n_camada_ant = dict(self.n_camada)
             util_cheg = self.taxa_total - self.taxa.get(0x1FFF, 0)
             util = self._util_pelo_pcr(util_cheg)
             self.hist_chegada.append(int(util_cheg))
@@ -1935,6 +2019,7 @@ class AnalisadorTS:
                     "n_pids": len(self.n_pid), "n_servicos": len(self.pmt_pids),
                     "cbr": self.taxa.get(0x1FFF, 0) > 0, "modo_taxa": self._modo_ts(),
                     "pacotes": self.pacotes, "desde": self.desde,
+                    **self._formato(),
                 },
                 "tr101290": {
                     "contadores": dict(self.cont),
@@ -2453,7 +2538,7 @@ class Distribuidor:
                 d = self._s.recv(65536)
             except OSError:
                 continue
-            self.pacotes += len(d) // 188
+            self.pacotes += len(d) // tamanho_pacote(d)
             for dst in self.destinos:
                 try:
                     self._s.sendto(d, dst)
@@ -3255,6 +3340,7 @@ def dados_relatorio(dados, canal, titulo):
                  "atual_util": r.get("taxa_util"), "atual_ts": r.get("taxa_total"),
                  "rajadas": ts.get("rajadas") or 0, "perda_interna": ts.get("perda_interna") or 0},
         "modo": modo, "tsid": r.get("tsid"), "rede": r.get("rede"), "hora_ts": r.get("hora_ts"),
+        "formato": r.get("formato") or "TS 188", "camadas": r.get("camadas") or {},
         "n_pids": r.get("n_pids"), "pacotes": r.get("pacotes"),
         "indicadores": indicadores,
         "totais": {p: sum(i["valor"] for i in indicadores if i["prio"] == p) for p in (1, 2, 3)},
@@ -3294,6 +3380,8 @@ def relatorio_txt(d) -> str:
     m = d["modo"]
     if m.get("modo"):
         L += [f"  Tipo do TS: {m['modo']} (variação {m['variacao_pct']}%)"]
+    L += [f"  Pacote {d['formato']}" + (("   ·   Camadas " + ", ".join(f"{k} {_f_taxa(v)}" for k, v in d["camadas"].items()))
+                                          if d["camadas"] else "")]
     L += [f"  TS ID {d['tsid'] if d['tsid'] is not None else '—'}   ·   Rede {d['rede'] or '—'}   ·   "
           f"{len(d['servicos'])} serviço(s)   ·   {d['n_pids'] or 0} PIDs   ·   {_f_n(d['pacotes'])} pacotes", ""]
     L += ["TR 101 290", "-" * 78]
@@ -3367,7 +3455,8 @@ def relatorio_html(d, logo=None) -> str:
         kpis += [("Bitrate útil agora", _f_taxa(tx["atual_util"]))]
     kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
              ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
-             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—")]
+             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—"),
+             ("Pacote", d["formato"].split(" (")[0])]
     if tx.get("rajadas"):
         kpis.append(("Rajadas de chegada", f"{tx['rajadas']} s"))
     if tx.get("perda_interna"):
@@ -3566,7 +3655,8 @@ def relatorio_pdf(d, logo=None) -> bytes:
         kpis.append(("Bitrate útil agora", _f_taxa(taxa["atual_util"])))
     kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
              ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
-             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—")]
+             ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—"),
+             ("Pacote", d["formato"].split(" (")[0])]
     if taxa.get("rajadas"):
         kpis.append(("Rajadas de chegada", f"{taxa['rajadas']} s"))
     if taxa.get("perda_interna"):
@@ -5728,9 +5818,9 @@ const CE={
 const CS={
  srt:[['servicos','Serviços a enviar','serv',[]],['modo','Modo','sel:caller,listener','caller'],['endereco','Destino (host:porta) / porta','text',''],
       ['latencia_ms','Latência (ms)','number',200],['senha','Senha AES (10-79)','password',''],['tamanho_chave','Chave','sel:16,24,32','16'],
-      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
- udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
- rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2',''],
+      ['stream_id','Stream ID','text',''],['overhead_pct','Overhead (%)','number',25],['formato','Pacote (188 = TS · 204 = BTS)','sel:188,204','188'],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
+ udp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:1234'],['ttl','TTL','number',16],['formato','Pacote (188 = TS · 204 = BTS)','sel:188,204','188'],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2','']],
+ rtp:[['servicos','Serviços a enviar','serv',[]],['endereco','Destino (ip:porta)','text','239.1.1.1:5004'],['ttl','TTL','number',16],['formato','Pacote (188 = TS · 204 = BTS)','sel:188,204','188'],['interface','Placa de rede (saída)','nic',''],['interface_reserva','Placa reserva (failover)','nic2',''],
       ['payload_type','Payload type','number',33],['ssrc','SSRC (opcional)','text','']],
  rtmp:[['url','Servidor (ex.: rtmp://a.rtmp.youtube.com/live2)','text',''],['chave','Chave de transmissão','password',''],['video','Vídeo','sel:copiar,h264','copiar'],['audio','Áudio','sel:aac,copiar','aac'],
       ['video_kbps','Vídeo kb/s (se h264)','number',4000],['audio_kbps','Áudio kb/s','number',128],['servicos','Serviço a enviar (RTMP leva um só)','serv1',[]]]};
@@ -6154,7 +6244,9 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
  $('#akpi').innerHTML=(S?kpi('Duração',dur(p.duracao_s))+kpi('Bitrate médio',fmtR(ts.media))+kpi('Bitrate mínimo',fmtR(ts.min),'menor média de 5 s da sessão')+kpi('Bitrate máximo',fmtR(ts.max),'maior média de 5 s da sessão (rajadas isoladas não contam)')
   :kpi('Bitrate TS',fmtR(r.taxa_total))+kpi('Bitrate útil',fmtR(r.taxa_util),'Sem pacotes nulos')+kpi('Sessão',dur(p.duracao_s)))
   +kpi('Taxa do TS',r.modo_taxa&&r.modo_taxa.modo?`${r.modo_taxa.modo} <small style="font-size:12px;color:var(--mut)">±${r.modo_taxa.variacao_pct}%</small>`:'medindo…',
-     r.modo_taxa&&r.modo_taxa.modo?`variação da taxa total nos últimos ${r.modo_taxa.amostras} s (mín ${fmtR(r.modo_taxa.min)}, máx ${fmtR(r.modo_taxa.max)}). CBR abaixo de 2%.`:'')+kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'),'Nome da rede na tabela NIT: '+(r.rede||'este sinal não envia NIT (comum em sinal por IP)'))
+     r.modo_taxa&&r.modo_taxa.modo?`variação da taxa total nos últimos ${r.modo_taxa.amostras} s (mín ${fmtR(r.modo_taxa.min)}, máx ${fmtR(r.modo_taxa.max)}). CBR abaixo de 2%.`:'')+(r.formato?kpi('Pacote',esc(r.formato.split(' (')[0]),r.bts?'Pacotes de 204 bytes: 188 do TS + 16 de informação ISDB-T (camada de cada pacote). Para manter nas saídas, escolha "Pacote 204" na saída.':esc(r.formato)):'')
+  +(r.camadas&&Object.keys(r.camadas).length?kpi('Camadas ISDB-T',Object.entries(r.camadas).filter(([k])=>'ABC'.includes(k)).map(([k,v])=>`${k} ${fmtR(v)}`).join(' · ')||'—','Taxa por camada hierárquica, lida do trailer de cada pacote BTS: '+Object.entries(r.camadas).map(([k,v])=>`${k}: ${fmtR(v)}`).join(', ')):'')
+  +kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'),'Nome da rede na tabela NIT: '+(r.rede||'este sinal não envia NIT (comum em sinal por IP)'))
   +(ts&&ts.rajadas?kpi('Rajadas',ts.rajadas,'segundos em que os pacotes chegaram acumulados (a rede ou o SRT segurou e soltou de uma vez). Costumam vir junto com perda/retransmissão.'):'')
   +(ts&&ts.perda_interna?kpi('Perda interna',`<span style="color:var(--warn)">${ts.perda_interna.toLocaleString('pt-BR')}</span>`,'datagramas descartados pelo próprio servidor antes da análise (CPU sobrecarregada ou buffer pequeno). Nesses momentos os erros de CC podem não estar no sinal.'):'')
   +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
