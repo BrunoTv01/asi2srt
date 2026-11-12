@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.28.4"
+__version__ = "2.29.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4733,6 +4733,12 @@ def rmem_max():
 
 def cmd_verificar(args):
     ok = True
+    if not em_container() and shutil.which("systemctl"):
+        b = estado_boot()
+        falta = [n for k, n in (("servico", "serviço não habilitado no boot"), ("grub", "GRUB pode parar no menu após queda de energia"),
+                                ("dektec", "driver DekTec não está em /etc/modules-load.d")) if b.get(k) is False]
+        print("✓ Subida automática configurada" if not falta else
+              "⚠ Subida automática incompleta: " + "; ".join(falta) + "  ->  sudo asi2srt inicio-automatico")
     if em_container():
         rm = rmem_max()
         print("Rodando em container Docker (rede do host: --network host)")
@@ -5124,6 +5130,88 @@ def ajustar_rede():
         print(f"aviso: não consegui ajustar os buffers de rede: {e}")
 
 
+# ---------------- subida automática ao ligar / após queda de energia ----------------
+ESPERA_REDE_DROPIN = """\
+# asi2srt: não travar o boot esperando placas sem cabo (placa reserva). Basta UMA placa com link.
+[Service]
+ExecStart=
+ExecStart=/usr/lib/systemd/systemd-networkd-wait-online --any --timeout=30
+"""
+GRUB_ASI2SRT = """\
+# asi2srt: depois de queda de energia, o GRUB do Ubuntu fica PARADO no menu esperando alguém.
+# Com isto ele segue sozinho em 5 s, e o disco é corrigido automaticamente se precisar.
+GRUB_RECORDFAIL_TIMEOUT=5
+GRUB_TIMEOUT=3
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT fsck.mode=auto fsck.repair=yes"
+"""
+
+
+def _modulo_existe(m):
+    return subprocess.run(["modinfo", m], capture_output=True).returncode == 0 if shutil.which("modinfo") else False
+
+
+def preparar_boot(verbose=True):
+    """Deixa o servidor voltar sozinho, sem ninguém, depois de reinício ou falta de energia."""
+    feito = []
+
+    def gravar(cam, txt):
+        try:
+            os.makedirs(os.path.dirname(cam), exist_ok=True)
+            atual = open(cam).read() if os.path.exists(cam) else None
+            if atual != txt:
+                with open(cam, "w") as f:
+                    f.write(txt)
+                return True
+        except OSError as e:
+            if verbose:
+                print(f"aviso: não consegui gravar {cam}: {e}")
+        return False
+
+    # 1) serviço habilitado no boot
+    subprocess.run(["systemctl", "enable", "asi2srt"], capture_output=True)
+    feito.append("serviço asi2srt habilitado no boot")
+    # 2) boot não espera placa sem cabo por 2 minutos
+    if os.path.exists("/usr/lib/systemd/systemd-networkd-wait-online") and \
+            subprocess.run(["systemctl", "is-enabled", "systemd-networkd-wait-online"],
+                           capture_output=True, text=True).stdout.strip() == "enabled":
+        if gravar("/etc/systemd/system/systemd-networkd-wait-online.service.d/asi2srt.conf", ESPERA_REDE_DROPIN):
+            feito.append("boot não fica preso esperando placa de rede sem cabo (máx. 30 s)")
+    # 3) driver DekTec carregado no boot
+    mods = [m for m in DEKTEC_MODULOS if _modulo_existe(m)]
+    if mods and gravar("/etc/modules-load.d/dektec.conf", "# asi2srt: driver da placa DekTec\n" + "\n".join(mods) + "\n"):
+        feito.append("driver DekTec carregado no boot (" + ", ".join(mods) + ")")
+    # 4) GRUB não fica parado no menu depois de queda de energia; fsck corrige sozinho
+    if os.path.isdir("/etc/default/grub.d") and shutil.which("update-grub"):
+        if gravar("/etc/default/grub.d/90-asi2srt.cfg", GRUB_ASI2SRT):
+            subprocess.run(["update-grub"], capture_output=True)
+            feito.append("GRUB segue sozinho após queda de energia; disco corrigido automaticamente")
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True)
+    if verbose:
+        for f in feito:
+            print("✓ " + f)
+        print("Falta só 1 ajuste na BIOS (não dá para fazer pelo Linux):\n"
+              "  Power Management > 'Restore on AC Power Loss' (ou 'After Power Failure', 'AC Back') = Power On")
+    return feito
+
+
+def estado_boot():
+    """Para 'verificar' e para o painel: o que garante a volta automática."""
+    def ok(cmd):
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    r = {"servico": ok(["systemctl", "is-enabled", "asi2srt"]) == "enabled" if shutil.which("systemctl") else None,
+         "grub": os.path.exists("/etc/default/grub.d/90-asi2srt.cfg") if os.path.isdir("/etc/default/grub.d") else None,
+         "dektec": (os.path.exists("/etc/modules-load.d/dektec.conf")
+                    if any(_modulo_existe(m) for m in DEKTEC_MODULOS) else None)}
+    return r
+
+
+def cmd_inicio_automatico(args):
+    if os.geteuid() != 0:
+        raise SystemExit("rode como root: sudo asi2srt inicio-automatico")
+    preparar_boot()
+    return 0
+
+
 def cmd_instalar_servico(args):
     if os.geteuid() != 0:
         raise SystemExit("rode como root: sudo asi2srt instalar-servico")
@@ -5143,6 +5231,7 @@ def cmd_instalar_servico(args):
         f.write(UNIDADE_SYSTEMD.format(exe=exe, config=args.config))
     subprocess.run(["systemctl", "daemon-reload"], check=False)
     ajustar_rede()
+    preparar_boot()
     print("serviço instalado.\n"
           "  1. sudo systemctl enable --now asi2srt\n"
           "  2. login inicial do painel: admin / admin  (troque no menu do usuário > Trocar minha senha)\n"
@@ -6291,6 +6380,9 @@ def main(argv=None):
     p = sub.add_parser("instalar-servico", help="instala serviço systemd (root)")
     p.add_argument("-c", "--config", default="/etc/asi2srt/config.yaml")
     p.set_defaults(func=cmd_instalar_servico)
+
+    p = sub.add_parser("inicio-automatico", help="sobe sozinho após reinício/queda de energia (root)")
+    p.set_defaults(func=cmd_inicio_automatico)
 
     p = sub.add_parser("teste", help="teste sem hardware (ffmpeg -> SRT + UDP local)")
     p.add_argument("--porta", type=int, default=9000)

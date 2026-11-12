@@ -477,6 +477,18 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## Subida automática (reinício e queda de energia)
+
+O instalador já deixa tudo pronto. Para aplicar ou reaplicar só esta parte, rode `sudo asi2srt inicio-automatico`. Ela faz quatro ajustes:
+- habilita o serviço `asi2srt` no boot (os canais ativos sobem sozinhos);
+- carrega o driver DekTec no boot (`/etc/modules-load.d/dektec.conf`);
+- evita que o boot fique 2 minutos esperando uma placa de rede sem cabo: basta uma placa com link, com no máximo 30 s de espera;
+- depois de uma queda de energia, o GRUB do Ubuntu segue sozinho em 5 s em vez de parar no menu, e o disco é corrigido automaticamente (`fsck.repair=yes`).
+
+Falta só **um ajuste na BIOS**: "Restore on AC Power Loss" (ou "After Power Failure") = **Power On**.
+
+O `asi2srt verificar` mostra se a subida automática está completa. No Docker, use `restart: unless-stopped` (já no compose) e `sudo systemctl enable docker`.
+
 ## Docker
 
 O asi2srt também roda em container. A imagem traz o asi2srt, o TSDuck (plugins srt, ip e dektec), o ffmpeg e o reportlab (PDF).
@@ -540,7 +552,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.28.4 && git push origin v2.28.4
+git tag v2.29.0 && git push origin v2.29.0
 ```
 
 ## Licença

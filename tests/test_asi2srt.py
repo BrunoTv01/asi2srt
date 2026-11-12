@@ -1435,3 +1435,17 @@ def test_abas_lista_cards_so_no_docker(gateway, monkeypatch):
     assert cod == 200 and b'data-vis="lista"' not in pag and b'data-vis="cards"' not in pag
     assert b'data-vis="rotas"' in pag and b'data-vis="comparar"' in pag and b"'rotas,comparar'" in pag
     assert 'data-vis="lista"' in a.VIS_EXTRAS_HTML and 'data-vis="cards"' in a.VIS_EXTRAS_HTML   # usado no Docker
+
+
+# ---------------- 2.29: subida automática ----------------
+def test_boot_automatico_textos():
+    assert "GRUB_RECORDFAIL_TIMEOUT=5" in a.GRUB_ASI2SRT and "fsck.repair=yes" in a.GRUB_ASI2SRT
+    assert "--any" in a.ESPERA_REDE_DROPIN and "ExecStart=\n" in a.ESPERA_REDE_DROPIN
+    assert "WantedBy=multi-user.target" in a.UNIDADE_SYSTEMD and "Restart=always" in a.UNIDADE_SYSTEMD
+    assert set(a.estado_boot()) == {"servico", "grub", "dektec"}
+
+
+def test_inicio_automatico_exige_root(monkeypatch):
+    monkeypatch.setattr(a.os, "geteuid", lambda: 1000)
+    with pytest.raises(SystemExit):
+        a.cmd_inicio_automatico(None)
