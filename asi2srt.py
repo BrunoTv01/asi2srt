@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.31.0"
+__version__ = "2.31.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -4494,7 +4494,7 @@ def servidor_web(ger: Gerenciador, endereco: str):
                                                            if espera else "Usuário ou senha incorretos"})
             token = acesso.criar_sessao(u)
             log.info("painel: login de %s (%s) a partir de %s", u["usuario"], u.get("papel"), ip)
-            auditar("login", usuario=u["usuario"], ip=ip, detalhe=f"{u.get('papel')} · {self.headers.get('User-Agent', '')[:80]}")
+            auditar("login", usuario=u["usuario"], ip=ip, detalhe=f"{u.get('papel')} · {navegador(self.headers.get('User-Agent', ''))}")
             return self._resp(200, acesso.publico(u), cab={"Set-Cookie": f"{COOKIE_SESSAO}={token}; Path=/; HttpOnly; "
                                                                       f"SameSite=Strict; Max-Age={SESSAO_MAX_S}"})
 
@@ -4942,6 +4942,15 @@ class Auditoria:
                     f.write(json.dumps(e, ensure_ascii=False) + "\n")
             except OSError:
                 pass
+
+
+def navegador(ua: str) -> str:
+    """'Chrome · Windows' a partir do User-Agent."""
+    nav = next((n for k, n in (("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"),
+                               ("Safari/", "Safari"), ("curl/", "curl"), ("python", "script")) if k.lower() in ua.lower()), "")
+    so = next((n for k, n in (("Android", "Android"), ("iPhone", "iPhone"), ("iPad", "iPad"), ("Windows", "Windows"),
+                              ("Mac OS", "macOS"), ("Linux", "Linux")) if k in ua), "")
+    return " · ".join(x for x in (nav, so) if x) or ua[:40] or "—"
 
 
 def hora_boot():
@@ -5942,10 +5951,10 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <div class="df"><button type="button" data-fechar>Cancelar</button><button class="pri" type="submit">Trocar senha</button></div></form></dialog>
 <dialog id="dlgaud" style="width:min(1100px,96vw)"><div class="dh"><h3>Registro de acessos e eventos</h3><button type="button" class="mini" data-fechar>✕</button></div>
 <div class="db"><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
- <select id="audtipo"><option value="">Tudo</option><option value="acesso">Entradas no sistema</option><option value="servico">Serviço e reinícios</option>
+ <select id="audtipo" style="width:auto"><option value="">Tudo</option><option value="acesso">Entradas no sistema</option><option value="servico">Serviço e reinícios</option>
  <option value="canal_parar">Canais parados</option><option value="canal_reiniciar">Canais reiniciados</option><option value="canal_alterado">Canais alterados</option><option value="login_falhou">Logins recusados</option></select>
- <select id="audusr"><option value="">Todos os usuários</option></select>
- <span id="audres" class="msg" style="margin-left:auto"></span><a class="btn" id="audcsv" href="#">Baixar CSV</a></div>
+ <select id="audusr" style="width:auto"><option value="">Todos os usuários</option></select>
+ <span id="audres" class="msg" style="margin-left:auto;font-family:inherit"></span><a class="btn" id="audcsv" href="#">Baixar CSV</a></div>
 <div id="audserv"></div>
 <div class="tabw" style="max-height:60vh;overflow:auto"><table class="t" id="audtab"></table></div></div></dialog>
 <dialog id="dlgus"><div class="dh"><h3>Usuários</h3><button type="button" class="mini" data-fechar>✕</button></div>
@@ -6634,7 +6643,8 @@ async function audCarregar(usuarios){const tp=$('#audtipo').value,us=$('#audusr'
  if(usuarios){try{const t=await api('GET','/api/auditoria?limite=3000');const n=[...new Set(t.map(e=>e.usuario).filter(x=>x&&x!=='sistema'&&x!=='—'))].sort();
   $('#audusr').innerHTML='<option value="">Todos os usuários</option>'+n.map(x=>`<option>${esc(x)}</option>`).join('');
   const ini=t.find(e=>e.tipo==='servico_iniciado'),boot=t.find(e=>e.tipo==='maquina_ligada'),q=t.find(e=>e.tipo==='servico_queda'||(e.tipo==='maquina_ligada'&&!e.ok));
-  $('#audserv').innerHTML=`<div class="kpis" style="margin-bottom:10px">${kpi('Serviço iniciado',ini?audDH(ini.t):'—',ini?ini.detalhe:'')}${kpi('Último boot da máquina',boot?audDH(boot.t):'—',boot?boot.detalhe:'')}${kpi('Última parada anormal',q?`<span style="color:var(--err)">${audDH(q.t)}</span>`:'nenhuma',q?q.detalhe:'')}</div>`}catch(e){}}
+  const dc=s=>new Date(s*1000).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  $('#audserv').innerHTML=`<div class="kpis" style="margin-bottom:10px;grid-template-columns:repeat(3,minmax(200px,1fr))">${kpi('Serviço iniciado',ini?dc(ini.t):'—',ini?ini.detalhe:'')}${kpi('Último boot da máquina',boot?dc(boot.t):'—',boot?boot.detalhe:'')}${kpi('Última parada anormal',q?`<span style="color:var(--err)">${dc(q.t)}</span>`:'nenhuma',q?q.detalhe:'')}</div>`}catch(e){}}
  $('#audres').textContent=`${l.length} evento(s)`;
  $('#audtab').innerHTML='<tr><th>Data e hora</th><th>Evento</th><th>Usuário</th><th>IP</th><th>Detalhe</th></tr>'+l.map(e=>`<tr><td class="mono" style="white-space:nowrap">${audDH(e.t)}</td>
   <td style="color:${AUD_COR[e.tipo]||'inherit'};white-space:nowrap">${esc(e.descricao)}</td><td>${esc(e.usuario)}</td><td class="mono">${esc(e.ip)}</td><td>${esc(e.detalhe)}</td></tr>`).join('');}
