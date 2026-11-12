@@ -1465,3 +1465,8 @@ def test_pipeline_rs204():
     assert "--rs204" not in a.montar_saida(c["saidas"][1], 1, "tsp")
     with pytest.raises(ValueError):
         a._args_formato({"formato": "192"})
+
+
+def test_relatorio_pids_em_analise():
+    d = {"pids": [{"pid": 0}, {"pid": 0x100}, {"pid": 5000, "tipo": "ignorado"}, {"pid": 0x1FFF}], "n_pids": 4}
+    assert a._f_pids(d) == "4 (2 em análise)"

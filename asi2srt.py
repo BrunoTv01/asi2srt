@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.30.0"
+__version__ = "2.30.1"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -3248,6 +3248,14 @@ class Gerenciador:
 # ======================================================================
 # Relatório para download: HTML (formatado, imprimível) e TXT
 # ======================================================================
+def _f_pids(d):
+    l = d.get("pids") or []
+    tot = len(l) or d.get("n_pids") or 0
+    ign = sum(1 for p in l if p.get("tipo") == "ignorado")
+    nulo = 1 if any(p.get("pid") == 0x1FFF for p in l) else 0
+    return f"{tot} ({max(0, tot - ign - nulo)} em análise)" if l else str(tot)
+
+
 def _f_taxa(b):
     b = float(b or 0)
     return f"{b / 1e6:.2f} Mb/s" if b >= 1e6 else f"{b / 1e3:.1f} kb/s"
@@ -3454,7 +3462,7 @@ def relatorio_html(d, logo=None) -> str:
     if not d["salvo"] and tx.get("atual_util") is not None:
         kpis += [("Bitrate útil agora", _f_taxa(tx["atual_util"]))]
     kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
-             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
+             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", _f_pids(d)),
              ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—"),
              ("Pacote", d["formato"].split(" (")[0])]
     if tx.get("rajadas"):
@@ -3654,7 +3662,7 @@ def relatorio_pdf(d, logo=None) -> bytes:
     if not d["salvo"] and taxa.get("atual_util") is not None:
         kpis.append(("Bitrate útil agora", _f_taxa(taxa["atual_util"])))
     kpis += [("Tipo do TS", f"{m['modo']} ±{m['variacao_pct']}%" if m.get("modo") else "—"),
-             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", str(d["n_pids"] or 0)),
+             ("Duração", _f_dur(d["duracao"])), ("Serviços", str(len(d["servicos"]))), ("PIDs", _f_pids(d)),
              ("TS ID", str(d["tsid"]) if d["tsid"] is not None else "—"), ("Rede", d["rede"] or "—"),
              ("Pacote", d["formato"].split(" (")[0])]
     if taxa.get("rajadas"):
@@ -6236,6 +6244,11 @@ async function carregarAna(){if(!anaId)return;const c=dados.find(x=>x.id===anaId
  const qs=sessSel==null?'':`?sessao=${sessSel}`;['pdf','html','txt','json'].forEach(f=>{$('#abx_'+f).href=`/api/canais/${anaId}/analise?baixar=1&formato=${f}`+(sessSel==null?'':`&sessao=${sessSel}`)});
  try{ana=await api('GET',`/api/canais/${anaId}/analise${qs}`);rAna()}catch(e){$('#aest').className='pill parado';$('#aest').textContent=e.message;}}
 function kpi(r,v,t){return`<div class="kpi" title="${esc(t||'')}"><small>${r}</small><b>${v}</b></div>`}
+// PIDs: total na entrada e quantos entram na análise (fora do pacote e nulo não geram erro)
+function kpiPids(l,tot){const ign=l.filter(p=>p.tipo==='ignorado').length,nulo=l.some(p=>p.pid===8191)?1:0,
+ nref=l.filter(p=>p.tipo==='desconhecido').length,an=Math.max(0,(l.length||tot)-ign-nulo);
+ const det=[`${an} em análise`,ign?`${ign} fora do pacote`:'',nulo?'nulo':'',nref?`<span style="color:var(--err)">${nref} não ref.</span>`:''].filter(Boolean).join(' · ');
+ return`<div class="kpi" title="Total de PIDs presentes na entrada. Em análise: PIDs verificados pela TR 101 290 (continuidade, ausência). Fora do pacote (⚙) e o nulo (0x1FFF) aparecem, mas não geram erro."><small>PIDs na entrada</small><b>${l.length||tot}</b><span style="display:block;font-size:11px;color:var(--mut);margin-top:2px">${det}</span></div>`}
 function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts=a.taxa_sessao;
  $('#aest').className='pill '+(S?'parado':a.estado);$('#aest').textContent=S?'relatório salvo':(r.sinal?a.estado:'sem sinal').replace('_',' ');
  $('#azerar').hidden=!!S;$('#aban').hidden=!S;
@@ -6249,7 +6262,7 @@ function rAna(){const a=ana,r=a.resumo,t=a.tr101290,S=a.salvo,p=a.periodo||{},ts
   +kpi('TS ID',r.tsid??'—')+kpi('Rede',esc(r.rede||'—'),'Nome da rede na tabela NIT: '+(r.rede||'este sinal não envia NIT (comum em sinal por IP)'))
   +(ts&&ts.rajadas?kpi('Rajadas',ts.rajadas,'segundos em que os pacotes chegaram acumulados (a rede ou o SRT segurou e soltou de uma vez). Costumam vir junto com perda/retransmissão.'):'')
   +(ts&&ts.perda_interna?kpi('Perda interna',`<span style="color:var(--warn)">${ts.perda_interna.toLocaleString('pt-BR')}</span>`,'datagramas descartados pelo próprio servidor antes da análise (CPU sobrecarregada ou buffer pequeno). Nesses momentos os erros de CC podem não estar no sinal.'):'')
-  +kpi('Serviços',r.n_servicos)+kpi('PIDs',r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
+  +kpi('Serviços',r.n_servicos)+kpiPids(a.pids||[],r.n_pids)+kpi('Hora do TS',esc((r.hora_ts||'—').split(' ').pop()),'Data/hora da TDT/TOT: '+(r.hora_ts||'não recebida'))
   +kpi('Pacotes',r.pacotes.toLocaleString('pt-BR'));
  $('#adesde').textContent='desde '+new Date(r.desde*1000).toLocaleTimeString('pt-BR');
  $('#atr').innerHTML=[1,2,3].map(p=>`<div class="trg"><h4>Prioridade ${p}</h4>${TRI.filter(x=>x[1]===p).map(([k,,cod,nome,desc])=>{
