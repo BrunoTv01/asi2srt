@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.28.3"
+__version__ = "2.28.4"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -587,7 +587,9 @@ def ip_da_interface(nome: str) -> str:
     for i in listar_interfaces(todas=True):
         if i["nome"] == nome:
             if not i["ips"]:
-                raise ValueError(f"a placa de rede {nome} não tem endereço IPv4")
+                raise ValueError(f"a placa de rede {nome} não tem endereço IPv4 fixo. Configure um IP nela "
+                                 f"(netplan: addresses: [IP/24] em /etc/netplan/, depois sudo netplan apply) "
+                                 f"e confira com: ip -br addr show {nome}")
             return i["ips"][0]
     raise ValueError(f"placa de rede {nome!r} não encontrada neste computador")
 

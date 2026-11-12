@@ -540,7 +540,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.28.3 && git push origin v2.28.3
+git tag v2.28.4 && git push origin v2.28.4
 ```
 
 ## Licença
