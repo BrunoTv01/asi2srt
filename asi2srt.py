@@ -50,7 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "2.31.1"
+__version__ = "2.32.0"
 TITULO_PADRAO = "Engenharia TV Cultura"
 
 try:
@@ -1172,6 +1172,8 @@ class AnalisadorTS:
 
     def __init__(self):
         self.pids_ignorados = set()      # PIDs fora do pacote: não geram erro
+        self.so_monitorados = False      # True (padrão no gateway): PIDs não referenciados nem são lidos (não aparecem, não contam)
+        self.monit = set(range(0x20)) | set(PIDS_ISDB) | {0x1FFF}
         self.pcr_rep_ticks = int(PCR_REP_PADRAO_MS / 1000 * 27_000_000)   # limite da repetição do PCR
         self.lock = threading.Lock()
         self.zerar()
@@ -1373,6 +1375,7 @@ class AnalisadorTS:
         else:
             self.n_188 += n
         npid, visto, cc_est, es_pids, pmt_pids = self.n_pid, self.visto, self.cc, self.es_pids, self.pmt_pids
+        monit = self.monit if self.so_monitorados else None
         intervalo = self.intervalo_pid
         pid_prog, cnt_prog = self.pid_prog, self.cnt_prog
         for k in range(n):
@@ -1394,6 +1397,8 @@ class AnalisadorTS:
                 continue
             b1 = d[i + 1]
             pid = ((b1 & 0x1F) << 8) | d[i + 2]
+            if monit is not None and pid not in monit:
+                continue                     # PID fora da PAT/PMT/SI: não é lido nem mostrado
             npid[pid] = npid.get(pid, 0) + 1
             v = visto.get(pid)
             if v is not None and 0.5 < agora - v <= 60:
@@ -1659,6 +1664,7 @@ class AnalisadorTS:
         self.pid_prog.clear()
         self.pid_prog.update(pp)
         self.pcr_prog = pcr
+        self.monit = self._referenciados()
 
     def _sdt(self, sec):
         if len(sec) < 15:
@@ -1711,11 +1717,14 @@ class AnalisadorTS:
     def verificar(self, agora):
         """Checagens por tempo e cálculo de taxas (chamar algumas vezes por segundo)."""
         if self.t_taxa is None:
-            self.t_taxa, self.n_ant = agora, dict(self.n_pid)
+            self.t_taxa, self.n_ant, self.pac_ant = agora, dict(self.n_pid), self.pacotes
         elif agora - self.t_taxa >= 1.0:
             dt = agora - self.t_taxa
             self.taxa = {p: (n - self.n_ant.get(p, 0)) * 1504 / dt for p, n in self.n_pid.items()}
-            self.taxa_total = sum(self.taxa.values())
+            # total = todos os pacotes recebidos (inclusive PIDs não monitorados, que não são lidos)
+            self.taxa_total = (self.pacotes - getattr(self, "pac_ant", self.pacotes)) * 1504 / dt \
+                if self.so_monitorados else sum(self.taxa.values())
+            self.pac_ant = self.pacotes
             self.hist_total.append(int(self.taxa_total))
             self._acc_teve = bool(self.acc_ts)
             if self.acc_ts:
@@ -1765,6 +1774,9 @@ class AnalisadorTS:
             self.pcr_janela = {}
             self.n_ant, self.t_taxa = dict(self.n_pid), agora
 
+        self.monit = self._referenciados()
+        if self.so_monitorados:
+            self._podar(agora)
         if self.ultimo_pacote is None:
             return
         fluindo = agora - self.ultimo_pacote < self.LIM_SINAL
@@ -1802,12 +1814,20 @@ class AnalisadorTS:
         for chave, lim in self.LIM_SI.items():
             if chave in self.si_visto:
                 ausente(f"si_{chave}", lim, chave, self.si_visto[chave])
-        if agora - self.inicio_fluxo > 2.0 and 0 in self.visto:
-            refs = self._referenciados()
+        if not self.so_monitorados and agora - self.inicio_fluxo > 2.0 and 0 in self.visto:
+            refs = self.monit
             for p, t in self.taxa.items():
                 if t > 0 and p not in refs and p not in self.nao_ref:
                     self.nao_ref.add(p)
                     self._erro("unref", agora)
+
+    def _podar(self, agora):
+        """Tira da lista PIDs que deixaram de ser referenciados (ex.: serviço removido da PAT) ou que
+        apareceram de passagem antes de a PAT/PMT chegar."""
+        for p in [p for p in self.n_pid if p not in self.monit and agora - self.visto.get(p, 0) > 10]:
+            for dic in (self.n_pid, self.visto, self.cc, self.taxa, self.intervalo_pid):
+                dic.pop(p, None)
+        self.nao_ref.clear()
 
     def _referenciados(self):
         refs = set(range(0x20)) | set(PIDS_ISDB) | self.pids_ignorados | {0x1FFF} | set(self.pmt_pids) | set(self.es_pids) | self.ca_pids
@@ -2575,6 +2595,7 @@ class Canal(threading.Thread):
         except ValueError:
             self.analisador.pids_ignorados = set(PIDS_FORA_PADRAO)
         ms = sup.get("pcr_repeticao_ms", PCR_REP_PADRAO_MS)
+        self.analisador.so_monitorados = sup.get("so_pids_monitorados", True) is not False
         self.analisador.pcr_rep_ticks = int((ms if ms in PCR_REP_OPCOES else PCR_REP_PADRAO_MS) / 1000 * 27_000_000)
         self.inicio_sessao = time.time()
         porta = self.analisador.abrir()
@@ -3077,7 +3098,8 @@ class Gerenciador:
         return {"titulo": self.sup.get("titulo") or TITULO_PADRAO,
                 "logo": bool(cam), "logo_v": int(os.path.getmtime(cam)) if cam else 0, "pids_ignorados": ign,
                 "pcr_repeticao_ms": ms, "previa": self.sup.get("previa", True) is not False,
-                "protecao": self.sup.get("protecao_automatica", True) is not False}
+                "protecao": self.sup.get("protecao_automatica", True) is not False,
+                "so_monitorados": self.sup.get("so_pids_monitorados", True) is not False}
 
     def salvar_aparencia(self, dados):
         titulo = str(dados.get("titulo", self.sup.get("titulo") or TITULO_PADRAO)).strip()
@@ -3098,6 +3120,11 @@ class Gerenciador:
                 self.sup["previa"] = bool(dados["previa"])
             if "protecao" in dados:
                 self.sup["protecao_automatica"] = bool(dados["protecao"])
+            if "so_monitorados" in dados:
+                self.sup["so_pids_monitorados"] = bool(dados["so_monitorados"])
+                for c in list(self.exec.values()):
+                    with c.analisador.lock:
+                        c.analisador.so_monitorados = self.sup["so_pids_monitorados"]
             if pcr_ms is not None:
                 self.sup["pcr_repeticao_ms"] = pcr_ms
                 for c in list(self.exec.values()):
@@ -5933,6 +5960,8 @@ color:#ffd8d6;padding:10px 16px;border-radius:9px;z-index:20;max-width:90vw}
 <option value="100">100 ms — ISO/IEC 13818-1, ISDB-Tb e recomendação atual da TR 101 290</option>
 <option value="40">40 ms — critério antigo do DVB (TR 101 290 até 2005)</option></select></label>
 <p class="msg" style="white-space:normal;margin:8px 0 0">Gera erro 2.3a quando o intervalo entre dois PCRs do mesmo programa passa do limite. Vale para todos os canais, na hora.</p></fieldset>
+<fieldset><legend>PIDs analisados</legend><label class="chk"><input type="checkbox" name="so_monit"> Só os PIDs monitorados (da PAT, PMT e tabelas SI)</label>
+<p class="msg" style="white-space:normal;margin:8px 0 0">Ligado: PIDs que não pertencem a nenhum serviço nem às tabelas do sinal não são lidos nem aparecem (também não contam no total). Desligado: aparecem como "não referenciado" (TR 101 290 3.4).</p></fieldset>
 <fieldset><legend>PIDs fora do pacote</legend><label>PIDs (separados por vírgula; decimal ou 0x…)<input name="pids_ign" placeholder="5000, 5016, 5017, 8184" spellcheck="false"></label>
 <p class="msg" style="white-space:normal;margin:8px 0 0">PIDs que vêm no TS mas não pertencem a nenhum serviço (dados do multiplexador). Continuam aparecendo nas tabelas, em cinza, mas <b>não geram erro</b>: nem "PID não referenciado", nem erro de continuidade (CC). Vale para todos os canais, na hora.</p></fieldset>
 <p class="msg" style="margin:4px 0 0">Versão do sistema: __VERSAO__</p></div>
@@ -6557,13 +6586,13 @@ function marca(ap){if(!ap)return;$('#mtit').textContent=ap.titulo;document.title
  const fv=document.getElementById('fav');if(fv)fv.href='/favicon.ico?v='+(ap.logo?ap.logo_v:0);
  if(ap.logo){im.src='/logo?v='+ap.logo_v;im.hidden=false}else{im.hidden=true;im.removeAttribute('src')}}
 let apNovo=null,apRem=false;
-$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);$('#frmap').elements.previa.checked=ap.previa!==false;$('#frmap').elements.protecao.checked=ap.protecao!==false;apNovo=null;apRem=false;
+$('#bap').onclick=()=>{const ap=INFO.aparencia||{};$('#frmap').elements.titulo.value=ap.titulo||'';$('#frmap').elements.pids_ign.value=(ap.pids_ignorados||[]).join(', ');$('#frmap').elements.pcr_ms.value=String(ap.pcr_repeticao_ms||100);$('#frmap').elements.previa.checked=ap.previa!==false;$('#frmap').elements.protecao.checked=ap.protecao!==false;$('#frmap').elements.so_monit.checked=ap.so_monitorados!==false;apNovo=null;apRem=false;
  $('#apprev').innerHTML=ap.logo?`<img src="/logo?v=${ap.logo_v}"><span>logo atual</span>`:'<span>sem logo</span>';$('#dlgap').showModal()};
 $('#aplogo').onchange=e=>{const f=e.target.files[0];if(!f)return;if(f.size>2*1024*1024){toast('O logo deve ter no máximo 2 MB');return}
  const r=new FileReader();r.onload=()=>{apNovo={tipo:f.type,b64:String(r.result).split(',')[1]};apRem=false;
   $('#apprev').innerHTML=`<img src="${r.result}"><span>${esc(f.name)} — será salvo ao clicar em Salvar</span>`};r.readAsDataURL(f)};
 $('#aprem').onclick=()=>{apNovo=null;apRem=true;$('#apprev').innerHTML='<span>o logo será removido ao salvar</span>'};
-$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value,previa:$('#frmap').elements.previa.checked,protecao:$('#frmap').elements.protecao.checked};
+$('#frmap').onsubmit=async ev=>{ev.preventDefault();const b={titulo:$('#frmap').elements.titulo.value.trim(),pids_ignorados:$('#frmap').elements.pids_ign.value,pcr_repeticao_ms:+$('#frmap').elements.pcr_ms.value,previa:$('#frmap').elements.previa.checked,protecao:$('#frmap').elements.protecao.checked,so_monitorados:$('#frmap').elements.so_monit.checked};
  if(apNovo){b.logo_base64=apNovo.b64;b.logo_tipo=apNovo.tipo}if(apRem)b.remover_logo=true;
  try{INFO.aparencia=await api('PUT','/api/aparencia',b);marca(INFO.aparencia);$('#dlgap').close();toast('Configurações salvas',1);
   api('GET','/api/info').then(i=>{INFO=i;TRI=i.tr101290||[];render()})}catch(e){toast(e.message)}};

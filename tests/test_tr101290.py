@@ -557,3 +557,18 @@ def test_trailer_ff_e_ts_188_na_origem():
     d = b"".join(_pkt188(cc=i) + b"\xff" * 16 for i in range(7))   # TSDuck completou com 0xFF
     an.processar(d, 1.0)
     assert an.n_204 == 0 and an.n_188 == 7 and not an._formato()["bts"]
+
+
+def test_so_pids_monitorados_nao_le_pid_solto():
+    import asi2srt as a
+    an = a.AnalisadorTS()
+    an.so_monitorados = True                      # padrão no gateway (⚙ PIDs analisados)
+    pkts = [_pkt188(pid=0x1FFF), _pkt188(pid=0x0012), _pkt188(pid=0x0777, cc=0), _pkt188(pid=0x0778)]
+    an.processar(b"".join(pkts * 3), 1.0)        # ainda sem PAT: só SI (0x12) e nulo são lidos
+    assert 0x777 not in an.n_pid and 0x778 not in an.n_pid and an.n_pid.get(0x12)
+    an.so_monitorados = False
+    an.processar(b"".join(pkts), 2.0)
+    assert 0x777 in an.n_pid                      # desligado: aparece (como não referenciado)
+    an.so_monitorados = True
+    an.verificar(20.0)                            # poda o que não é referenciado
+    assert 0x777 not in an.n_pid and 0x12 in an.n_pid

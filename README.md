@@ -477,6 +477,10 @@ asi2srt teste
 Gera um TS com ffmpeg e o envia em SRT (porta 9000) e UDP (127.0.0.1:5000).
 Painel em `http://127.0.0.1:8088` (admin / admin).
 
+## PIDs analisados
+
+Por padrão (⚙ → **PIDs analisados**), o sistema lê **só os PIDs monitorados**: os da PAT e das PMTs (vídeo, áudio, dados, PCR), as tabelas SI (0x00 a 0x1F e as do ISDB-Tb), os PIDs "fora do pacote" e o nulo. Qualquer outro PID não é lido, não aparece nas listas e não entra no total. PIDs que deixam de ser referenciados (serviço removido da PAT) saem da lista em 10 s. Desligando a opção, voltam a aparecer como "não referenciado" (TR 101 290 3.4). A taxa total continua contando todos os pacotes.
+
 ## Registro de acessos
 
 Fica no menu do usuário → **Registro de acessos** (só para admin). Registra:
@@ -571,7 +575,7 @@ O sistema se protege sozinho dos problemas mais comuns de campo:
 ## Gerar uma versão (binário)
 
 ```bash
-git tag v2.31.1 && git push origin v2.31.1
+git tag v2.32.0 && git push origin v2.32.0
 ```
 
 ## Licença
